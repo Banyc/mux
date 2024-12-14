@@ -4,11 +4,11 @@ use primitive::arena::obj_pool::ArcObjPool;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
-    control::{CentralReadTx, DeadControl},
+    control::DeadControl,
     protocol::{DataHeader, Header, StreamId, StreamIdMsg},
 };
 
-use super::DataBuf;
+use super::{DataBuf, DeadCentralIo};
 
 const OBJ_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(4) };
 
@@ -103,4 +103,23 @@ pub enum CentralIoReadMsg {
     Data(StreamId, DataBuf),
     CloseRead(StreamId),
     CloseWrite(StreamId),
+}
+
+#[derive(Debug, Clone)]
+pub struct CentralReadTx {
+    tx: tokio::sync::mpsc::Sender<CentralIoReadMsg>,
+}
+impl CentralReadTx {
+    pub async fn send(&self, msg: CentralIoReadMsg) -> Result<(), DeadControl> {
+        self.tx.send(msg).await.map_err(|_| DeadControl {})
+    }
+}
+#[derive(Debug)]
+pub struct CentralReadRx {
+    rx: tokio::sync::mpsc::Receiver<CentralIoReadMsg>,
+}
+impl CentralReadRx {
+    pub async fn recv(&mut self) -> Result<CentralIoReadMsg, DeadCentralIo> {
+        self.rx.recv().await.ok_or(DeadCentralIo {})
+    }
 }

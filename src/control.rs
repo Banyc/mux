@@ -12,9 +12,11 @@ use crate::{
     central_io::{
         reader::CentralIoReadMsg,
         writer::{WriteControlMsg, WriteDataMsg},
-        DataBuf,
+        DataBuf, DeadCentralIo,
     },
+    common::{End, Side},
     protocol::StreamId,
+    stream::reader::{StreamReadDataMsg, StreamReadDataTx},
 };
 
 const CHANNEL_SIZE: usize = 1024;
@@ -163,74 +165,6 @@ impl Drop for StreamState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Side {
-    Read,
-    Write,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum End {
-    Local,
-    Peer,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Initiation {
-    Server,
-    Client,
-}
-
-#[derive(Debug, Clone)]
-pub struct CentralReadTx {
-    tx: tokio::sync::mpsc::Sender<CentralIoReadMsg>,
-}
-impl CentralReadTx {
-    pub async fn send(&self, msg: CentralIoReadMsg) -> Result<(), DeadControl> {
-        self.tx.send(msg).await.map_err(|_| DeadControl {})
-    }
-}
-#[derive(Debug)]
-pub struct CentralReadRx {
-    rx: tokio::sync::mpsc::Receiver<CentralIoReadMsg>,
-}
-impl CentralReadRx {
-    pub async fn recv(&mut self) -> Result<CentralIoReadMsg, DeadCentralIo> {
-        self.rx.recv().await.ok_or(DeadCentralIo {})
-    }
-}
-
-#[derive(Debug)]
-pub enum StreamReadDataMsg {
-    Fin,
-    Data(DataBuf),
-}
-pub fn stream_read_data_channel() -> (StreamReadDataTx, StreamReadDataRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
-    let tx = StreamReadDataTx { tx };
-    let rx = StreamReadDataRx { rx };
-    (tx, rx)
-}
-#[derive(Debug, Clone)]
-pub struct StreamReadDataTx {
-    tx: tokio::sync::mpsc::Sender<StreamReadDataMsg>,
-}
-impl StreamReadDataTx {
-    pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadControl> {
-        self.tx.send(msg).await.map_err(|_| DeadControl {})
-    }
-    pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
-    }
-}
-#[derive(Debug)]
-pub struct StreamReadDataRx {
-    rx: tokio::sync::mpsc::Receiver<StreamReadDataMsg>,
-}
-impl StreamReadDataRx {
-    pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
-    }
-}
-
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
     let tx = WriteDataTxPrototype { tx };
@@ -313,60 +247,11 @@ impl WriteControlRx {
     }
 }
 
-#[derive(Debug)]
-pub struct StreamCloseMsg {
-    pub side: Side,
-    pub stream_id: StreamId,
-}
-pub fn stream_close_channel() -> (StreamCloseTxPrototype, StreamCloseRx) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let tx = StreamCloseTxPrototype { tx };
-    let rx = StreamCloseRx { rx };
-    (tx, rx)
-}
-#[derive(Debug, Clone)]
-pub struct StreamCloseTxPrototype {
-    tx: tokio::sync::mpsc::UnboundedSender<StreamCloseMsg>,
-}
-impl StreamCloseTxPrototype {
-    pub fn derive(&self, side: Side, stream_id: StreamId) -> StreamCloseTx {
-        StreamCloseTx {
-            stream_id,
-            side,
-            tx: self.tx.clone(),
-        }
-    }
-}
-#[derive(Debug, Clone)]
-pub struct StreamCloseTx {
-    stream_id: StreamId,
-    side: Side,
-    tx: tokio::sync::mpsc::UnboundedSender<StreamCloseMsg>,
-}
-impl Drop for StreamCloseTx {
-    fn drop(&mut self) {
-        let msg = StreamCloseMsg {
-            stream_id: self.stream_id,
-            side: self.side,
-        };
-        let _ = self.tx.send(msg);
-    }
-}
-#[derive(Debug)]
-pub struct StreamCloseRx {
-    rx: tokio::sync::mpsc::UnboundedReceiver<StreamCloseMsg>,
-}
-impl StreamCloseRx {
-    pub async fn recv(&mut self) -> Result<StreamCloseMsg, DeadStream> {
-        self.rx.recv().await.ok_or(DeadStream {})
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeadCentralIo {}
-
 #[derive(Debug, Clone)]
 pub struct DeadControl {}
 
-#[derive(Debug, Clone)]
-pub struct DeadStream {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Initiation {
+    Server,
+    Client,
+}

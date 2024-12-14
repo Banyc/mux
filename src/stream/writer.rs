@@ -2,7 +2,12 @@ use std::num::NonZeroUsize;
 
 use primitive::arena::obj_pool::ArcObjPool;
 
-use crate::control::{DeadCentralIo, StreamCloseTx, StreamWriteDataTx, WriteBrokenPipe};
+use crate::{
+    central_io::DeadCentralIo,
+    control::{StreamWriteDataTx, WriteBrokenPipe},
+};
+
+use super::StreamCloseTx;
 
 const BUF_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
 const MAX_DATA_SENT_ONCE: usize = 1 << 12;

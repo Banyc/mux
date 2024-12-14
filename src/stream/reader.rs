@@ -1,7 +1,8 @@
-use crate::{
-    central_io::DataBuf,
-    control::{DeadControl, StreamCloseTx, StreamReadDataMsg, StreamReadDataRx},
-};
+use crate::{central_io::DataBuf, control::DeadControl};
+
+use super::StreamCloseTx;
+
+const CHANNEL_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub struct StreamReader {
@@ -51,4 +52,37 @@ impl StreamReader {
 pub enum RecvError {
     EarlyEof,
     DeadControl(DeadControl),
+}
+
+#[derive(Debug)]
+pub enum StreamReadDataMsg {
+    Fin,
+    Data(DataBuf),
+}
+pub fn stream_read_data_channel() -> (StreamReadDataTx, StreamReadDataRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let tx = StreamReadDataTx { tx };
+    let rx = StreamReadDataRx { rx };
+    (tx, rx)
+}
+#[derive(Debug, Clone)]
+pub struct StreamReadDataTx {
+    tx: tokio::sync::mpsc::Sender<StreamReadDataMsg>,
+}
+impl StreamReadDataTx {
+    pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadControl> {
+        self.tx.send(msg).await.map_err(|_| DeadControl {})
+    }
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+#[derive(Debug)]
+pub struct StreamReadDataRx {
+    rx: tokio::sync::mpsc::Receiver<StreamReadDataMsg>,
+}
+impl StreamReadDataRx {
+    pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
+    }
 }
