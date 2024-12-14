@@ -4,4 +4,4 @@ mod control;
 mod protocol;
 mod stream;
 
-pub use stream::{reader::StreamReader, writer::StreamWriter};
+pub use stream::{accepter::StreamAccepter, reader::StreamReader, writer::StreamWriter};
