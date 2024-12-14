@@ -55,10 +55,10 @@ impl MuxControl {
             Initiation::Client => false,
         }
     }
-    fn next_stream_id(&mut self) -> Option<StreamId> {
+    fn next_stream_id(&mut self) -> Result<StreamId, TooManyOpenStreams> {
         let max_local_stream_id = StreamId::MAX >> 1;
         if usize::try_from(max_local_stream_id).unwrap() <= self.local_opened_streams {
-            return None;
+            return Err(TooManyOpenStreams {});
         }
         let mut next_local_stream_id = self.next_possible_local_stream_id;
         let local_stream_id = loop {
@@ -73,7 +73,7 @@ impl MuxControl {
         } else {
             local_stream_id
         };
-        Some(stream_id)
+        Ok(stream_id)
     }
     pub async fn close(&mut self, stream_id: StreamId, end: End, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
@@ -95,7 +95,7 @@ impl MuxControl {
         dispatcher: StreamReadDataTx,
         broken_pipe: WriteBrokenPipe,
         stream_id: Option<StreamId>,
-    ) -> Option<StreamWriteDataTx> {
+    ) -> Result<StreamWriteDataTx, TooManyOpenStreams> {
         let stream_id = match stream_id {
             Some(stream_id) => stream_id,
             None => self.next_stream_id()?,
@@ -105,7 +105,7 @@ impl MuxControl {
         }
         let stream = StreamState::new(dispatcher, broken_pipe);
         self.stream_table.insert(stream_id, stream);
-        Some(self.write_data_tx.derive(stream_id))
+        Ok(self.write_data_tx.derive(stream_id))
     }
 }
 
@@ -255,3 +255,6 @@ pub enum Initiation {
     Server,
     Client,
 }
+
+#[derive(Debug)]
+pub struct TooManyOpenStreams {}
