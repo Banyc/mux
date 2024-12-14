@@ -37,13 +37,13 @@ pub enum RunCentralIoReaderError {
 
 #[derive(Debug)]
 pub struct CentralIoReader<R> {
-    recver: R,
+    io_reader: R,
     pkt_pool: ArcObjPool<Vec<u8>>,
 }
 impl<R> CentralIoReader<R> {
-    pub fn new(recver: R) -> Self {
+    pub fn new(io_reader: R) -> Self {
         Self {
-            recver,
+            io_reader,
             pkt_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
         }
     }
@@ -62,7 +62,7 @@ where
     }
     async fn recv_pkt(&mut self) -> io::Result<Option<CentralIoReadMsg>> {
         let mut hdr = [0; Header::SIZE];
-        self.recver.read_exact(&mut hdr).await?;
+        self.io_reader.read_exact(&mut hdr).await?;
         let hdr = Header::decode(hdr).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -82,16 +82,16 @@ where
     }
     async fn recv_data(&mut self) -> io::Result<(StreamId, DataBuf)> {
         let mut hdr = [0; DataHeader::SIZE];
-        self.recver.read_exact(&mut hdr).await.unwrap();
+        self.io_reader.read_exact(&mut hdr).await.unwrap();
         let hdr = DataHeader::decode(hdr);
         let mut buf = self.pkt_pool.take_scoped();
         buf.extend(core::iter::repeat(0).take(usize::try_from(hdr.body_len).unwrap()));
-        self.recver.read_exact(&mut buf).await?;
+        self.io_reader.read_exact(&mut buf).await?;
         Ok((hdr.stream_id, buf))
     }
     async fn recv_stream_id(&mut self) -> io::Result<StreamId> {
         let mut hdr = [0; StreamIdMsg::SIZE];
-        self.recver.read_exact(&mut hdr).await.unwrap();
+        self.io_reader.read_exact(&mut hdr).await.unwrap();
         let hdr = StreamIdMsg::decode(hdr);
         Ok(hdr.stream_id)
     }

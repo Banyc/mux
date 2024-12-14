@@ -82,7 +82,7 @@ where
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
         let hdr = Header::Data;
         let mut remaining_body_len = msg.data.len();
-        loop {
+        while remaining_body_len != 0 {
             let body_len = remaining_body_len.min(usize::try_from(u32::MAX).unwrap());
             remaining_body_len -= body_len;
             let body_len = u32::try_from(body_len).unwrap();
@@ -98,6 +98,7 @@ where
             self.io_writer.write_all(&fixed_buf).await?;
             self.io_writer.write_all(&msg.data).await?;
         }
+        Ok(())
     }
 }
 

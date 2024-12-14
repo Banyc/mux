@@ -264,10 +264,10 @@ pub struct StreamWriteDataTx {
     tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
-    pub async fn send(&self, pkt: DataBuf) -> Result<(), DeadCentralIo> {
+    pub async fn send(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
-            data: pkt,
+            data,
         };
         self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
     }
