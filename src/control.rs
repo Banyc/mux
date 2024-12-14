@@ -226,8 +226,8 @@ pub struct StreamReadDataRx {
     rx: tokio::sync::mpsc::Receiver<StreamReadDataMsg>,
 }
 impl StreamReadDataRx {
-    pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadCentralIo> {
-        self.rx.recv().await.ok_or(DeadCentralIo {})
+    pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
     }
 }
 
