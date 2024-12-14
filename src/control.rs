@@ -7,7 +7,11 @@ use std::{
 };
 
 use crate::{
-    central_io::{reader::CentralIoReadMsg, DataBuf},
+    central_io::{
+        reader::CentralIoReadMsg,
+        writer::{WriteControlMsg, WriteDataMsg},
+        DataBuf,
+    },
     protocol::StreamId,
 };
 
@@ -16,14 +20,14 @@ const CHANNEL_SIZE: usize = 1024;
 #[derive(Debug)]
 pub struct MuxControl {
     stream_table: HashMap<StreamId, StreamState>,
-    up_tx: WriteDataTxPrototype,
+    write_data_tx: WriteDataTxPrototype,
     next_possible_stream_id: StreamId,
 }
 impl MuxControl {
-    pub fn new(up_tx: WriteDataTxPrototype) -> Self {
+    pub fn new(write_data_tx: WriteDataTxPrototype) -> Self {
         Self {
             stream_table: HashMap::new(),
-            up_tx,
+            write_data_tx,
             next_possible_stream_id: 0,
         }
     }
@@ -39,8 +43,8 @@ impl MuxControl {
             self.stream_table.remove(&stream_id);
         }
     }
-    pub fn dispatcher(&self, stream: StreamId) -> Option<&StreamReadDataTx> {
-        self.stream_table.get(&stream)?.dispatcher()
+    pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamReadDataTx> {
+        self.stream_table.get(&stream_id)?.dispatcher()
     }
     fn next_stream_id(&mut self) -> Option<StreamId> {
         if usize::try_from(StreamId::MAX).unwrap() <= self.stream_table.len() {
@@ -64,7 +68,7 @@ impl MuxControl {
         let stream_id = self.next_stream_id()?;
         let stream = StreamState::new(dispatcher, broken_pipe);
         self.stream_table.insert(stream_id, stream);
-        Some(self.up_tx.derive(stream_id))
+        Some(self.write_data_tx.derive(stream_id))
     }
 }
 
@@ -187,11 +191,6 @@ impl StreamReadDataRx {
     }
 }
 
-#[derive(Debug)]
-pub struct WriteDataMsg {
-    pub stream_id: StreamId,
-    pub data: DataBuf,
-}
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
     let tx = WriteDataTxPrototype { tx };
@@ -203,8 +202,8 @@ pub struct WriteDataRx {
     rx: tokio::sync::mpsc::Receiver<WriteDataMsg>,
 }
 impl WriteDataRx {
-    pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadStream> {
-        self.rx.recv().await.ok_or(DeadStream {})
+    pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
     }
 }
 #[derive(Debug, Clone)]
@@ -255,12 +254,6 @@ impl WriteBrokenPipe {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum WriteControlMsg {
-    Open(StreamId),
-    CloseRead(StreamId),
-    CloseWrite(StreamId),
-}
 #[derive(Debug, Clone)]
 pub struct WriteControlTx {
     tx: tokio::sync::mpsc::Sender<WriteControlMsg>,

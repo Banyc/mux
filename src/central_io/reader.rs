@@ -23,7 +23,7 @@ where
         let msg = io_reader
             .recv()
             .await
-            .map_err(RunCentralIoReaderError::Reader)?;
+            .map_err(RunCentralIoReaderError::IoReader)?;
         tx.send(msg)
             .await
             .map_err(RunCentralIoReaderError::Control)?;
@@ -31,7 +31,7 @@ where
 }
 #[derive(Debug)]
 pub enum RunCentralIoReaderError {
-    Reader(io::Error),
+    IoReader(io::Error),
     Control(DeadControl),
 }
 
@@ -87,13 +87,13 @@ where
         let mut buf = self.pkt_pool.take_scoped();
         buf.extend(core::iter::repeat(0).take(usize::try_from(hdr.body_len).unwrap()));
         self.recver.read_exact(&mut buf).await?;
-        Ok((hdr.stream, buf))
+        Ok((hdr.stream_id, buf))
     }
     async fn recv_stream_id(&mut self) -> io::Result<StreamId> {
         let mut hdr = [0; StreamIdMsg::SIZE];
         self.recver.read_exact(&mut hdr).await.unwrap();
         let hdr = StreamIdMsg::decode(hdr);
-        Ok(hdr.stream)
+        Ok(hdr.stream_id)
     }
 }
 

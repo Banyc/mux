@@ -41,7 +41,7 @@ impl Header {
 
 #[derive(Debug, Clone)]
 pub struct StreamIdMsg {
-    pub stream: StreamId,
+    pub stream_id: StreamId,
 }
 impl StreamIdMsg {
     pub const SIZE: usize = core::mem::size_of::<StreamId>();
@@ -51,12 +51,12 @@ impl StreamIdMsg {
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
-        Self { stream }
+        Self { stream_id: stream }
     }
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut buf = [0; Self::SIZE];
         let mut wtr = io::Cursor::new(&mut buf[..]);
-        wtr.write_all(&self.stream.to_be_bytes()).unwrap();
+        wtr.write_all(&self.stream_id.to_be_bytes()).unwrap();
         assert_eq!(wtr.write(&[0]).unwrap(), 0);
         buf
     }
@@ -64,7 +64,7 @@ impl StreamIdMsg {
 
 #[derive(Debug, Clone)]
 pub struct DataHeader {
-    pub stream: StreamId,
+    pub stream_id: StreamId,
     pub body_len: u32,
 }
 impl DataHeader {
@@ -78,12 +78,15 @@ impl DataHeader {
         rdr.read_exact(&mut body_len).unwrap();
         let body_len = u32::from_be_bytes(body_len);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
-        Self { stream, body_len }
+        Self {
+            stream_id: stream,
+            body_len,
+        }
     }
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut buf = [0; Self::SIZE];
         let mut wtr = io::Cursor::new(&mut buf[..]);
-        wtr.write_all(&self.stream.to_be_bytes()).unwrap();
+        wtr.write_all(&self.stream_id.to_be_bytes()).unwrap();
         wtr.write_all(&self.body_len.to_be_bytes()).unwrap();
         assert_eq!(wtr.write(&[0]).unwrap(), 0);
         buf
@@ -93,11 +96,11 @@ impl DataHeader {
 #[test]
 fn test_data_header() {
     let h = DataHeader {
-        stream: 1,
+        stream_id: 1,
         body_len: 2,
     };
     let b = h.encode();
     let h2 = DataHeader::decode(b);
-    assert_eq!(h.stream, h2.stream);
+    assert_eq!(h.stream_id, h2.stream_id);
     assert_eq!(h.body_len, h2.body_len);
 }
