@@ -6,6 +6,8 @@ use std::{
     },
 };
 
+use primitive::ops::ring::RingSpace;
+
 use crate::{
     central_io::{
         reader::CentralIoReadMsg,
@@ -20,19 +22,56 @@ const CHANNEL_SIZE: usize = 1024;
 #[derive(Debug)]
 pub struct MuxControl {
     stream_table: HashMap<StreamId, StreamState>,
+    local_opened_streams: usize,
+    initiation: Initiation,
+    next_possible_local_stream_id: StreamId,
     write_data_tx: WriteDataTxPrototype,
-    next_possible_stream_id: StreamId,
 }
 impl MuxControl {
-    pub fn new(write_data_tx: WriteDataTxPrototype) -> Self {
+    pub fn new(initiation: Initiation, write_data_tx: WriteDataTxPrototype) -> Self {
         Self {
             stream_table: HashMap::new(),
+            local_opened_streams: 0,
+            initiation,
+            next_possible_local_stream_id: 0,
             write_data_tx,
-            next_possible_stream_id: 0,
         }
     }
     pub fn streams(&self) -> usize {
         self.stream_table.len()
+    }
+    fn is_local_opened_stream(&self, stream_id: StreamId) -> bool {
+        let is_first_bit_set = stream_id >> (StreamId::BITS - 1) == 1;
+        match self.initiation {
+            Initiation::Server => is_first_bit_set,
+            Initiation::Client => !is_first_bit_set,
+        }
+    }
+    fn should_stream_id_set_first_bit(&self) -> bool {
+        match self.initiation {
+            Initiation::Server => true,
+            Initiation::Client => false,
+        }
+    }
+    fn next_stream_id(&mut self) -> Option<StreamId> {
+        let max_local_stream_id = StreamId::MAX >> 1;
+        if usize::try_from(max_local_stream_id).unwrap() <= self.local_opened_streams {
+            return None;
+        }
+        let mut next_local_stream_id = self.next_possible_local_stream_id;
+        let local_stream_id = loop {
+            if !self.stream_table.contains_key(&next_local_stream_id) {
+                break next_local_stream_id;
+            }
+            next_local_stream_id = next_local_stream_id.ring_add(1, max_local_stream_id);
+        };
+        self.next_possible_local_stream_id = local_stream_id.ring_add(1, max_local_stream_id);
+        let stream_id = if self.should_stream_id_set_first_bit() {
+            local_stream_id | (1 << (StreamId::BITS - 1))
+        } else {
+            local_stream_id
+        };
+        Some(stream_id)
     }
     pub async fn close(&mut self, stream_id: StreamId, end: End, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
@@ -40,32 +79,28 @@ impl MuxControl {
         };
         stream.close(end, side).await;
         if stream.is_closed() {
+            if self.is_local_opened_stream(stream_id) {
+                self.local_opened_streams -= 1;
+            }
             self.stream_table.remove(&stream_id);
         }
     }
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamReadDataTx> {
         self.stream_table.get(&stream_id)?.dispatcher()
     }
-    fn next_stream_id(&mut self) -> Option<StreamId> {
-        if usize::try_from(StreamId::MAX).unwrap() <= self.stream_table.len() {
-            return None;
-        }
-        let mut next_stream_id = self.next_possible_stream_id;
-        let stream_id = loop {
-            if !self.stream_table.contains_key(&next_stream_id) {
-                break next_stream_id;
-            }
-            next_stream_id = next_stream_id.wrapping_add(1);
-        };
-        self.next_possible_stream_id = stream_id.wrapping_add(1);
-        Some(stream_id)
-    }
     pub fn open(
         &mut self,
         dispatcher: StreamReadDataTx,
         broken_pipe: WriteBrokenPipe,
+        stream_id: Option<StreamId>,
     ) -> Option<StreamWriteDataTx> {
-        let stream_id = self.next_stream_id()?;
+        let stream_id = match stream_id {
+            Some(stream_id) => stream_id,
+            None => self.next_stream_id()?,
+        };
+        if self.is_local_opened_stream(stream_id) {
+            self.local_opened_streams += 1;
+        }
         let stream = StreamState::new(dispatcher, broken_pipe);
         self.stream_table.insert(stream_id, stream);
         Some(self.write_data_tx.derive(stream_id))
@@ -137,6 +172,11 @@ pub enum Side {
 pub enum End {
     Local,
     Peer,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Initiation {
+    Server,
+    Client,
 }
 
 #[derive(Debug, Clone)]
