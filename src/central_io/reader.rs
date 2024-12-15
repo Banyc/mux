@@ -132,6 +132,9 @@ pub struct CentralIoReadRx {
 }
 impl CentralIoReadRx {
     pub async fn recv(&mut self) -> Result<CentralIoReadMsg, DeadCentralIo> {
-        self.rx.recv().await.ok_or(DeadCentralIo {})
+        self.rx
+            .recv()
+            .await
+            .ok_or(DeadCentralIo { side: Side::Read })
     }
 }

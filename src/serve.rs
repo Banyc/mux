@@ -1,4 +1,4 @@
-use std::{future::Future, time::Duration};
+use std::{future::Future, io, time::Duration};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -7,9 +7,13 @@ use tokio::{
 
 use crate::{
     central_io::{
-        reader::{central_io_read_channel, run_central_io_reader, CentralIoReader},
-        writer::{run_central_io_writer, CentralIoWriter},
+        reader::{
+            central_io_read_channel, run_central_io_reader, CentralIoReader,
+            RunCentralIoReaderError,
+        },
+        writer::{run_central_io_writer, CentralIoWriter, RunCentralIoWriterError},
     },
+    common::Side,
     control::{
         run_control, write_data_channel, Initiation, MuxControl, RunControlArgs, RunControlError,
     },
@@ -28,11 +32,18 @@ pub struct MuxConfig {
     pub heartbeat_interval: Duration,
 }
 
+#[derive(Debug)]
+pub enum MuxError {
+    IoReader(io::Error),
+    IoWriter(io::Error),
+    DeadStreamInit,
+}
+
 pub fn spawn_mux_no_reconnection<R, W>(
     io_reader: R,
     io_writer: W,
     config: MuxConfig,
-    spawner: &mut JoinSet<()>,
+    spawner: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -51,7 +62,7 @@ pub fn spawn_mux_with_reconnection<R, W, ReconnectFut>(
     io_writer: W,
     config: MuxConfig,
     reconnect: impl FnMut() -> ReconnectFut + Send + 'static,
-    spawner: &mut JoinSet<()>,
+    spawner: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -65,7 +76,7 @@ fn spawn_mux<R, W, ReconnectFut>(
     io_writer: W,
     config: MuxConfig,
     reconnect: Option<impl FnMut() -> ReconnectFut + Send + 'static>,
-    spawner: &mut JoinSet<()>,
+    spawner: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -81,22 +92,24 @@ where
         stream_accept_tx,
     };
     spawner.spawn(async move {
-        let res = run_services(io_reader, io_writer, &config, stream_init_handle).await;
+        let (stream_init_handle, err) =
+            run_services(io_reader, io_writer, &config, stream_init_handle).await;
         let Some(mut reconnect) = reconnect else {
-            return;
+            return err;
         };
-        let Some(mut stream_init_handle) = res else {
-            return;
+        let Some(mut curr_stream_init_handle) = stream_init_handle else {
+            return err;
         };
         loop {
             let Some((io_reader, io_writer)) = reconnect().await else {
-                return;
+                return err;
             };
-            let res = run_services(io_reader, io_writer, &config, stream_init_handle).await;
-            match res {
-                Some(x) => stream_init_handle = x,
-                None => return,
-            }
+            let (stream_init_handle, err) =
+                run_services(io_reader, io_writer, &config, curr_stream_init_handle).await;
+            let Some(stream_init_handle) = stream_init_handle else {
+                return err;
+            };
+            curr_stream_init_handle = stream_init_handle;
         }
     });
     (stream_opener, stream_accepter)
@@ -107,7 +120,7 @@ async fn run_services<R, W>(
     io_writer: W,
     config: &MuxConfig,
     stream_init_handle: StreamInitHandle,
-) -> Option<StreamInitHandle>
+) -> (Option<StreamInitHandle>, MuxError)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -148,12 +161,41 @@ where
         .await
     });
 
-    let res = control_spawner.join_next().await.unwrap().unwrap();
-    match res {
-        Ok(()) => None,
-        Err(e) => match e {
-            RunControlError::DeadCentralIo(_, stream_init_handle) => Some(stream_init_handle),
-            RunControlError::DeadStreamInit(_) => None,
+    let control_res = control_spawner.join_next().await.unwrap().unwrap();
+    let control_err = control_res.unwrap_err();
+
+    let err = match &control_err {
+        RunControlError::DeadCentralIo(dead_central_io, _) => match dead_central_io.side {
+            Side::Read => {
+                let err = central_io_reader_spawner
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                let RunCentralIoReaderError::IoReader(e) = err else {
+                    panic!();
+                };
+                MuxError::IoReader(e)
+            }
+            Side::Write => {
+                let err = central_io_writer_spawner
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                let RunCentralIoWriterError::IoWriter(e) = err else {
+                    panic!();
+                };
+                MuxError::IoWriter(e)
+            }
         },
-    }
+        RunControlError::DeadStreamInit(_) => MuxError::DeadStreamInit,
+    };
+    let stream_init_handle = match control_err {
+        RunControlError::DeadCentralIo(_, stream_init_handle) => Some(stream_init_handle),
+        RunControlError::DeadStreamInit(_) => None,
+    };
+    (stream_init_handle, err)
 }

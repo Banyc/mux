@@ -46,6 +46,9 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
     let (stream_close_tx, mut stream_close_rx) = stream_close_channel();
     let e: DeadCentralIo = loop {
         tokio::select! {
+            () = write_control_tx.closed() => {
+                break DeadCentralIo { side: Side::Write };
+            }
             res = stream_close_rx.recv() => {
                 let msg = res.unwrap();
                 control.local_close(msg.stream_id, msg.side);
@@ -341,7 +344,10 @@ impl StreamWriteDataTx {
             stream_id: self.stream_id,
             data,
         };
-        self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| DeadCentralIo { side: Side::Write })
     }
 }
 

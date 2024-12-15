@@ -79,7 +79,13 @@ pub struct WriteControlTx {
 }
 impl WriteControlTx {
     pub async fn send(&self, msg: WriteControlMsg) -> Result<(), DeadCentralIo> {
-        self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| DeadCentralIo { side: Side::Write })
+    }
+    pub async fn closed(&self) {
+        self.tx.closed().await
     }
 }
 #[derive(Debug)]
