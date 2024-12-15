@@ -5,7 +5,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::{
     common::Side,
     control::{DeadControl, WriteDataRx},
-    protocol::{DataHeader, Header, StreamId, StreamIdMsg},
+    protocol::{BodyLen, DataHeader, Header, StreamId, StreamIdMsg},
     stream::writer::{WriteControlMsg, WriteControlRx},
 };
 
@@ -85,9 +85,9 @@ where
         let hdr = Header::Data;
         let mut remaining_body_len = msg.data.len();
         while remaining_body_len != 0 {
-            let body_len = remaining_body_len.min(usize::try_from(u32::MAX).unwrap());
+            let body_len = remaining_body_len.min(usize::from(BodyLen::MAX));
             remaining_body_len -= body_len;
-            let body_len = u32::try_from(body_len).unwrap();
+            let body_len = BodyLen::try_from(body_len).unwrap();
             let data_hdr = DataHeader {
                 stream_id: msg.stream_id,
                 body_len,

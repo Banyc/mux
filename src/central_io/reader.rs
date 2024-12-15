@@ -93,7 +93,7 @@ where
         self.io_reader.read_exact(&mut hdr).await.unwrap();
         let hdr = DataHeader::decode(hdr);
         let mut buf = self.pkt_pool.take_scoped();
-        buf.extend(core::iter::repeat(0).take(usize::try_from(hdr.body_len).unwrap()));
+        buf.extend(core::iter::repeat(0).take(usize::from(hdr.body_len)));
         self.io_reader.read_exact(&mut buf).await?;
         Ok((hdr.stream_id, buf))
     }

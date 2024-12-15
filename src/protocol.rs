@@ -62,21 +62,22 @@ impl StreamIdMsg {
     }
 }
 
+pub type BodyLen = u16;
 #[derive(Debug, Clone)]
 pub struct DataHeader {
     pub stream_id: StreamId,
-    pub body_len: u32,
+    pub body_len: BodyLen,
 }
 impl DataHeader {
-    pub const SIZE: usize = core::mem::size_of::<StreamId>() + core::mem::size_of::<u32>();
+    pub const SIZE: usize = core::mem::size_of::<StreamId>() + core::mem::size_of::<BodyLen>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
         let mut stream = [0; 4];
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
-        let mut body_len = [0; 4];
+        let mut body_len = [0; 2];
         rdr.read_exact(&mut body_len).unwrap();
-        let body_len = u32::from_be_bytes(body_len);
+        let body_len = BodyLen::from_be_bytes(body_len);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
         Self {
             stream_id: stream,
