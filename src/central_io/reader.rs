@@ -4,6 +4,7 @@ use primitive::arena::obj_pool::ArcObjPool;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
+    common::Side,
     control::DeadControl,
     protocol::{DataHeader, Header, StreamId, StreamIdMsg},
 };
@@ -76,8 +77,14 @@ where
                 let (stream, pkt) = self.recv_data().await?;
                 Some(CentralIoReadMsg::Data(stream, pkt))
             }
-            Header::CloseRead => Some(CentralIoReadMsg::CloseRead(self.recv_stream_id().await?)),
-            Header::CloseWrite => Some(CentralIoReadMsg::CloseWrite(self.recv_stream_id().await?)),
+            Header::CloseRead => Some(CentralIoReadMsg::Close(
+                self.recv_stream_id().await?,
+                Side::Read,
+            )),
+            Header::CloseWrite => Some(CentralIoReadMsg::Close(
+                self.recv_stream_id().await?,
+                Side::Write,
+            )),
         })
     }
     async fn recv_data(&mut self) -> io::Result<(StreamId, DataBuf)> {
@@ -101,8 +108,7 @@ where
 pub enum CentralIoReadMsg {
     Open(StreamId),
     Data(StreamId, DataBuf),
-    CloseRead(StreamId),
-    CloseWrite(StreamId),
+    Close(StreamId, Side),
 }
 
 #[derive(Debug, Clone)]

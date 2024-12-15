@@ -1,6 +1,6 @@
 use crate::{control::DeadControl, StreamReader, StreamWriter};
 
-use super::DeadStream;
+use super::DeadStreamInit;
 
 const CHANNEL_SIZE: usize = 1024;
 
@@ -34,8 +34,8 @@ pub struct StreamAcceptTx {
     tx: tokio::sync::mpsc::Sender<StreamAcceptMsg>,
 }
 impl StreamAcceptTx {
-    pub async fn send(&self, msg: StreamAcceptMsg) -> Result<(), DeadStream> {
-        self.tx.send(msg).await.map_err(|_| DeadStream {})
+    pub async fn send(&self, msg: StreamAcceptMsg) -> Result<(), DeadStreamInit> {
+        self.tx.send(msg).await.map_err(|_| DeadStreamInit {})
     }
 }
 #[derive(Debug)]

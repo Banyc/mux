@@ -10,16 +10,129 @@ use primitive::ops::ring::RingSpace;
 
 use crate::{
     central_io::{
-        reader::CentralIoReadMsg,
+        reader::{CentralIoReadMsg, CentralReadRx},
         writer::{WriteControlMsg, WriteDataMsg},
         DataBuf, DeadCentralIo,
     },
-    common::{End, Side},
+    common::Side,
     protocol::StreamId,
-    stream::reader::{StreamReadDataMsg, StreamReadDataTx},
+    stream::{
+        accepter::StreamAcceptMsg,
+        opener::StreamOpenMsg,
+        reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
+        stream_close_channel, DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
+    },
+    StreamReader, StreamWriter,
 };
 
 const CHANNEL_SIZE: usize = 1024;
+
+#[derive(Debug)]
+pub struct RunControlArgs {
+    pub control: MuxControl,
+    pub central_read_rx: CentralReadRx,
+    pub write_control_tx: WriteControlTx,
+    pub stream_init_handle: StreamInitHandle,
+}
+pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
+    let RunControlArgs {
+        mut control,
+        mut central_read_rx,
+        write_control_tx,
+        mut stream_init_handle,
+    } = args;
+    let (stream_close_tx, mut stream_close_rx) = stream_close_channel();
+    let e: DeadCentralIo = loop {
+        tokio::select! {
+            res = stream_close_rx.recv() => {
+                let msg = res.unwrap();
+                control.local_close(msg.stream_id, msg.side);
+                let control_msg = WriteControlMsg::Close(msg.stream_id, msg.side);
+                if let Err(e) = write_control_tx.send(control_msg).await {
+                    break e;
+                };
+            }
+            res = stream_init_handle.stream_open_rx.recv() => {
+                let msg = res.map_err(RunControlError::DeadStream)?;
+                handle_open(&mut control, &stream_close_tx, msg).map_err(RunControlError::DeadStream)?;
+            }
+            res = central_read_rx.recv() => {
+                let msg = match res {
+                    Ok(x) => x,
+                    Err(e) => break e,
+                };
+                handle_central_read(
+                    &mut control,
+                    &stream_close_tx,
+                    &mut stream_init_handle,
+                    msg
+                ).await.map_err(RunControlError::DeadStream)?;
+            }
+        }
+    };
+    Err(RunControlError::DeadCentralIo(e, stream_init_handle))
+}
+#[derive(Debug)]
+pub enum RunControlError {
+    DeadCentralIo(DeadCentralIo, StreamInitHandle),
+    DeadStream(DeadStreamInit),
+}
+
+fn handle_open(
+    control: &mut MuxControl,
+    stream_close_tx: &StreamCloseTxPrototype,
+    msg: StreamOpenMsg,
+) -> Result<(), DeadStreamInit> {
+    let res = open_stream(control, stream_close_tx, None);
+    msg.stream.send(res).map_err(|_| DeadStreamInit {})
+}
+async fn handle_central_read(
+    control: &mut MuxControl,
+    stream_close_tx: &StreamCloseTxPrototype,
+    stream_init_handle: &mut StreamInitHandle,
+    msg: CentralIoReadMsg,
+) -> Result<(), DeadStreamInit> {
+    match msg {
+        CentralIoReadMsg::Open(stream_id) => {
+            let stream = open_stream(control, stream_close_tx, Some(stream_id)).unwrap();
+            stream_init_handle.stream_accept_tx.send(stream).await?;
+        }
+        CentralIoReadMsg::Close(stream_id, side) => {
+            control.peer_close(stream_id, side).await;
+        }
+        CentralIoReadMsg::Data(stream_id, data_buf) => {
+            let Some(dispatcher) = control.dispatcher(stream_id) else {
+                return Ok(());
+            };
+            let msg = StreamReadDataMsg::Data(data_buf);
+            let _ = dispatcher.send(msg).await;
+        }
+    }
+    Ok(())
+}
+fn open_stream(
+    control: &mut MuxControl,
+    stream_close_tx: &StreamCloseTxPrototype,
+    stream_id: Option<StreamId>,
+) -> Result<StreamAcceptMsg, TooManyOpenStreams> {
+    let write_broken_pipe = WriteBrokenPipe::new();
+    let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
+    let (stream_id, stream_write_data_tx) =
+        control.open(stream_read_data_tx, write_broken_pipe.clone(), stream_id)?;
+    let stream_reader = StreamReader::new(
+        stream_read_data_rx,
+        stream_close_tx.derive(Side::Read, stream_id),
+    );
+    let stream_writer = StreamWriter::new(
+        stream_write_data_tx,
+        write_broken_pipe,
+        stream_close_tx.derive(Side::Write, stream_id),
+    );
+    Ok(StreamAcceptMsg {
+        reader: stream_reader,
+        writer: stream_writer,
+    })
+}
 
 #[derive(Debug)]
 pub struct MuxControl {
@@ -75,17 +188,29 @@ impl MuxControl {
         };
         Ok(stream_id)
     }
-    pub async fn close(&mut self, stream_id: StreamId, end: End, side: Side) {
+    pub fn local_close(&mut self, stream_id: StreamId, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return;
         };
-        stream.close(end, side).await;
+        stream.local_close(side);
         if stream.is_closed() {
-            if self.is_local_opened_stream(stream_id) {
-                self.local_opened_streams -= 1;
-            }
-            self.stream_table.remove(&stream_id);
+            self.clean_closed_stream(stream_id);
         }
+    }
+    pub async fn peer_close(&mut self, stream_id: StreamId, side: Side) {
+        let Some(stream) = self.stream_table.get_mut(&stream_id) else {
+            return;
+        };
+        let _ = stream.peer_close(side).await;
+        if stream.is_closed() {
+            self.clean_closed_stream(stream_id);
+        }
+    }
+    fn clean_closed_stream(&mut self, stream_id: StreamId) {
+        if self.is_local_opened_stream(stream_id) {
+            self.local_opened_streams -= 1;
+        }
+        self.stream_table.remove(&stream_id);
     }
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamReadDataTx> {
         self.stream_table.get(&stream_id)?.dispatcher()
@@ -95,7 +220,7 @@ impl MuxControl {
         dispatcher: StreamReadDataTx,
         broken_pipe: WriteBrokenPipe,
         stream_id: Option<StreamId>,
-    ) -> Result<StreamWriteDataTx, TooManyOpenStreams> {
+    ) -> Result<(StreamId, StreamWriteDataTx), TooManyOpenStreams> {
         let stream_id = match stream_id {
             Some(stream_id) => stream_id,
             None => self.next_stream_id()?,
@@ -105,7 +230,7 @@ impl MuxControl {
         }
         let stream = StreamState::new(dispatcher, broken_pipe);
         self.stream_table.insert(stream_id, stream);
-        Ok(self.write_data_tx.derive(stream_id))
+        Ok((stream_id, self.write_data_tx.derive(stream_id)))
     }
 }
 
@@ -127,21 +252,26 @@ impl StreamState {
             write_broken_pipe,
         }
     }
-    pub async fn close(&mut self, end: End, side: Side) {
-        match (end, side) {
-            (End::Local, Side::Read) => self.is_read_closed = true,
-            (End::Local, Side::Write) => self.is_write_closed = true,
-            (End::Peer, Side::Read) => {
+    pub fn local_close(&mut self, side: Side) {
+        match side {
+            Side::Read => self.is_read_closed = true,
+            Side::Write => self.is_write_closed = true,
+        }
+    }
+    pub async fn peer_close(&mut self, side: Side) -> Result<(), DeadStream> {
+        match side {
+            Side::Read => {
                 if self.is_peer_read_closed {
-                    return;
+                    return Ok(());
                 }
                 self.is_peer_read_closed = true;
-                let _ = self.read_dispatcher.send(StreamReadDataMsg::Fin).await;
+                self.read_dispatcher.send(StreamReadDataMsg::Fin).await?;
             }
-            (End::Peer, Side::Write) => {
+            Side::Write => {
                 self.write_broken_pipe.close();
             }
         }
+        Ok(())
     }
     pub fn is_write_closed(&self) -> bool {
         self.is_write_closed

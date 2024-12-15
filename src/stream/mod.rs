@@ -1,9 +1,18 @@
-use crate::{common::Side, protocol::StreamId};
+use accepter::StreamAcceptTx;
+use opener::StreamOpenRx;
+
+use crate::{common::Side, control::DeadControl, protocol::StreamId};
 
 pub mod accepter;
 pub mod opener;
 pub mod reader;
 pub mod writer;
+
+#[derive(Debug)]
+pub struct StreamInitHandle {
+    pub stream_open_rx: StreamOpenRx,
+    pub stream_accept_tx: StreamAcceptTx,
+}
 
 #[derive(Debug)]
 pub struct StreamCloseMsg {
@@ -49,10 +58,12 @@ pub struct StreamCloseRx {
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamCloseMsg>,
 }
 impl StreamCloseRx {
-    pub async fn recv(&mut self) -> Result<StreamCloseMsg, DeadStream> {
-        self.rx.recv().await.ok_or(DeadStream {})
+    pub async fn recv(&mut self) -> Result<StreamCloseMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DeadStreamInit {}
 #[derive(Debug, Clone)]
 pub struct DeadStream {}

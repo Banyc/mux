@@ -3,7 +3,7 @@ use crate::{
     StreamReader, StreamWriter,
 };
 
-use super::{accepter::StreamAcceptMsg, DeadStream};
+use super::{accepter::StreamAcceptMsg, DeadStreamInit};
 
 const CHANNEL_SIZE: usize = 1024;
 
@@ -54,8 +54,8 @@ pub struct StreamOpenRx {
     rx: tokio::sync::mpsc::Receiver<StreamOpenMsg>,
 }
 impl StreamOpenRx {
-    pub async fn recv(&mut self) -> Result<StreamOpenMsg, DeadStream> {
-        self.rx.recv().await.ok_or(DeadStream {})
+    pub async fn recv(&mut self) -> Result<StreamOpenMsg, DeadStreamInit> {
+        self.rx.recv().await.ok_or(DeadStreamInit {})
     }
 }
 

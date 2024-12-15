@@ -1,6 +1,6 @@
 use crate::{central_io::DataBuf, control::DeadControl};
 
-use super::StreamCloseTx;
+use super::{DeadStream, StreamCloseTx};
 
 const CHANNEL_SIZE: usize = 1024;
 
@@ -70,8 +70,8 @@ pub struct StreamReadDataTx {
     tx: tokio::sync::mpsc::Sender<StreamReadDataMsg>,
 }
 impl StreamReadDataTx {
-    pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadControl> {
-        self.tx.send(msg).await.map_err(|_| DeadControl {})
+    pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadStream> {
+        self.tx.send(msg).await.map_err(|_| DeadStream {})
     }
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()

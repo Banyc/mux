@@ -3,6 +3,7 @@ use std::{io, time::Duration};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
+    common::Side,
     control::{DeadControl, WriteControlRx, WriteDataRx},
     protocol::{DataHeader, Header, StreamId, StreamIdMsg},
 };
@@ -62,13 +63,13 @@ where
     pub async fn send_control(&mut self, msg: WriteControlMsg) -> io::Result<()> {
         let hdr = match &msg {
             WriteControlMsg::Open(_) => Header::Open,
-            WriteControlMsg::CloseRead(_) => Header::CloseRead,
-            WriteControlMsg::CloseWrite(_) => Header::CloseWrite,
+            WriteControlMsg::Close(_, side) => match side {
+                Side::Read => Header::CloseRead,
+                Side::Write => Header::CloseWrite,
+            },
         };
         let stream_id = match msg {
-            WriteControlMsg::Open(stream_id)
-            | WriteControlMsg::CloseRead(stream_id)
-            | WriteControlMsg::CloseWrite(stream_id) => stream_id,
+            WriteControlMsg::Open(stream_id) | WriteControlMsg::Close(stream_id, _) => stream_id,
         };
         let stream_id_msg = StreamIdMsg { stream_id };
         let hdr = hdr.encode();
@@ -105,8 +106,7 @@ where
 #[derive(Debug, Clone)]
 pub enum WriteControlMsg {
     Open(StreamId),
-    CloseRead(StreamId),
-    CloseWrite(StreamId),
+    Close(StreamId, Side),
 }
 
 #[derive(Debug)]
