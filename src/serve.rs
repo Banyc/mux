@@ -36,7 +36,6 @@ pub struct MuxConfig {
 pub enum MuxError {
     IoReader(io::Error),
     IoWriter(io::Error),
-    DeadStreamInit,
 }
 
 pub fn spawn_mux_no_reconnection<R, W>(
@@ -191,11 +190,9 @@ where
                 MuxError::IoWriter(e)
             }
         },
-        RunControlError::DeadStreamInit(_) => MuxError::DeadStreamInit,
     };
     let stream_init_handle = match control_err {
         RunControlError::DeadCentralIo(_, stream_init_handle) => Some(stream_init_handle),
-        RunControlError::DeadStreamInit(_) => None,
     };
     (stream_init_handle, err)
 }

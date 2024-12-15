@@ -57,9 +57,11 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                     break e;
                 };
             }
-            res = stream_init_handle.stream_open_rx.recv() => {
-                let msg = res.map_err(RunControlError::DeadStreamInit)?;
-                let stream_id = handle_local_open(&mut control, &stream_close_tx, msg).map_err(RunControlError::DeadStreamInit)?;
+            Ok(msg) = stream_init_handle.stream_open_rx.recv() => {
+                let stream_id = match handle_local_open(&mut control, &stream_close_tx, msg) {
+                    Ok(stream_id) => stream_id,
+                    Err(DeadStreamInit {}) => continue,
+                };
                 if let Some(stream_id) = stream_id {
                     let control_msg = WriteControlMsg::Open(stream_id);
                     if let Err(e) = write_control_tx.send(control_msg).await {
@@ -72,12 +74,14 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                     Ok(x) => x,
                     Err(e) => break e,
                 };
-                handle_central_read(
+                if let Err(DeadStreamInit {}) = handle_central_read(
                     &mut control,
                     &stream_close_tx,
                     &mut stream_init_handle,
                     msg
-                ).await.map_err(RunControlError::DeadStreamInit)?;
+                ).await {
+                    continue;
+                }
             }
         }
     };
@@ -86,7 +90,6 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
 #[derive(Debug)]
 pub enum RunControlError {
     DeadCentralIo(DeadCentralIo, StreamInitHandle),
-    DeadStreamInit(DeadStreamInit),
 }
 
 fn handle_local_open(

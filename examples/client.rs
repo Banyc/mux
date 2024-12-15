@@ -43,18 +43,9 @@ async fn main() {
                 initiation: Initiation::Client,
                 heartbeat_interval: Duration::from_secs(5),
             };
-            let (opener, mut accepter) =
+            let (opener, _accepter) =
                 spawn_mux_no_reconnection(read, write, config, &mut mux_spawner);
-            tokio::spawn(async move {
-                loop {
-                    let _ = accepter.accept().await;
-                }
-            });
             let (r, w) = opener.open().await.unwrap();
-            tokio::spawn(async move {
-                let _opener = opener;
-                tokio::time::sleep(Duration::MAX).await;
-            });
             (Box::new(PollRead::new(r)), Box::new(PollWrite::new(w)))
         }
         _ => panic!("unknown protocol `{protocol}`"),
