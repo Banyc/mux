@@ -114,7 +114,7 @@ async fn handle_central_read(
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
             let (_, stream) = open_stream(control, stream_close_tx, Some(stream_id)).unwrap();
-            stream_init_handle.stream_accept_tx.send(stream).await?;
+            stream_init_handle.stream_accept_tx.try_send(stream)?;
         }
         CentralIoReadMsg::Close(stream_id, side) => {
             control.peer_close(stream_id, side).await;
