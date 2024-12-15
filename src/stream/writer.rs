@@ -1,5 +1,6 @@
-use std::num::NonZeroUsize;
+use std::{io, num::NonZeroUsize};
 
+use async_async_io::write::AsyncAsyncWrite;
 use primitive::arena::obj_pool::ArcObjPool;
 
 const CHANNEL_SIZE: usize = 1024;
@@ -39,6 +40,25 @@ impl StreamWriter {
     pub fn close(&mut self) {
         self.close = None;
     }
+    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
+        if self.close.is_none() {
+            return Err(SendError::LocalClosedStream);
+        }
+        if self.broken_pipe.is_closed() {
+            return Err(SendError::PeerClosedStream);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let data_len = buf.len().min(MAX_DATA_SENT_ONCE);
+        let mut data_buf = self.buf_pool.take_scoped();
+        data_buf.extend(&buf[..data_len]);
+        self.data
+            .send(data_buf)
+            .await
+            .map_err(SendError::DeadCentralIo)?;
+        Ok(data_len)
+    }
     pub async fn send(&mut self, buf: &[u8]) -> Result<(), SendError> {
         if self.close.is_none() {
             return Err(SendError::LocalClosedStream);
@@ -65,6 +85,28 @@ pub enum SendError {
     LocalClosedStream,
     PeerClosedStream,
     DeadCentralIo(DeadCentralIo),
+}
+
+impl AsyncAsyncWrite for StreamWriter {
+    async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.write(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => Err(match e {
+                SendError::LocalClosedStream => io::ErrorKind::NotConnected.into(),
+                SendError::PeerClosedStream => io::ErrorKind::BrokenPipe.into(),
+                SendError::DeadCentralIo(_) => io::ErrorKind::BrokenPipe.into(),
+            }),
+        }
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.close();
+        Ok(())
+    }
 }
 
 pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {

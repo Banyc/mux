@@ -1,3 +1,7 @@
+use std::io;
+
+use async_async_io::read::AsyncAsyncRead;
+
 use crate::{central_io::DataBuf, control::DeadControl};
 
 use super::{DeadStream, StreamCloseTx};
@@ -20,18 +24,18 @@ impl StreamReader {
             _close: close,
         }
     }
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, RecvError> {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, DeadControl> {
         if self.is_eof {
-            return Err(RecvError::EarlyEof);
+            return Ok(0);
         }
         let (data_buf, pos) = match self.leftover.take() {
             Some(x) => x,
             None => {
-                let msg = self.data.recv().await.map_err(RecvError::DeadControl)?;
+                let msg = self.data.recv().await?;
                 let data_buf = match msg {
                     StreamReadDataMsg::Fin => {
                         self.is_eof = true;
-                        return Err(RecvError::EarlyEof);
+                        return Ok(0);
                     }
                     StreamReadDataMsg::Data(data_buf) => data_buf,
                 };
@@ -48,10 +52,14 @@ impl StreamReader {
         Ok(data_len)
     }
 }
-#[derive(Debug)]
-pub enum RecvError {
-    EarlyEof,
-    DeadControl(DeadControl),
+
+impl AsyncAsyncRead for StreamReader {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.recv(buf).await {
+            Ok(n) => Ok(n),
+            Err(DeadControl {}) => Err(io::ErrorKind::BrokenPipe.into()),
+        }
+    }
 }
 
 #[derive(Debug)]

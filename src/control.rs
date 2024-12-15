@@ -253,7 +253,7 @@ struct StreamState {
     is_write_closed: bool,
     is_read_closed: bool,
     read_dispatcher: StreamReadDataTx,
-    is_peer_read_closed: bool,
+    is_peer_write_closed: bool,
     write_broken_pipe: WriteBrokenPipe,
 }
 impl StreamState {
@@ -262,7 +262,7 @@ impl StreamState {
             is_write_closed: false,
             is_read_closed: false,
             read_dispatcher,
-            is_peer_read_closed: false,
+            is_peer_write_closed: false,
             write_broken_pipe,
         }
     }
@@ -275,20 +275,20 @@ impl StreamState {
     pub async fn peer_close(&mut self, side: Side) -> Result<(), DeadStream> {
         match side {
             Side::Read => {
-                if self.is_peer_read_closed {
-                    return Ok(());
-                }
-                self.is_peer_read_closed = true;
-                self.read_dispatcher.send(StreamReadDataMsg::Fin).await?;
+                self.write_broken_pipe.close();
             }
             Side::Write => {
-                self.write_broken_pipe.close();
+                if self.is_peer_write_closed {
+                    return Ok(());
+                }
+                self.is_peer_write_closed = true;
+                self.read_dispatcher.send(StreamReadDataMsg::Fin).await?;
             }
         }
         Ok(())
     }
     pub fn dispatcher(&self) -> Option<&StreamReadDataTx> {
-        if self.is_peer_read_closed {
+        if self.is_peer_write_closed {
             return None;
         }
         Some(&self.read_dispatcher)
@@ -296,7 +296,7 @@ impl StreamState {
     pub fn is_closed(&self) -> bool {
         self.is_write_closed
             && self.is_read_closed
-            && self.is_peer_read_closed
+            && self.is_peer_write_closed
             && self.write_broken_pipe.is_closed()
     }
 }
