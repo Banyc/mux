@@ -9,13 +9,12 @@ use crate::{
     central_io::DeadCentralIo,
     common::Side,
     control::{DeadControl, StreamWriteDataTx, WriteBrokenPipe},
-    protocol::StreamId,
+    protocol::{BodyLen, StreamId},
 };
 
 use super::StreamCloseTx;
 
 const BUF_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
-const MAX_DATA_SENT_ONCE: usize = 1 << 12;
 
 #[derive(Debug)]
 pub struct StreamWriter {
@@ -50,7 +49,7 @@ impl StreamWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        let data_len = buf.len().min(MAX_DATA_SENT_ONCE);
+        let data_len = buf.len().min(usize::from(BodyLen::MAX));
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         self.data
@@ -68,7 +67,7 @@ impl StreamWriter {
         }
         let remaining_buf = &mut &*buf;
         while !remaining_buf.is_empty() {
-            let data_len = remaining_buf.len().min(MAX_DATA_SENT_ONCE);
+            let data_len = remaining_buf.len().min(usize::from(BodyLen::MAX));
             let mut data_buf = self.buf_pool.take_scoped();
             data_buf.extend(&remaining_buf[..data_len]);
             *remaining_buf = &remaining_buf[data_len..];
