@@ -38,7 +38,6 @@ mod benches {
         // b.set_nodelay(true).unwrap();
         (a, b)
     }
-
     fn get_mux_pair(
         spawner: &mut JoinSet<MuxError>,
     ) -> (
@@ -63,6 +62,23 @@ mod benches {
             let b = accepter.accept().await.unwrap();
             let a = PollIo::new(PollRead::new(a.0), PollWrite::new(a.1));
             let b = PollIo::new(PollRead::new(b.0), PollWrite::new(b.1));
+            (a, b)
+        })
+    }
+    fn get_smux_pair() -> (
+        async_smux::MuxStream<TcpStream>,
+        async_smux::MuxStream<TcpStream>,
+    ) {
+        RT.block_on(async {
+            let (a, b) = get_tcp_pair().await;
+            let (connector, _, worker) =
+                async_smux::MuxBuilder::client().with_connection(a).build();
+            RT.spawn(worker);
+            let (_, mut acceptor, worker) =
+                async_smux::MuxBuilder::server().with_connection(b).build();
+            RT.spawn(worker);
+            let a = connector.connect().unwrap();
+            let b = acceptor.accept().await.unwrap();
             (a, b)
         })
     }
@@ -118,11 +134,15 @@ mod benches {
         let (a, b) = RT.block_on(async { get_tcp_pair().await });
         bench_send(bencher, a, b);
     }
-
     #[bench]
     fn bench_mux_send(bencher: &mut Bencher) {
         let mut spawner = JoinSet::new();
         let (a, b) = get_mux_pair(&mut spawner);
+        bench_send(bencher, a, b);
+    }
+    #[bench]
+    fn bench_smux_send(bencher: &mut Bencher) {
+        let (a, b) = get_smux_pair();
         bench_send(bencher, a, b);
     }
 }
