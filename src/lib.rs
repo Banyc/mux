@@ -1,3 +1,9 @@
+#![cfg_attr(feature = "nightly", feature(test))]
+#[cfg(feature = "nightly")]
+extern crate test;
+
+#[cfg(feature = "nightly")]
+mod bench;
 mod central_io;
 mod common;
 mod control;
