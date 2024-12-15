@@ -10,8 +10,8 @@ use primitive::ops::ring::RingSpace;
 
 use crate::{
     central_io::{
-        reader::{CentralIoReadMsg, CentralReadRx},
-        writer::{WriteControlMsg, WriteDataMsg},
+        reader::{CentralIoReadMsg, CentralIoReadRx},
+        writer::WriteDataMsg,
         DataBuf, DeadCentralIo,
     },
     common::Side,
@@ -20,7 +20,9 @@ use crate::{
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
         reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
-        stream_close_channel, DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
+        stream_close_channel,
+        writer::{WriteControlMsg, WriteControlTx},
+        DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
     },
     StreamReader, StreamWriter,
 };
@@ -30,14 +32,14 @@ const CHANNEL_SIZE: usize = 1024;
 #[derive(Debug)]
 pub struct RunControlArgs {
     pub control: MuxControl,
-    pub central_read_rx: CentralReadRx,
+    pub central_io_read_rx: CentralIoReadRx,
     pub write_control_tx: WriteControlTx,
     pub stream_init_handle: StreamInitHandle,
 }
 pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
     let RunControlArgs {
         mut control,
-        mut central_read_rx,
+        mut central_io_read_rx,
         write_control_tx,
         mut stream_init_handle,
     } = args;
@@ -53,10 +55,16 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                 };
             }
             res = stream_init_handle.stream_open_rx.recv() => {
-                let msg = res.map_err(RunControlError::DeadStream)?;
-                handle_open(&mut control, &stream_close_tx, msg).map_err(RunControlError::DeadStream)?;
+                let msg = res.map_err(RunControlError::DeadStreamInit)?;
+                let stream_id = handle_local_open(&mut control, &stream_close_tx, msg).map_err(RunControlError::DeadStreamInit)?;
+                if let Some(stream_id) = stream_id {
+                    let control_msg = WriteControlMsg::Open(stream_id);
+                    if let Err(e) = write_control_tx.send(control_msg).await {
+                        break e;
+                    };
+                }
             }
-            res = central_read_rx.recv() => {
+            res = central_io_read_rx.recv() => {
                 let msg = match res {
                     Ok(x) => x,
                     Err(e) => break e,
@@ -66,7 +74,7 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                     &stream_close_tx,
                     &mut stream_init_handle,
                     msg
-                ).await.map_err(RunControlError::DeadStream)?;
+                ).await.map_err(RunControlError::DeadStreamInit)?;
             }
         }
     };
@@ -75,16 +83,21 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
 #[derive(Debug)]
 pub enum RunControlError {
     DeadCentralIo(DeadCentralIo, StreamInitHandle),
-    DeadStream(DeadStreamInit),
+    DeadStreamInit(DeadStreamInit),
 }
 
-fn handle_open(
+fn handle_local_open(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
     msg: StreamOpenMsg,
-) -> Result<(), DeadStreamInit> {
+) -> Result<Option<StreamId>, DeadStreamInit> {
     let res = open_stream(control, stream_close_tx, None);
-    msg.stream.send(res).map_err(|_| DeadStreamInit {})
+    let (resp, stream_id) = match res {
+        Ok((stream_id, msg)) => (Ok(msg), Some(stream_id)),
+        Err(e) => (Err(e), None),
+    };
+    msg.stream.send(resp).map_err(|_| DeadStreamInit {})?;
+    Ok(stream_id)
 }
 async fn handle_central_read(
     control: &mut MuxControl,
@@ -94,7 +107,7 @@ async fn handle_central_read(
 ) -> Result<(), DeadStreamInit> {
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
-            let stream = open_stream(control, stream_close_tx, Some(stream_id)).unwrap();
+            let (_, stream) = open_stream(control, stream_close_tx, Some(stream_id)).unwrap();
             stream_init_handle.stream_accept_tx.send(stream).await?;
         }
         CentralIoReadMsg::Close(stream_id, side) => {
@@ -114,7 +127,7 @@ fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
     stream_id: Option<StreamId>,
-) -> Result<StreamAcceptMsg, TooManyOpenStreams> {
+) -> Result<(StreamId, StreamAcceptMsg), TooManyOpenStreams> {
     let write_broken_pipe = WriteBrokenPipe::new();
     let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
     let (stream_id, stream_write_data_tx) =
@@ -128,10 +141,11 @@ fn open_stream(
         write_broken_pipe,
         stream_close_tx.derive(Side::Write, stream_id),
     );
-    Ok(StreamAcceptMsg {
+    let msg = StreamAcceptMsg {
         reader: stream_reader,
         writer: stream_writer,
-    })
+    };
+    Ok((stream_id, msg))
 }
 
 #[derive(Debug)]
@@ -151,9 +165,6 @@ impl MuxControl {
             next_possible_local_stream_id: 0,
             write_data_tx,
         }
-    }
-    pub fn streams(&self) -> usize {
-        self.stream_table.len()
     }
     fn is_local_opened_stream(&self, stream_id: StreamId) -> bool {
         let is_first_bit_set = stream_id >> (StreamId::BITS - 1) == 1;
@@ -273,9 +284,6 @@ impl StreamState {
         }
         Ok(())
     }
-    pub fn is_write_closed(&self) -> bool {
-        self.is_write_closed
-    }
     pub fn dispatcher(&self) -> Option<&StreamReadDataTx> {
         if self.is_peer_read_closed {
             return None;
@@ -335,9 +343,6 @@ impl StreamWriteDataTx {
         };
         self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
     }
-    pub fn stream_id(&self) -> StreamId {
-        self.stream_id
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -355,25 +360,6 @@ impl WriteBrokenPipe {
     }
     pub fn close(&self) {
         self.should_write_close.store(true, Ordering::Relaxed);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WriteControlTx {
-    tx: tokio::sync::mpsc::Sender<WriteControlMsg>,
-}
-impl WriteControlTx {
-    pub async fn send(&self, msg: WriteControlMsg) -> Result<(), DeadCentralIo> {
-        self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
-    }
-}
-#[derive(Debug)]
-pub struct WriteControlRx {
-    rx: tokio::sync::mpsc::Receiver<WriteControlMsg>,
-}
-impl WriteControlRx {
-    pub async fn recv(&mut self) -> Result<WriteControlMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
     }
 }
 

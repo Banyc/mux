@@ -4,8 +4,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
     common::Side,
-    control::{DeadControl, WriteControlRx, WriteDataRx},
+    control::{DeadControl, WriteDataRx},
     protocol::{DataHeader, Header, StreamId, StreamIdMsg},
+    stream::writer::{WriteControlMsg, WriteControlRx},
 };
 
 use super::DataBuf;
@@ -101,12 +102,6 @@ where
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum WriteControlMsg {
-    Open(StreamId),
-    Close(StreamId, Side),
 }
 
 #[derive(Debug)]

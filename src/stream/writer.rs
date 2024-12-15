@@ -2,9 +2,13 @@ use std::num::NonZeroUsize;
 
 use primitive::arena::obj_pool::ArcObjPool;
 
+const CHANNEL_SIZE: usize = 1024;
+
 use crate::{
     central_io::DeadCentralIo,
-    control::{StreamWriteDataTx, WriteBrokenPipe},
+    common::Side,
+    control::{DeadControl, StreamWriteDataTx, WriteBrokenPipe},
+    protocol::StreamId,
 };
 
 use super::StreamCloseTx;
@@ -61,4 +65,35 @@ pub enum SendError {
     LocalClosedStream,
     PeerClosedStream,
     DeadCentralIo(DeadCentralIo),
+}
+
+pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let tx = WriteControlTx { tx };
+    let rx = WriteControlRx { rx };
+    (tx, rx)
+}
+#[derive(Debug, Clone)]
+pub struct WriteControlTx {
+    tx: tokio::sync::mpsc::Sender<WriteControlMsg>,
+}
+impl WriteControlTx {
+    pub async fn send(&self, msg: WriteControlMsg) -> Result<(), DeadCentralIo> {
+        self.tx.send(msg).await.map_err(|_| DeadCentralIo {})
+    }
+}
+#[derive(Debug)]
+pub struct WriteControlRx {
+    rx: tokio::sync::mpsc::Receiver<WriteControlMsg>,
+}
+impl WriteControlRx {
+    pub async fn recv(&mut self) -> Result<WriteControlMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WriteControlMsg {
+    Open(StreamId),
+    Close(StreamId, Side),
 }

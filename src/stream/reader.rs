@@ -73,9 +73,6 @@ impl StreamReadDataTx {
     pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadStream> {
         self.tx.send(msg).await.map_err(|_| DeadStream {})
     }
-    pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
-    }
 }
 #[derive(Debug)]
 pub struct StreamReadDataRx {

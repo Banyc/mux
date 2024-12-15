@@ -12,10 +12,11 @@ use crate::{
 use super::{DataBuf, DeadCentralIo};
 
 const OBJ_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(4) };
+const CHANNEL_SIZE: usize = 1024;
 
 pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
-    tx: CentralReadTx,
+    tx: CentralIoReadTx,
 ) -> Result<(), RunCentralIoReaderError>
 where
     R: AsyncRead + Unpin,
@@ -110,21 +111,26 @@ pub enum CentralIoReadMsg {
     Data(StreamId, DataBuf),
     Close(StreamId, Side),
 }
-
+pub fn central_io_read_channel() -> (CentralIoReadTx, CentralIoReadRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let tx = CentralIoReadTx { tx };
+    let rx = CentralIoReadRx { rx };
+    (tx, rx)
+}
 #[derive(Debug, Clone)]
-pub struct CentralReadTx {
+pub struct CentralIoReadTx {
     tx: tokio::sync::mpsc::Sender<CentralIoReadMsg>,
 }
-impl CentralReadTx {
+impl CentralIoReadTx {
     pub async fn send(&self, msg: CentralIoReadMsg) -> Result<(), DeadControl> {
         self.tx.send(msg).await.map_err(|_| DeadControl {})
     }
 }
 #[derive(Debug)]
-pub struct CentralReadRx {
+pub struct CentralIoReadRx {
     rx: tokio::sync::mpsc::Receiver<CentralIoReadMsg>,
 }
-impl CentralReadRx {
+impl CentralIoReadRx {
     pub async fn recv(&mut self) -> Result<CentralIoReadMsg, DeadCentralIo> {
         self.rx.recv().await.ok_or(DeadCentralIo {})
     }
