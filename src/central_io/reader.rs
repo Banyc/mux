@@ -40,13 +40,13 @@ pub enum RunCentralIoReaderError {
 #[derive(Debug)]
 pub struct CentralIoReader<R> {
     io_reader: R,
-    pkt_pool: ArcObjPool<Vec<u8>>,
+    buf_pool: ArcObjPool<Vec<u8>>,
 }
 impl<R> CentralIoReader<R> {
     pub fn new(io_reader: R) -> Self {
         Self {
             io_reader,
-            pkt_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
+            buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
         }
     }
 }
@@ -92,7 +92,7 @@ where
         let mut hdr = [0; DataHeader::SIZE];
         self.io_reader.read_exact(&mut hdr).await.unwrap();
         let hdr = DataHeader::decode(hdr);
-        let mut buf = self.pkt_pool.take_scoped();
+        let mut buf = self.buf_pool.take_scoped();
         buf.extend(core::iter::repeat(0).take(usize::from(hdr.body_len)));
         self.io_reader.read_exact(&mut buf).await?;
         Ok((hdr.stream_id, buf))
