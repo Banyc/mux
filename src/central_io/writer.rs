@@ -73,6 +73,9 @@ where
         let stream_id = match msg {
             WriteControlMsg::Open(stream_id) | WriteControlMsg::Close(stream_id, _) => stream_id,
         };
+        self.send_control_(hdr, stream_id).await
+    }
+    async fn send_control_(&mut self, hdr: Header, stream_id: u32) -> io::Result<()> {
         let stream_id_msg = StreamIdMsg { stream_id };
         let hdr = hdr.encode();
         let stream_id_msg = stream_id_msg.encode();
@@ -83,8 +86,15 @@ where
         Ok(())
     }
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
+        let data_buf = match msg.data {
+            StreamWriteData::Fin => {
+                let hdr = Header::CloseWrite;
+                return self.send_control_(hdr, msg.stream_id).await;
+            }
+            StreamWriteData::Data(data_buf) => data_buf,
+        };
         let hdr = Header::Data;
-        let mut remaining_body_len = msg.data.len();
+        let mut remaining_body_len = data_buf.len();
         while remaining_body_len != 0 {
             let body_len = remaining_body_len.min(usize::from(BodyLen::MAX));
             remaining_body_len -= body_len;
@@ -99,7 +109,7 @@ where
             let fixed_buf: [u8; Header::SIZE + DataHeader::SIZE] =
                 core::array::from_fn(|_| concat.next().unwrap());
             self.io_writer.write_all(&fixed_buf).await?;
-            self.io_writer.write_all(&msg.data).await?;
+            self.io_writer.write_all(&data_buf).await?;
         }
         Ok(())
     }
@@ -108,7 +118,12 @@ where
 #[derive(Debug)]
 pub struct WriteDataMsg {
     pub stream_id: StreamId,
-    pub data: DataBuf,
+    pub data: StreamWriteData,
+}
+#[derive(Debug)]
+pub enum StreamWriteData {
+    Fin,
+    Data(DataBuf),
 }
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
@@ -143,16 +158,47 @@ pub struct StreamWriteDataTx {
     tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
-    pub async fn send(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
+    pub async fn send_data(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
-            data,
+            data: StreamWriteData::Data(data),
         };
         self.tx
             .send(msg)
             .await
             .map_err(|_| DeadCentralIo { side: Side::Write })
     }
+    pub async fn send_eof(&self) -> Result<(), DeadCentralIo> {
+        let msg = WriteDataMsg {
+            stream_id: self.stream_id,
+            data: StreamWriteData::Fin,
+        };
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| DeadCentralIo { side: Side::Write })
+    }
+    pub fn try_send_eof(&self) -> Result<(), StreamWriteDataTxTrySendEofError> {
+        let msg = WriteDataMsg {
+            stream_id: self.stream_id,
+            data: StreamWriteData::Fin,
+        };
+        let Err(e) = self.tx.try_send(msg) else {
+            return Ok(());
+        };
+        Err(match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                StreamWriteDataTxTrySendEofError::QueueFull
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                StreamWriteDataTxTrySendEofError::DeadCentralIo(DeadCentralIo { side: Side::Write })
+            }
+        })
+    }
+}
+pub enum StreamWriteDataTxTrySendEofError {
+    DeadCentralIo(DeadCentralIo),
+    QueueFull,
 }
 
 #[derive(Debug, Clone)]

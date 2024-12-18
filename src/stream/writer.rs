@@ -4,7 +4,10 @@ use async_async_io::write::AsyncAsyncWrite;
 use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
-    central_io::{writer::StreamWriteDataTx, DeadCentralIo},
+    central_io::{
+        writer::{StreamWriteDataTx, StreamWriteDataTxTrySendEofError},
+        DeadCentralIo,
+    },
     control::WriteBrokenPipe,
     protocol::BodyLen,
 };
@@ -20,6 +23,20 @@ pub struct StreamWriter {
     close: Option<StreamCloseTx>,
     buf_pool: ArcObjPool<Vec<u8>>,
 }
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        let Some(mut close) = self.close.take() else {
+            return;
+        };
+        match self.data.try_send_eof() {
+            Ok(()) => close.no_send_to_peer(),
+            Err(e) => match e {
+                StreamWriteDataTxTrySendEofError::DeadCentralIo(DeadCentralIo { side: _ }) => (),
+                StreamWriteDataTxTrySendEofError::QueueFull => (),
+            },
+        }
+    }
+}
 impl StreamWriter {
     pub(crate) fn new(
         data: StreamWriteDataTx,
@@ -33,8 +50,13 @@ impl StreamWriter {
             buf_pool: ArcObjPool::new(None, BUF_POOL_SHARDS, Vec::new, |v| v.clear()),
         }
     }
-    pub fn close(&mut self) {
-        self.close = None;
+    pub async fn close(&mut self) -> Result<(), DeadCentralIo> {
+        let Some(mut close) = self.close.take() else {
+            return Ok(());
+        };
+        self.data.send_eof().await?;
+        close.no_send_to_peer();
+        Ok(())
     }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         if self.close.is_none() {
@@ -50,7 +72,7 @@ impl StreamWriter {
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         self.data
-            .send(data_buf)
+            .send_data(data_buf)
             .await
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len)
@@ -69,7 +91,7 @@ impl StreamWriter {
             data_buf.extend(&remaining_buf[..data_len]);
             *remaining_buf = &remaining_buf[data_len..];
             self.data
-                .send(data_buf)
+                .send_data(data_buf)
                 .await
                 .map_err(SendError::DeadCentralIo)?;
         }
@@ -100,7 +122,9 @@ impl AsyncAsyncWrite for StreamWriter {
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        self.close();
+        if let Err(DeadCentralIo { side: _ }) = self.close().await {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         Ok(())
     }
 }
