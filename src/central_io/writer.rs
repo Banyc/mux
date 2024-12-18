@@ -158,27 +158,17 @@ pub struct StreamWriteDataTx {
     tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
-    pub async fn send_data(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
+    pub async fn send(&self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
-            data: StreamWriteData::Data(data),
+            data,
         };
         self.tx
             .send(msg)
             .await
             .map_err(|_| DeadCentralIo { side: Side::Write })
     }
-    pub async fn send_eof(&self) -> Result<(), DeadCentralIo> {
-        let msg = WriteDataMsg {
-            stream_id: self.stream_id,
-            data: StreamWriteData::Fin,
-        };
-        self.tx
-            .send(msg)
-            .await
-            .map_err(|_| DeadCentralIo { side: Side::Write })
-    }
-    pub fn try_send_eof(&self) -> Result<(), StreamWriteDataTxTrySendEofError> {
+    pub fn try_send_eof(&self) -> Result<(), TrySendEofError> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
             data: StreamWriteData::Fin,
@@ -187,16 +177,14 @@ impl StreamWriteDataTx {
             return Ok(());
         };
         Err(match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                StreamWriteDataTxTrySendEofError::QueueFull
-            }
+            tokio::sync::mpsc::error::TrySendError::Full(_) => TrySendEofError::QueueFull,
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                StreamWriteDataTxTrySendEofError::DeadCentralIo(DeadCentralIo { side: Side::Write })
+                TrySendEofError::DeadCentralIo(DeadCentralIo { side: Side::Write })
             }
         })
     }
 }
-pub enum StreamWriteDataTxTrySendEofError {
+pub enum TrySendEofError {
     DeadCentralIo(DeadCentralIo),
     QueueFull,
 }

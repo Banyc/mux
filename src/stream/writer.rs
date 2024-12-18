@@ -5,7 +5,7 @@ use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
     central_io::{
-        writer::{StreamWriteDataTx, StreamWriteDataTxTrySendEofError},
+        writer::{StreamWriteData, StreamWriteDataTx, TrySendEofError},
         DeadCentralIo,
     },
     control::WriteBrokenPipe,
@@ -31,8 +31,8 @@ impl Drop for StreamWriter {
         match self.data.try_send_eof() {
             Ok(()) => close.no_send_to_peer(),
             Err(e) => match e {
-                StreamWriteDataTxTrySendEofError::DeadCentralIo(DeadCentralIo { side: _ }) => (),
-                StreamWriteDataTxTrySendEofError::QueueFull => (),
+                TrySendEofError::DeadCentralIo(DeadCentralIo { side: _ }) => (),
+                TrySendEofError::QueueFull => (),
             },
         }
     }
@@ -54,7 +54,7 @@ impl StreamWriter {
         let Some(mut close) = self.close.take() else {
             return Ok(());
         };
-        self.data.send_eof().await?;
+        self.data.send(StreamWriteData::Fin).await?;
         close.no_send_to_peer();
         Ok(())
     }
@@ -72,7 +72,7 @@ impl StreamWriter {
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         self.data
-            .send_data(data_buf)
+            .send(StreamWriteData::Data(data_buf))
             .await
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len)
@@ -91,7 +91,7 @@ impl StreamWriter {
             data_buf.extend(&remaining_buf[..data_len]);
             *remaining_buf = &remaining_buf[data_len..];
             self.data
-                .send_data(data_buf)
+                .send(StreamWriteData::Data(data_buf))
                 .await
                 .map_err(SendError::DeadCentralIo)?;
         }
