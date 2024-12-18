@@ -11,8 +11,8 @@ use primitive::ops::ring::RingSpace;
 use crate::{
     central_io::{
         reader::{CentralIoReadMsg, CentralIoReadRx},
-        writer::WriteDataMsg,
-        DataBuf, DeadCentralIo,
+        writer::{StreamWriteDataTx, WriteControlMsg, WriteControlTx, WriteDataTxPrototype},
+        DeadCentralIo,
     },
     common::Side,
     protocol::StreamId,
@@ -20,14 +20,10 @@ use crate::{
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
         reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
-        stream_close_channel,
-        writer::{WriteControlMsg, WriteControlTx},
-        DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
+        stream_close_channel, DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
     },
     StreamReader, StreamWriter,
 };
-
-const CHANNEL_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub struct RunControlArgs {
@@ -306,51 +302,6 @@ impl StreamState {
 impl Drop for StreamState {
     fn drop(&mut self) {
         self.write_broken_pipe.close();
-    }
-}
-
-pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
-    let tx = WriteDataTxPrototype { tx };
-    let rx = WriteDataRx { rx };
-    (tx, rx)
-}
-#[derive(Debug)]
-pub struct WriteDataRx {
-    rx: tokio::sync::mpsc::Receiver<WriteDataMsg>,
-}
-impl WriteDataRx {
-    pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
-    }
-}
-#[derive(Debug, Clone)]
-pub struct WriteDataTxPrototype {
-    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
-}
-impl WriteDataTxPrototype {
-    pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
-        StreamWriteDataTx {
-            tx: self.tx.clone(),
-            stream_id: stream,
-        }
-    }
-}
-#[derive(Debug, Clone)]
-pub struct StreamWriteDataTx {
-    stream_id: StreamId,
-    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
-}
-impl StreamWriteDataTx {
-    pub async fn send(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
-        let msg = WriteDataMsg {
-            stream_id: self.stream_id,
-            data,
-        };
-        self.tx
-            .send(msg)
-            .await
-            .map_err(|_| DeadCentralIo { side: Side::Write })
     }
 }
 

@@ -4,12 +4,13 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
     common::Side,
-    control::{DeadControl, WriteDataRx},
+    control::DeadControl,
     protocol::{BodyLen, DataHeader, Header, StreamId, StreamIdMsg},
-    stream::writer::{WriteControlMsg, WriteControlRx},
 };
 
-use super::DataBuf;
+use super::{DataBuf, DeadCentralIo};
+
+const CHANNEL_SIZE: usize = 1024;
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoWriter<W>,
@@ -108,4 +109,84 @@ where
 pub struct WriteDataMsg {
     pub stream_id: StreamId,
     pub data: DataBuf,
+}
+pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let tx = WriteDataTxPrototype { tx };
+    let rx = WriteDataRx { rx };
+    (tx, rx)
+}
+#[derive(Debug)]
+pub struct WriteDataRx {
+    rx: tokio::sync::mpsc::Receiver<WriteDataMsg>,
+}
+impl WriteDataRx {
+    pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
+    }
+}
+#[derive(Debug, Clone)]
+pub struct WriteDataTxPrototype {
+    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
+}
+impl WriteDataTxPrototype {
+    pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
+        StreamWriteDataTx {
+            tx: self.tx.clone(),
+            stream_id: stream,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct StreamWriteDataTx {
+    stream_id: StreamId,
+    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
+}
+impl StreamWriteDataTx {
+    pub async fn send(&self, data: DataBuf) -> Result<(), DeadCentralIo> {
+        let msg = WriteDataMsg {
+            stream_id: self.stream_id,
+            data,
+        };
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| DeadCentralIo { side: Side::Write })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WriteControlMsg {
+    Open(StreamId),
+    Close(StreamId, Side),
+}
+pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let tx = WriteControlTx { tx };
+    let rx = WriteControlRx { rx };
+    (tx, rx)
+}
+#[derive(Debug, Clone)]
+pub struct WriteControlTx {
+    tx: tokio::sync::mpsc::Sender<WriteControlMsg>,
+}
+impl WriteControlTx {
+    pub async fn send(&self, msg: WriteControlMsg) -> Result<(), DeadCentralIo> {
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| DeadCentralIo { side: Side::Write })
+    }
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+}
+#[derive(Debug)]
+pub struct WriteControlRx {
+    rx: tokio::sync::mpsc::Receiver<WriteControlMsg>,
+}
+impl WriteControlRx {
+    pub async fn recv(&mut self) -> Result<WriteControlMsg, DeadControl> {
+        self.rx.recv().await.ok_or(DeadControl {})
+    }
 }

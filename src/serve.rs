@@ -11,16 +11,16 @@ use crate::{
             central_io_read_channel, run_central_io_reader, CentralIoReader,
             RunCentralIoReaderError,
         },
-        writer::{run_central_io_writer, CentralIoWriter, RunCentralIoWriterError},
+        writer::{
+            run_central_io_writer, write_control_channel, write_data_channel, CentralIoWriter,
+            RunCentralIoWriterError,
+        },
     },
     common::Side,
-    control::{
-        run_control, write_data_channel, Initiation, MuxControl, RunControlArgs, RunControlError,
-    },
+    control::{run_control, Initiation, MuxControl, RunControlArgs, RunControlError},
     stream::{
         accepter::stream_accept_channel,
         opener::{stream_open_channel, StreamOpener},
-        writer::write_control_channel,
         StreamInitHandle,
     },
     StreamAccepter,

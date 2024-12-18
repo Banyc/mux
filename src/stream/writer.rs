@@ -3,13 +3,10 @@ use std::{io, num::NonZeroUsize};
 use async_async_io::write::AsyncAsyncWrite;
 use primitive::arena::obj_pool::ArcObjPool;
 
-const CHANNEL_SIZE: usize = 1024;
-
 use crate::{
-    central_io::DeadCentralIo,
-    common::Side,
-    control::{DeadControl, StreamWriteDataTx, WriteBrokenPipe},
-    protocol::{BodyLen, StreamId},
+    central_io::{writer::StreamWriteDataTx, DeadCentralIo},
+    control::WriteBrokenPipe,
+    protocol::BodyLen,
 };
 
 use super::StreamCloseTx;
@@ -106,41 +103,4 @@ impl AsyncAsyncWrite for StreamWriter {
         self.close();
         Ok(())
     }
-}
-
-pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
-    let tx = WriteControlTx { tx };
-    let rx = WriteControlRx { rx };
-    (tx, rx)
-}
-#[derive(Debug, Clone)]
-pub struct WriteControlTx {
-    tx: tokio::sync::mpsc::Sender<WriteControlMsg>,
-}
-impl WriteControlTx {
-    pub async fn send(&self, msg: WriteControlMsg) -> Result<(), DeadCentralIo> {
-        self.tx
-            .send(msg)
-            .await
-            .map_err(|_| DeadCentralIo { side: Side::Write })
-    }
-    pub async fn closed(&self) {
-        self.tx.closed().await
-    }
-}
-#[derive(Debug)]
-pub struct WriteControlRx {
-    rx: tokio::sync::mpsc::Receiver<WriteControlMsg>,
-}
-impl WriteControlRx {
-    pub async fn recv(&mut self) -> Result<WriteControlMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum WriteControlMsg {
-    Open(StreamId),
-    Close(StreamId, Side),
 }
