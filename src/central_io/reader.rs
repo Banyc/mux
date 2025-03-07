@@ -90,7 +90,7 @@ where
     }
     async fn recv_data(&mut self) -> io::Result<(StreamId, DataBuf)> {
         let mut hdr = [0; DataHeader::SIZE];
-        self.io_reader.read_exact(&mut hdr).await.unwrap();
+        self.io_reader.read_exact(&mut hdr).await?;
         let hdr = DataHeader::decode(hdr);
         let mut buf = self.buf_pool.take_scoped();
         buf.extend(core::iter::repeat(0).take(usize::from(hdr.body_len)));
@@ -99,7 +99,7 @@ where
     }
     async fn recv_stream_id(&mut self) -> io::Result<StreamId> {
         let mut hdr = [0; StreamIdMsg::SIZE];
-        self.io_reader.read_exact(&mut hdr).await.unwrap();
+        self.io_reader.read_exact(&mut hdr).await?;
         let hdr = StreamIdMsg::decode(hdr);
         Ok(hdr.stream_id)
     }
