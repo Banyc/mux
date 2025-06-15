@@ -14,7 +14,7 @@ use crate::{
 
 use super::StreamCloseTx;
 
-const BUF_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
+const BUF_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
 #[derive(Debug)]
 pub struct StreamWriter {

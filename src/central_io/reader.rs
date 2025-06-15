@@ -11,7 +11,7 @@ use crate::{
 
 use super::{DataBuf, DeadCentralIo};
 
-const OBJ_POOL_SHARDS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(4) };
+const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const CHANNEL_SIZE: usize = 1024;
 
 pub async fn run_central_io_reader<R>(
@@ -93,7 +93,7 @@ where
         self.io_reader.read_exact(&mut hdr).await?;
         let hdr = DataHeader::decode(hdr);
         let mut buf = self.buf_pool.take_scoped();
-        buf.extend(core::iter::repeat(0).take(usize::from(hdr.body_len)));
+        buf.extend(std::iter::repeat_n(0, usize::from(hdr.body_len)));
         self.io_reader.read_exact(&mut buf).await?;
         Ok((hdr.stream_id, buf))
     }

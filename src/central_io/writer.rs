@@ -5,12 +5,13 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::{
     common::Side,
     control::DeadControl,
+    fair_queue,
     protocol::{BodyLen, DataHeader, Header, StreamId, StreamIdMsg},
 };
 
 use super::{DataBuf, DeadCentralIo};
 
-const CHANNEL_SIZE: usize = 1024;
+const CONTROL_CHANNEL_SIZE: usize = 1024;
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoWriter<W>,
@@ -126,14 +127,14 @@ pub enum StreamWriteData {
     Data(DataBuf),
 }
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let (tx, rx) = fair_queue::channel();
     let tx = WriteDataTxPrototype { tx };
     let rx = WriteDataRx { rx };
     (tx, rx)
 }
 #[derive(Debug)]
 pub struct WriteDataRx {
-    rx: tokio::sync::mpsc::Receiver<WriteDataMsg>,
+    rx: fair_queue::Receiver<WriteDataMsg>,
 }
 impl WriteDataRx {
     pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
@@ -142,7 +143,7 @@ impl WriteDataRx {
 }
 #[derive(Debug, Clone)]
 pub struct WriteDataTxPrototype {
-    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
+    tx: fair_queue::Sender<WriteDataMsg>,
 }
 impl WriteDataTxPrototype {
     pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
@@ -155,10 +156,10 @@ impl WriteDataTxPrototype {
 #[derive(Debug, Clone)]
 pub struct StreamWriteDataTx {
     stream_id: StreamId,
-    tx: tokio::sync::mpsc::Sender<WriteDataMsg>,
+    tx: fair_queue::Sender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
-    pub async fn send(&self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
+    pub async fn send(&mut self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
             data,
@@ -168,7 +169,7 @@ impl StreamWriteDataTx {
             .await
             .map_err(|_| DeadCentralIo { side: Side::Write })
     }
-    pub fn try_send_eof(&self) -> Result<(), TrySendEofError> {
+    pub fn try_send_eof(&mut self) -> Result<(), TrySendEofError> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
             data: StreamWriteData::Fin,
@@ -195,7 +196,7 @@ pub enum WriteControlMsg {
     Close(StreamId, Side),
 }
 pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_CHANNEL_SIZE);
     let tx = WriteControlTx { tx };
     let rx = WriteControlRx { rx };
     (tx, rx)

@@ -7,6 +7,7 @@ mod bench;
 mod central_io;
 mod common;
 mod control;
+mod fair_queue;
 mod protocol;
 mod serve;
 mod stream;
