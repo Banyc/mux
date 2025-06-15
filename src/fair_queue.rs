@@ -11,83 +11,112 @@ const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
 const DATA_QUEUE_SIZE: usize = 1 << 10;
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+pub fn channel<T>() -> (Opener<T>, Receiver<T>) {
     let (opener_tx, opener_rx) = mpsc::channel(OPENER_QUEUE_SIZE);
-    let tx = Sender::new(opener_tx);
+    let tx = Opener::new(opener_tx);
     let rx = Receiver::new(opener_rx);
     (tx, rx)
 }
 #[derive(Debug)]
-pub struct Sender<T> {
+pub struct Opener<T> {
     opener: mpsc::Sender<OpenRequest<T>>,
-    queue: Option<NotClone<mpsc::Sender<T>>>,
 }
-impl<T> Sender<T> {
-    fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
+impl<T> Clone for Opener<T> {
+    fn clone(&self) -> Self {
         Self {
-            opener,
-            queue: None,
+            opener: self.opener.clone(),
         }
     }
-    pub fn try_send(&mut self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
-        let queue = match &self.queue {
-            Some(NotClone(queue)) => queue,
-            None => {
-                let (resp_tx, mut resp_rx) = oneshot::channel();
-                let req = OpenRequest {
-                    dedicated_chan: resp_tx,
-                };
-                match self.opener.try_send(req) {
-                    Ok(_) => (),
-                    Err(e) => match e {
-                        mpsc::error::TrySendError::Full(_) => {
-                            return Err(mpsc::error::TrySendError::Full(value))
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            return Err(mpsc::error::TrySendError::Closed(value))
-                        }
-                    },
-                };
-                let queue = match resp_rx.try_recv() {
-                    Ok(queue) => queue,
-                    Err(_) => return Err(mpsc::error::TrySendError::Closed(value)),
-                };
-                let NotClone(queue) = self.queue.get_or_insert(NotClone(queue));
-                queue
-            }
-        };
-        queue.try_send(value)
+}
+impl<T> Opener<T> {
+    fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
+        Self { opener }
     }
-    pub async fn send(&mut self, value: T) -> Result<(), mpsc::error::SendError<T>> {
-        let queue = match &self.queue {
-            Some(NotClone(queue)) => queue,
-            None => {
-                let (resp_tx, resp_rx) = oneshot::channel();
-                let req = OpenRequest {
-                    dedicated_chan: resp_tx,
-                };
-                match self.opener.send(req).await {
-                    Ok(_) => (),
-                    Err(_) => return Err(mpsc::error::SendError(value)),
-                };
-                let queue = match resp_rx.await {
-                    Ok(queue) => queue,
-                    Err(_) => return Err(mpsc::error::SendError(value)),
-                };
-                let NotClone(queue) = self.queue.get_or_insert(NotClone(queue));
-                queue
-            }
+    pub async fn open(&self) -> Option<Sender<T>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = OpenRequest {
+            dedicated_chan: resp_tx,
         };
-        queue.send(value).await
+        match self.opener.send(req).await {
+            Ok(_) => (),
+            Err(_) => return None,
+        };
+        let queue = match resp_rx.await {
+            Ok(queue) => queue,
+            Err(_) => return None,
+        };
+        Some(Sender::new(queue))
     }
+    pub fn lazy_open(&self) -> LazySender<T> {
+        LazySender::new(self.clone())
+    }
+}
+#[derive(Debug)]
+pub struct Sender<T> {
+    queue: mpsc::Sender<T>,
 }
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Self {
-            opener: self.opener.clone(),
-            queue: None,
+            queue: self.queue.clone(),
         }
     }
+}
+impl<T> Sender<T> {
+    fn new(queue: mpsc::Sender<T>) -> Self {
+        Self { queue }
+    }
+    pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
+        self.queue.try_send(value)
+    }
+    pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.queue.send(value).await
+    }
+}
+#[derive(Debug)]
+pub struct LazySender<T> {
+    opener: Opener<T>,
+    sender: Option<NotClone<Sender<T>>>,
+}
+impl<T> LazySender<T> {
+    fn new(opener: Opener<T>) -> Self {
+        Self {
+            opener,
+            sender: None,
+        }
+    }
+    async fn ensure_sender(&mut self) -> Option<&Sender<T>> {
+        if self.sender.is_none() {
+            let sender = self.opener.open().await?;
+            self.sender.get_or_insert(NotClone(sender));
+        }
+        Some(&self.sender.as_ref().unwrap().0)
+    }
+    pub fn try_send(&mut self, value: T) -> Result<(), (LazySenderError, T)> {
+        let Some(NotClone(sender)) = &self.sender else {
+            return Err((LazySenderError::NotOpened, value));
+        };
+        match sender.try_send(value) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(value)) => Err((LazySenderError::Full, value)),
+            Err(mpsc::error::TrySendError::Closed(value)) => Err((LazySenderError::Closed, value)),
+        }
+    }
+    pub async fn send(&mut self, value: T) -> Result<(), (LazySenderError, T)> {
+        let Some(sender) = self.ensure_sender().await else {
+            return Err((LazySenderError::Closed, value));
+        };
+        match sender.send(value).await {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::SendError(value)) => Err((LazySenderError::Closed, value)),
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub enum LazySenderError {
+    Closed,
+    Full,
+    NotOpened,
 }
 #[derive(Debug)]
 pub struct Receiver<T> {
@@ -104,15 +133,15 @@ impl<T> Receiver<T> {
         }
     }
     pub async fn recv(&mut self) -> Option<T> {
-        struct FairReceiverFut<'a, T>(&'a mut Receiver<T>);
-        impl<T> Future for FairReceiverFut<'_, T> {
+        struct FairReceiverRecv<'a, T>(&'a mut Receiver<T>);
+        impl<T> Future for FairReceiverRecv<'_, T> {
             type Output = Option<T>;
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.deref_mut();
                 this.0.poll_recv(cx)
             }
         }
-        FairReceiverFut(self).await
+        FairReceiverRecv(self).await
     }
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if self.queues.len() != MAX_QUEUE_COUNT {

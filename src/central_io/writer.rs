@@ -128,7 +128,7 @@ pub enum StreamWriteData {
 }
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let (tx, rx) = fair_queue::channel();
-    let tx = WriteDataTxPrototype { tx };
+    let tx = WriteDataTxPrototype { opener: tx };
     let rx = WriteDataRx { rx };
     (tx, rx)
 }
@@ -143,20 +143,20 @@ impl WriteDataRx {
 }
 #[derive(Debug, Clone)]
 pub struct WriteDataTxPrototype {
-    tx: fair_queue::Sender<WriteDataMsg>,
+    opener: fair_queue::Opener<WriteDataMsg>,
 }
 impl WriteDataTxPrototype {
     pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
         StreamWriteDataTx {
-            tx: self.tx.clone(),
+            tx: self.opener.lazy_open(),
             stream_id: stream,
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StreamWriteDataTx {
     stream_id: StreamId,
-    tx: fair_queue::Sender<WriteDataMsg>,
+    tx: fair_queue::LazySender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
     pub async fn send(&mut self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
@@ -178,8 +178,9 @@ impl StreamWriteDataTx {
             return Ok(());
         };
         Err(match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => TrySendEofError::QueueFull,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            (fair_queue::LazySenderError::Full, _)
+            | (fair_queue::LazySenderError::NotOpened, _) => TrySendEofError::WouldBlock,
+            (fair_queue::LazySenderError::Closed, _) => {
                 TrySendEofError::DeadCentralIo(DeadCentralIo { side: Side::Write })
             }
         })
@@ -187,7 +188,7 @@ impl StreamWriteDataTx {
 }
 pub enum TrySendEofError {
     DeadCentralIo(DeadCentralIo),
-    QueueFull,
+    WouldBlock,
 }
 
 #[derive(Debug, Clone)]

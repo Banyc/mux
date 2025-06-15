@@ -32,7 +32,7 @@ impl Drop for StreamWriter {
             Ok(()) => close.no_send_to_peer(),
             Err(e) => match e {
                 TrySendEofError::DeadCentralIo(DeadCentralIo { side: _ }) => (),
-                TrySendEofError::QueueFull => (),
+                TrySendEofError::WouldBlock => (),
             },
         }
     }
