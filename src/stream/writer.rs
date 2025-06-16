@@ -5,7 +5,7 @@ use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
     central_io::{
-        writer::{StreamWriteData, StreamWriteDataTx, TrySendEofError},
+        writer::{StreamWriteData, StreamWriteDataTx},
         DeadCentralIo,
     },
     control::WriteBrokenPipe,
@@ -28,13 +28,7 @@ impl Drop for StreamWriter {
         let Some(mut close) = self.close.take() else {
             return;
         };
-        match self.data.try_send_eof() {
-            Ok(()) => close.no_send_to_peer(),
-            Err(e) => match e {
-                TrySendEofError::DeadCentralIo(DeadCentralIo { side: _ }) => (),
-                TrySendEofError::WouldBlock => (),
-            },
-        }
+        close.no_send_to_peer()
     }
 }
 impl StreamWriter {
@@ -49,14 +43,6 @@ impl StreamWriter {
             close: Some(close),
             buf_pool: ArcObjPool::new(None, BUF_POOL_SHARDS, Vec::new, |v| v.clear()),
         }
-    }
-    pub async fn close(&mut self) -> Result<(), DeadCentralIo> {
-        let Some(mut close) = self.close.take() else {
-            return Ok(());
-        };
-        self.data.send(StreamWriteData::Fin).await?;
-        close.no_send_to_peer();
-        Ok(())
     }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         if self.close.is_none() {
@@ -116,15 +102,10 @@ impl AsyncAsyncWrite for StreamWriter {
             }),
         }
     }
-
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-
     async fn shutdown(&mut self) -> io::Result<()> {
-        if let Err(DeadCentralIo { side: _ }) = self.close().await {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
         Ok(())
     }
 }

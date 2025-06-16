@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -88,6 +88,7 @@ where
     }
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
         let data_buf = match msg.data {
+            StreamWriteData::Open => return Ok(()),
             StreamWriteData::Fin => {
                 let hdr = Header::CloseWrite;
                 return self.send_control_(hdr, msg.stream_id).await;
@@ -123,22 +124,45 @@ pub struct WriteDataMsg {
 }
 #[derive(Debug)]
 pub enum StreamWriteData {
+    Open,
     Fin,
     Data(DataBuf),
 }
 pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let (tx, rx) = fair_queue::channel();
     let tx = WriteDataTxPrototype { opener: tx };
-    let rx = WriteDataRx { rx };
+    let rx = WriteDataRx {
+        rx,
+        token_to_stream: HashMap::new(),
+    };
     (tx, rx)
 }
 #[derive(Debug)]
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
+    token_to_stream: HashMap<fair_queue::Token, StreamId>,
 }
 impl WriteDataRx {
     pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
+        loop {
+            let (token, msg) = self.rx.recv().await.ok_or(DeadControl {})?;
+            match msg {
+                fair_queue::ReceiverRecv::Open(value) => {
+                    self.token_to_stream.insert(token, value.stream_id);
+                    return Ok(value);
+                }
+                fair_queue::ReceiverRecv::Value(value) => return Ok(value),
+                fair_queue::ReceiverRecv::Close => {
+                    let Some(stream_id) = self.token_to_stream.remove(&token) else {
+                        continue;
+                    };
+                    return Ok(WriteDataMsg {
+                        stream_id,
+                        data: StreamWriteData::Fin,
+                    });
+                }
+            }
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -148,7 +172,10 @@ pub struct WriteDataTxPrototype {
 impl WriteDataTxPrototype {
     pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
         StreamWriteDataTx {
-            tx: self.opener.lazy_open(),
+            tx: self.opener.lazy_open(WriteDataMsg {
+                stream_id: stream,
+                data: StreamWriteData::Open,
+            }),
             stream_id: stream,
         }
     }
@@ -169,26 +196,6 @@ impl StreamWriteDataTx {
             .await
             .map_err(|_| DeadCentralIo { side: Side::Write })
     }
-    pub fn try_send_eof(&mut self) -> Result<(), TrySendEofError> {
-        let msg = WriteDataMsg {
-            stream_id: self.stream_id,
-            data: StreamWriteData::Fin,
-        };
-        let Err(e) = self.tx.try_send(msg) else {
-            return Ok(());
-        };
-        Err(match e {
-            (fair_queue::LazySenderError::Full, _)
-            | (fair_queue::LazySenderError::NotOpened, _) => TrySendEofError::WouldBlock,
-            (fair_queue::LazySenderError::Closed, _) => {
-                TrySendEofError::DeadCentralIo(DeadCentralIo { side: Side::Write })
-            }
-        })
-    }
-}
-pub enum TrySendEofError {
-    DeadCentralIo(DeadCentralIo),
-    WouldBlock,
 }
 
 #[derive(Debug, Clone)]
