@@ -387,6 +387,7 @@ dependencies = [
  "file_transfer",
  "primitive",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

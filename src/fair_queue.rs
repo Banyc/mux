@@ -3,11 +3,8 @@ use std::{
     future::Future,
     ops::DerefMut,
     pin::Pin,
-    sync::{
-        atomic::{fence, Ordering},
-        Arc, Mutex,
-    },
-    task::{Context, Poll},
+    sync::{Arc, Mutex},
+    task::{ready, Context, Poll},
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -37,7 +34,6 @@ impl<T> Opener<T> {
     fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
         Self { opener }
     }
-    #[allow(unused)]
     pub fn is_closed(&self) -> bool {
         self.opener.is_closed()
     }
@@ -83,7 +79,6 @@ impl<T> LazySender<T> {
         }
         Some(&self.sender.as_ref().unwrap().0)
     }
-    #[allow(unused)]
     pub fn try_send(&mut self, value: T) -> Result<(), (LazySenderError, T)> {
         let Some(NotClone(sender)) = &self.sender else {
             return Err((LazySenderError::NotOpened, value));
@@ -104,68 +99,142 @@ impl<T> LazySender<T> {
         }
     }
 }
-#[derive(Debug)]
-pub struct Sender<T> {
-    queue: mpsc::Sender<T>,
-    ready: Arc<Mutex<ReadyTree>>,
-    token: Token,
-}
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: self.queue.clone(),
-            ready: self.ready.clone(),
-            token: self.token,
-        }
-    }
-}
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        // dbg!("drop add");
-        self.ready.lock().unwrap().add(self.token);
-    }
-}
-impl<T> Sender<T> {
-    fn new(resp: OpenResponse<T>) -> Self {
-        Self {
-            queue: resp.dedicated_chan,
-            ready: resp.ready,
-            token: resp.token,
-        }
-    }
-    #[allow(unused)]
-    pub fn is_closed(&self) -> bool {
-        self.queue.is_closed()
-    }
-    pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
-        self.ready.lock().unwrap().add(self.token);
-        // dbg!("try send add");
-        fence(Ordering::AcqRel);
-        let res = self.queue.try_send(value);
-        if res.is_err() {
-            // dbg!("res err");
-            self.ready.lock().unwrap().sub(self.token);
-        }
-        res
-    }
-    pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
-        self.ready.lock().unwrap().add(self.token);
-        // dbg!("send add");
-        fence(Ordering::AcqRel);
-        let res = self.queue.send(value).await;
-        if res.is_err() {
-            // dbg!("res err");
-            self.ready.lock().unwrap().sub(self.token);
-        }
-        res
-    }
-}
 #[derive(Debug, Clone)]
 pub enum LazySenderError {
     Closed,
     Full,
     NotOpened,
 }
+
+#[derive(Debug)]
+pub struct PollSender<T> {
+    queue: tokio_util::sync::PollSender<T>,
+    state: SenderState,
+}
+impl<T: Send> From<Sender<T>> for PollSender<T> {
+    fn from(value: Sender<T>) -> Self {
+        Self {
+            queue: tokio_util::sync::PollSender::new(value.queue),
+            state: value.state,
+        }
+    }
+}
+impl<T: Send> PollSender<T> {
+    pub fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        self.state.poll_reserve(&mut self.queue, cx)
+    }
+    pub fn send_item(&mut self, value: T) -> Result<(), T> {
+        self.state.send_item(&mut self.queue, value)
+    }
+    pub fn poll_send(&mut self, value: T, cx: &mut Context<'_>) -> Poll<Result<(), T>> {
+        match ready!(self.poll_reserve(cx)) {
+            Ok(()) => (),
+            Err(()) => return Err(value).into(),
+        }
+        self.send_item(value).into()
+    }
+}
+#[derive(Debug)]
+pub struct Sender<T> {
+    queue: mpsc::Sender<T>,
+    state: SenderState,
+}
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+impl<T> Sender<T> {
+    fn new(resp: OpenResponse<T>) -> Self {
+        let state = SenderState::new(resp.ready, resp.token);
+        Self {
+            queue: resp.dedicated_chan,
+            state,
+        }
+    }
+    pub fn is_closed(&self) -> bool {
+        self.queue.is_closed()
+    }
+    pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
+        self.state.try_send(&self.queue, value)
+    }
+    pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.state.send(&self.queue, value).await
+    }
+}
+#[derive(Debug, Clone)]
+struct SenderState {
+    ready: Arc<Mutex<ReadyTree>>,
+    token: Token,
+}
+impl Drop for SenderState {
+    fn drop(&mut self) {
+        self.ready.lock().unwrap().add(self.token);
+    }
+}
+impl SenderState {
+    pub fn new(ready: Arc<Mutex<ReadyTree>>, token: Token) -> Self {
+        Self { ready, token }
+    }
+    pub fn try_send<T>(
+        &self,
+        queue: &mpsc::Sender<T>,
+        value: T,
+    ) -> Result<(), mpsc::error::TrySendError<T>> {
+        self.ready.lock().unwrap().add(self.token);
+        let res = queue.try_send(value);
+        if res.is_err() {
+            self.ready.lock().unwrap().sub(self.token);
+        }
+        res
+    }
+    pub async fn send<T>(
+        &self,
+        queue: &mpsc::Sender<T>,
+        value: T,
+    ) -> Result<(), mpsc::error::SendError<T>> {
+        self.ready.lock().unwrap().add(self.token);
+        let res = queue.send(value).await;
+        if res.is_err() {
+            self.ready.lock().unwrap().sub(self.token);
+        }
+        res
+    }
+    pub fn poll_reserve<T: Send>(
+        &self,
+        queue: &mut tokio_util::sync::PollSender<T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ()>> {
+        let res = ready!(queue.poll_reserve(cx));
+        match res {
+            Ok(()) => Ok(()).into(),
+            Err(e) => {
+                assert!(e.into_inner().is_none());
+                Err(()).into()
+            }
+        }
+    }
+    /// call [`Self::poll_reserve`] first
+    pub fn send_item<T: Send>(
+        &self,
+        queue: &mut tokio_util::sync::PollSender<T>,
+        value: T,
+    ) -> Result<(), T> {
+        self.ready.lock().unwrap().add(self.token);
+        let res = queue.send_item(value);
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.ready.lock().unwrap().sub(self.token);
+                Err(e.into_inner().unwrap())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Receiver<T> {
     opener: mpsc::Receiver<OpenRequest<T>>,

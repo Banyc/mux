@@ -170,20 +170,24 @@ pub struct WriteDataTxPrototype {
     opener: fair_queue::Opener<WriteDataMsg>,
 }
 impl WriteDataTxPrototype {
-    pub fn derive(&self, stream: StreamId) -> StreamWriteDataTx {
-        StreamWriteDataTx {
-            tx: self.opener.lazy_open(WriteDataMsg {
-                stream_id: stream,
-                data: StreamWriteData::Open,
-            }),
+    pub async fn derive(&self, stream: StreamId) -> Result<StreamWriteDataTx, DeadCentralIo> {
+        Ok(StreamWriteDataTx {
+            tx: self
+                .opener
+                .open(WriteDataMsg {
+                    stream_id: stream,
+                    data: StreamWriteData::Open,
+                })
+                .await
+                .ok_or(DeadCentralIo { side: Side::Write })?,
             stream_id: stream,
-        }
+        })
     }
 }
 #[derive(Debug)]
 pub struct StreamWriteDataTx {
     stream_id: StreamId,
-    tx: fair_queue::LazySender<WriteDataMsg>,
+    tx: fair_queue::Sender<WriteDataMsg>,
 }
 impl StreamWriteDataTx {
     pub async fn send(&mut self, data: StreamWriteData) -> Result<(), DeadCentralIo> {

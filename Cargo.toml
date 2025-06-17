@@ -7,6 +7,7 @@ edition = "2021"
 async_async_io = "0.2"
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7.15"
 
 [dev-dependencies]
 async_smux = "0.3"

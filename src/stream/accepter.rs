@@ -34,8 +34,8 @@ pub struct StreamAcceptTx {
     tx: tokio::sync::mpsc::Sender<StreamAcceptMsg>,
 }
 impl StreamAcceptTx {
-    pub fn try_send(&self, msg: StreamAcceptMsg) -> Result<(), DeadStreamInit> {
-        self.tx.try_send(msg).map_err(|_| DeadStreamInit {})
+    pub async fn send(&self, msg: StreamAcceptMsg) -> Result<(), DeadStreamInit> {
+        self.tx.send(msg).await.map_err(|_| DeadStreamInit {})
     }
 }
 #[derive(Debug)]
