@@ -13,7 +13,6 @@ mod protocol;
 mod serve;
 mod stream;
 
-pub use async_async_io;
 pub use control::{DeadControl, Initiation, TooManyOpenStreams};
 pub use serve::{spawn_mux_no_reconnection, spawn_mux_with_reconnection, MuxConfig, MuxError};
 pub use stream::{

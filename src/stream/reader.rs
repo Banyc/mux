@@ -1,6 +1,11 @@
-use std::io;
+use std::{
+    io,
+    ops::DerefMut,
+    pin::Pin,
+    task::{ready, Context, Poll},
+};
 
-use async_async_io::read::AsyncAsyncRead;
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{central_io::DataBuf, control::DeadControl};
 
@@ -9,33 +14,36 @@ use super::{DeadStream, StreamCloseTx};
 const CHANNEL_SIZE: usize = 1024;
 
 #[derive(Debug)]
-pub struct StreamReader {
-    data: StreamReadDataRx,
+struct StreamReaderState {
     leftover: Option<(DataBuf, usize)>,
     is_eof: bool,
     _close: StreamCloseTx,
 }
-impl StreamReader {
-    pub(crate) fn new(data: StreamReadDataRx, close: StreamCloseTx) -> Self {
+impl StreamReaderState {
+    pub fn new(close: StreamCloseTx) -> Self {
         Self {
-            data,
             leftover: None,
             is_eof: false,
             _close: close,
         }
     }
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, DeadControl> {
+    pub fn poll_recv(
+        &mut self,
+        data: &mut StreamReadDataRx,
+        buf: &mut [u8],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, DeadControl>> {
         if self.is_eof {
-            return Ok(0);
+            return Ok(0).into();
         }
         let (data_buf, pos) = match self.leftover.take() {
             Some(x) => x,
             None => {
-                let msg = self.data.recv().await?;
+                let msg = ready!(data.poll_recv(cx))?;
                 let data_buf = match msg {
                     StreamReadDataMsg::Fin => {
                         self.is_eof = true;
-                        return Ok(0);
+                        return Ok(0).into();
                     }
                     StreamReadDataMsg::Data(data_buf) => data_buf,
                 };
@@ -49,16 +57,39 @@ impl StreamReader {
         if pos < data_buf.len() {
             self.leftover = Some((data_buf, pos));
         }
-        Ok(data_len)
+        Ok(data_len).into()
     }
 }
 
-impl AsyncAsyncRead for StreamReader {
-    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.recv(buf).await {
-            Ok(n) => Ok(n),
-            Err(DeadControl {}) => Err(io::ErrorKind::BrokenPipe.into()),
-        }
+#[derive(Debug)]
+pub struct StreamReader {
+    data: StreamReadDataRx,
+    state: StreamReaderState,
+}
+impl StreamReader {
+    pub(crate) fn new(data: StreamReadDataRx, close: StreamCloseTx) -> Self {
+        let state = StreamReaderState::new(close);
+        Self { data, state }
+    }
+}
+impl AsyncRead for StreamReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.deref_mut();
+        let n = match ready!(this
+            .state
+            .poll_recv(&mut this.data, buf.initialize_unfilled(), cx))
+        {
+            Ok(n) => n,
+            Err(DeadControl {}) => {
+                return Err(io::ErrorKind::BrokenPipe.into()).into();
+            }
+        };
+        buf.advance(n);
+        Ok(()).into()
     }
 }
 
@@ -87,7 +118,13 @@ pub struct StreamReadDataRx {
     rx: tokio::sync::mpsc::Receiver<StreamReadDataMsg>,
 }
 impl StreamReadDataRx {
-    pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
-        self.rx.recv().await.ok_or(DeadControl {})
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<StreamReadDataMsg, DeadControl>> {
+        ready!(self.rx.poll_recv(cx)).ok_or(DeadControl {}).into()
     }
+    // pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
+    //     self.rx.recv().await.ok_or(DeadControl {})
+    // }
 }

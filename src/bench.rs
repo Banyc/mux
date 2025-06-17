@@ -4,7 +4,6 @@
 mod benches {
     use std::{pin::Pin, sync::LazyLock, time::Duration};
 
-    use async_async_io::read::PollRead;
     use test::Bencher;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -82,8 +81,8 @@ mod benches {
     fn get_mux_pair(
         spawner: &mut JoinSet<MuxError>,
     ) -> (
-        DuplexStream<PollRead<StreamReader>, StreamWriter>,
-        DuplexStream<PollRead<StreamReader>, StreamWriter>,
+        DuplexStream<StreamReader, StreamWriter>,
+        DuplexStream<StreamReader, StreamWriter>,
     ) {
         RT.block_on(async {
             let (a, b) = get_tcp_pair().await;
@@ -101,8 +100,8 @@ mod benches {
             let (_, mut accepter) = spawn_mux_no_reconnection(b_r, b_w, config, spawner);
             let a = opener.open().await.unwrap();
             let b = accepter.accept().await.unwrap();
-            let a = DuplexStream::new(PollRead::new(a.0), a.1);
-            let b = DuplexStream::new(PollRead::new(b.0), b.1);
+            let a = DuplexStream::new(a.0, a.1);
+            let b = DuplexStream::new(b.0, b.1);
             (a, b)
         })
     }

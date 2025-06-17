@@ -381,7 +381,6 @@ dependencies = [
 name = "mux"
 version = "0.1.0"
 dependencies = [
- "async_async_io",
  "async_smux",
  "clap",
  "file_transfer",
