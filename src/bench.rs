@@ -2,9 +2,9 @@
 
 #[cfg(test)]
 mod benches {
-    use std::{sync::LazyLock, time::Duration};
+    use std::{pin::Pin, sync::LazyLock, time::Duration};
 
-    use async_async_io::{read::PollRead, write::PollWrite, PollIo};
+    use async_async_io::read::PollRead;
     use test::Bencher;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -24,6 +24,47 @@ mod benches {
             .unwrap()
     });
 
+    #[derive(Debug)]
+    pub struct DuplexStream<R, W> {
+        r: R,
+        w: W,
+    }
+    impl<R, W> DuplexStream<R, W> {
+        pub fn new(r: R, w: W) -> Self {
+            Self { r, w }
+        }
+    }
+    impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for DuplexStream<R, W> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.r).poll_read(cx, buf)
+        }
+    }
+    impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for DuplexStream<R, W> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.w).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.w).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.w).poll_shutdown(cx)
+        }
+    }
+
     async fn get_tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -41,8 +82,8 @@ mod benches {
     fn get_mux_pair(
         spawner: &mut JoinSet<MuxError>,
     ) -> (
-        PollIo<StreamReader, StreamWriter>,
-        PollIo<StreamReader, StreamWriter>,
+        DuplexStream<PollRead<StreamReader>, StreamWriter>,
+        DuplexStream<PollRead<StreamReader>, StreamWriter>,
     ) {
         RT.block_on(async {
             let (a, b) = get_tcp_pair().await;
@@ -60,8 +101,8 @@ mod benches {
             let (_, mut accepter) = spawn_mux_no_reconnection(b_r, b_w, config, spawner);
             let a = opener.open().await.unwrap();
             let b = accepter.accept().await.unwrap();
-            let a = PollIo::new(PollRead::new(a.0), PollWrite::new(a.1));
-            let b = PollIo::new(PollRead::new(b.0), PollWrite::new(b.1));
+            let a = DuplexStream::new(PollRead::new(a.0), a.1);
+            let b = DuplexStream::new(PollRead::new(b.0), b.1);
             (a, b)
         })
     }

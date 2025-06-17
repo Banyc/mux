@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -189,15 +194,44 @@ pub struct StreamWriteDataTx {
     stream_id: StreamId,
     tx: fair_queue::Sender<WriteDataMsg>,
 }
-impl StreamWriteDataTx {
-    pub async fn send(&mut self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
+// impl StreamWriteDataTx {
+//     pub async fn send(&self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
+//         let msg = WriteDataMsg {
+//             stream_id: self.stream_id,
+//             data,
+//         };
+//         self.tx
+//             .send(msg)
+//             .await
+//             .map_err(|_| DeadCentralIo { side: Side::Write })
+//     }
+// }
+#[derive(Debug)]
+pub struct PollStreamWriteDataTx {
+    stream_id: StreamId,
+    tx: fair_queue::PollSender<WriteDataMsg>,
+}
+impl From<StreamWriteDataTx> for PollStreamWriteDataTx {
+    fn from(value: StreamWriteDataTx) -> Self {
+        Self {
+            stream_id: value.stream_id,
+            tx: value.tx.into(),
+        }
+    }
+}
+impl PollStreamWriteDataTx {
+    pub fn poll_preserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), DeadCentralIo>> {
+        self.tx
+            .poll_reserve(cx)
+            .map_err(|_| DeadCentralIo { side: Side::Write })
+    }
+    pub fn send_item(&mut self, data: StreamWriteData) -> Result<(), DeadCentralIo> {
         let msg = WriteDataMsg {
             stream_id: self.stream_id,
             data,
         };
         self.tx
-            .send(msg)
-            .await
+            .send_item(msg)
             .map_err(|_| DeadCentralIo { side: Side::Write })
     }
 }

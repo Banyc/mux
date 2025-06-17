@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use async_async_io::{read::PollRead, write::PollWrite};
+use async_async_io::read::PollRead;
 use clap::Parser;
 use file_transfer::FileTransferCommand;
 use mux::{spawn_mux_no_reconnection, Initiation, MuxConfig};
@@ -46,7 +46,7 @@ async fn main() {
             let (_opener, mut accepter) =
                 spawn_mux_no_reconnection(read, write, config, &mut mux_spawner);
             let (r, w) = accepter.accept().await.unwrap();
-            (Box::new(PollRead::new(r)), Box::new(PollWrite::new(w)))
+            (Box::new(PollRead::new(r)), Box::new(w))
         }
         _ => panic!("unknown protocol `{protocol}`"),
     };
