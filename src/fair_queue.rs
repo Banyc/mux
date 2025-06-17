@@ -108,8 +108,9 @@ pub enum LazySenderError {
 
 #[derive(Debug)]
 pub struct PollSender<T> {
-    queue: tokio_util::sync::PollSender<T>,
     state: SenderState,
+    // drop ordering barrier
+    queue: tokio_util::sync::PollSender<T>,
 }
 impl<T: Send> From<Sender<T>> for PollSender<T> {
     fn from(value: Sender<T>) -> Self {
@@ -136,8 +137,9 @@ impl<T: Send> PollSender<T> {
 }
 #[derive(Debug)]
 pub struct Sender<T> {
-    queue: mpsc::Sender<T>,
     state: SenderState,
+    // drop ordering barrier
+    queue: mpsc::Sender<T>,
 }
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
