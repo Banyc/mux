@@ -116,8 +116,8 @@ async fn handle_central_read(
             let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
                 Ok(x) => x,
                 Err(e) => match e {
-                    OpenError::TooManyOpenStreams(_) => panic!(),
-                    OpenError::DeadCentralIo(dead_central_io) => {
+                    ControlOpenError::TooManyOpenStreams(_) => panic!(),
+                    ControlOpenError::DeadCentralIo(dead_central_io) => {
                         return Err(HandleCentralReadError::DeadCentralIo(dead_central_io));
                     }
                 },
@@ -149,7 +149,7 @@ async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
     stream_id: Option<StreamId>,
-) -> Result<(StreamId, StreamAcceptMsg), OpenError> {
+) -> Result<(StreamId, StreamAcceptMsg), ControlOpenError> {
     let write_broken_pipe = WriteBrokenPipe::new();
     let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
     let (stream_id, stream_write_data_tx) = control
@@ -254,12 +254,12 @@ impl MuxControl {
         dispatcher: StreamReadDataTx,
         broken_pipe: WriteBrokenPipe,
         stream_id: Option<StreamId>,
-    ) -> Result<(StreamId, StreamWriteDataTx), OpenError> {
+    ) -> Result<(StreamId, StreamWriteDataTx), ControlOpenError> {
         let stream_id = match stream_id {
             Some(stream_id) => stream_id,
             None => self
                 .next_stream_id()
-                .map_err(OpenError::TooManyOpenStreams)?,
+                .map_err(ControlOpenError::TooManyOpenStreams)?,
         };
         if self.is_local_opened_stream(stream_id) {
             self.local_opened_streams += 1;
@@ -271,12 +271,12 @@ impl MuxControl {
             self.write_data_tx
                 .derive(stream_id)
                 .await
-                .map_err(OpenError::DeadCentralIo)?,
+                .map_err(ControlOpenError::DeadCentralIo)?,
         ))
     }
 }
 #[derive(Debug)]
-pub enum OpenError {
+pub enum ControlOpenError {
     TooManyOpenStreams(TooManyOpenStreams),
     DeadCentralIo(DeadCentralIo),
 }

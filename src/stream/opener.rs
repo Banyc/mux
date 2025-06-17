@@ -1,5 +1,5 @@
 use crate::{
-    control::{DeadControl, OpenError},
+    control::{DeadControl, ControlOpenError},
     StreamReader, StreamWriter,
 };
 
@@ -23,7 +23,7 @@ impl StreamOpener {
 
 #[derive(Debug)]
 pub struct StreamOpenMsg {
-    pub stream: tokio::sync::oneshot::Sender<Result<StreamAcceptMsg, OpenError>>,
+    pub stream: tokio::sync::oneshot::Sender<Result<StreamAcceptMsg, ControlOpenError>>,
 }
 pub fn stream_open_channel() -> (StreamOpenTx, StreamOpenRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
@@ -62,5 +62,5 @@ impl StreamOpenRx {
 #[derive(Debug)]
 pub enum StreamOpenError {
     DeadControl(DeadControl),
-    ControlOpen(OpenError),
+    ControlOpen(ControlOpenError),
 }
