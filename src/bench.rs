@@ -130,59 +130,68 @@ mod benches {
     }
 
     #[inline]
-    async fn recv<T: AsyncRead + Unpin>(buf: &mut [u8], a: &mut T) -> std::io::Result<()> {
-        a.read_exact(buf).await?;
-        Ok(())
+    async fn recv<T: AsyncRead + Unpin>(buf: &mut [u8], a: &mut T) {
+        a.read_exact(buf).await.unwrap();
     }
 
     const DATA_SIZE: usize = 0x20000;
 
-    fn bench_send<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    fn bench_send_recv(
         bencher: &mut Bencher,
-        mut a: T,
-        mut b: T,
+        mut a: impl AsyncWrite + Unpin,
+        b: impl AsyncRead + Unpin + Send + 'static,
+    ) {
+        bencher.bytes = DATA_SIZE as u64;
+        let mut b = Some(b);
+        bencher.iter(|| {
+            send_recv(&mut a, &mut b);
+        });
+    }
+
+    fn send_recv(
+        mut a: impl AsyncWrite + Unpin,
+        b: &mut Option<impl AsyncRead + Unpin + Send + 'static>,
     ) {
         let data = vec![0; DATA_SIZE];
-        let mut buf = vec![0; DATA_SIZE];
-        RT.spawn(async move {
-            loop {
-                if recv(&mut buf, &mut b).await.is_err() {
-                    break;
-                }
-            }
+
+        RT.block_on(async {
+            let r = {
+                let mut b = b.take().unwrap();
+                RT.spawn(async move {
+                    let mut buf: Vec<u8> = vec![0; DATA_SIZE];
+                    recv(&mut buf, &mut b).await;
+                    b
+                })
+            };
+            send(&data, &mut a).await;
+            *b = Some(r.await.unwrap());
         });
-        bencher.bytes = DATA_SIZE as u64;
-
-        // Warm up
-        for _ in 0..10 {
-            RT.block_on(async {
-                send(&data, &mut a).await;
-            });
-        }
-
-        for _ in 0..10 {
-            bencher.iter(|| {
-                RT.block_on(async {
-                    send(&data, &mut a).await;
-                });
-            });
-        }
     }
 
     #[bench]
     fn bench_tcp_send(bencher: &mut Bencher) {
         let (a, b) = RT.block_on(async { get_tcp_pair().await });
-        bench_send(bencher, a, b);
+        bench_send_recv(bencher, a, b);
     }
     #[bench]
     fn bench_mux_send(bencher: &mut Bencher) {
         let mut spawner = JoinSet::new();
         let (a, b) = get_mux_pair(&mut spawner);
-        bench_send(bencher, a, b);
+        bench_send_recv(bencher, a, b);
+    }
+    #[test]
+    #[ignore]
+    fn profile_mux_send() {
+        let mut spawner = JoinSet::new();
+        let (mut a, b) = get_mux_pair(&mut spawner);
+        let mut b = Some(b);
+        loop {
+            send_recv(&mut a, &mut b);
+        }
     }
     #[bench]
     fn bench_smux_send(bencher: &mut Bencher) {
         let (a, b) = get_smux_pair();
-        bench_send(bencher, a, b);
+        bench_send_recv(bencher, a, b);
     }
 }

@@ -9,5 +9,5 @@ not on crates.io.
 ## Throughput
 
 - TCP: $1$
-- this: $0.497$
-- [`async_smux`](https://github.com/black-binary/async-smux): $0.358$
+- this: $0.61$
+- [`async_smux`](https://github.com/black-binary/async-smux): $0.58$
