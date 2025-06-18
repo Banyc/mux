@@ -186,24 +186,23 @@ impl SenderState {
         queue: &mpsc::Sender<T>,
         value: T,
     ) -> Result<(), mpsc::error::TrySendError<T>> {
-        self.ready.lock().unwrap().add(self.token);
-        let res = queue.try_send(value);
-        if res.is_err() {
-            self.ready.lock().unwrap().sub(self.token);
-        }
-        res
+        let mut undo = ready_incr(&self.ready, self.token);
+        queue.try_send(value)?;
+        undo.cancel();
+        Ok(())
     }
+    /// # Cancel safety
+    ///
+    /// safe
     pub async fn send<T>(
         &self,
         queue: &mpsc::Sender<T>,
         value: T,
     ) -> Result<(), mpsc::error::SendError<T>> {
-        self.ready.lock().unwrap().add(self.token);
-        let res = queue.send(value).await;
-        if res.is_err() {
-            self.ready.lock().unwrap().sub(self.token);
-        }
-        res
+        let mut undo = ready_incr(&self.ready, self.token);
+        queue.send(value).await?;
+        undo.cancel();
+        Ok(())
     }
     pub fn poll_reserve<T: Send>(
         &self,
@@ -225,15 +224,12 @@ impl SenderState {
         queue: &mut tokio_util::sync::PollSender<T>,
         value: T,
     ) -> Result<(), T> {
-        self.ready.lock().unwrap().add(self.token);
-        let res = queue.send_item(value);
-        match res {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.ready.lock().unwrap().sub(self.token);
-                Err(e.into_inner().unwrap())
-            }
+        let mut undo = ready_incr(&self.ready, self.token);
+        if let Err(e) = queue.send_item(value) {
+            return Err(e.into_inner().unwrap());
         }
+        undo.cancel();
+        Ok(())
     }
 }
 
@@ -367,6 +363,13 @@ struct OpenResponse<T> {
     pub ready: Arc<Mutex<ReadyTree>>,
 }
 
+fn ready_incr<'a>(tree: &'a Mutex<ReadyTree>, token: Token) -> UndoGuard<impl FnMut() + 'a> {
+    tree.lock().unwrap().add(token);
+    UndoGuard::new(move || {
+        tree.lock().unwrap().sub(token);
+    })
+}
+
 #[derive(Debug, Clone)]
 struct ReadyTree {
     ready_count: BTreeMap<Token, usize>,
@@ -424,6 +427,31 @@ impl ReadyTree {
 #[derive(Debug, Clone)]
 pub struct UnreadyResult {
     pub is_spurious: bool,
+}
+
+#[derive(Debug)]
+pub struct UndoGuard<F: FnMut()> {
+    no_undo: bool,
+    undo: F,
+}
+impl<F: FnMut()> Drop for UndoGuard<F> {
+    fn drop(&mut self) {
+        if self.no_undo {
+            return;
+        }
+        (self.undo)();
+    }
+}
+impl<F: FnMut()> UndoGuard<F> {
+    pub fn new(undo: F) -> Self {
+        Self {
+            no_undo: false,
+            undo,
+        }
+    }
+    pub fn cancel(&mut self) {
+        self.no_undo = true;
+    }
 }
 
 #[derive(Debug)]

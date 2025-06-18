@@ -60,10 +60,10 @@ impl StreamWriterState {
         if buf.is_empty() {
             return Ok(0).into();
         }
+        ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
         let data_len = buf.len().min(usize::from(BodyLen::MAX));
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
-        ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
         data.send_item(StreamWriteData::Data(data_buf))
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len).into()
