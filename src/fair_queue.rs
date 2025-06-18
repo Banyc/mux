@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt::Debug,
     future::Future,
     ops::DerefMut,
     pin::Pin,
@@ -106,26 +107,34 @@ pub enum LazySenderError {
     NotOpened,
 }
 
+#[derive(Debug, Clone)]
+struct SenderWithState<Sender> {
+    pub state: SenderState,
+    // drop ordering barrier
+    pub sender: Sender,
+}
+
 #[derive(Debug)]
 pub struct PollSender<T> {
-    state: SenderState,
-    // drop ordering barrier
-    queue: tokio_util::sync::PollSender<T>,
+    queue: SenderWithState<tokio_util::sync::PollSender<T>>,
 }
 impl<T: Send> From<Sender<T>> for PollSender<T> {
     fn from(value: Sender<T>) -> Self {
+        let sender = tokio_util::sync::PollSender::new(value.queue.sender);
         Self {
-            queue: tokio_util::sync::PollSender::new(value.queue),
-            state: value.state,
+            queue: SenderWithState {
+                state: value.queue.state,
+                sender,
+            },
         }
     }
 }
 impl<T: Send> PollSender<T> {
     pub fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
-        self.state.poll_reserve(&mut self.queue, cx)
+        self.queue.state.poll_reserve(&mut self.queue.sender, cx)
     }
     pub fn send_item(&mut self, value: T) -> Result<(), T> {
-        self.state.send_item(&mut self.queue, value)
+        self.queue.state.send_item(&mut self.queue.sender, value)
     }
     pub fn poll_send(&mut self, value: T, cx: &mut Context<'_>) -> Poll<Result<(), T>> {
         match ready!(self.poll_reserve(cx)) {
@@ -137,34 +146,34 @@ impl<T: Send> PollSender<T> {
 }
 #[derive(Debug)]
 pub struct Sender<T> {
-    state: SenderState,
-    // drop ordering barrier
-    queue: mpsc::Sender<T>,
+    queue: SenderWithState<mpsc::Sender<T>>,
 }
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        Self {
-            queue: self.queue.clone(),
-            state: self.state.clone(),
-        }
+        let queue = SenderWithState {
+            state: self.queue.state.clone(),
+            sender: self.queue.sender.clone(),
+        };
+        Self { queue }
     }
 }
 impl<T> Sender<T> {
     fn new(resp: OpenResponse<T>) -> Self {
         let state = SenderState::new(resp.ready, resp.token);
-        Self {
-            queue: resp.dedicated_chan,
+        let queue = SenderWithState {
             state,
-        }
+            sender: resp.dedicated_chan,
+        };
+        Self { queue }
     }
     pub fn is_closed(&self) -> bool {
-        self.queue.is_closed()
+        self.queue.sender.is_closed()
     }
     pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
-        self.state.try_send(&self.queue, value)
+        self.queue.state.try_send(&self.queue.sender, value)
     }
     pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
-        self.state.send(&self.queue, value).await
+        self.queue.state.send(&self.queue.sender, value).await
     }
 }
 #[derive(Debug, Clone)]
@@ -267,7 +276,8 @@ impl<T> Receiver<T> {
             match self.opener.poll_recv(cx) {
                 Poll::Ready(None) => (),
                 Poll::Ready(Some(open_req)) => {
-                    let (tx, rx) = mpsc::channel(DATA_QUEUE_SIZE);
+                    let (tx, mut rx) = mpsc::channel(DATA_QUEUE_SIZE);
+                    assert!(rx.poll_recv(cx).is_pending(), "register waker");
                     let new_token = loop {
                         let token = self.next_new_token;
                         self.next_new_token = Token(self.next_new_token.0.wrapping_add(1));
@@ -281,7 +291,6 @@ impl<T> Receiver<T> {
                         ready: self.ready.clone(),
                     };
                     if open_req.resp.send(resp).is_ok() {
-                        self.ready.lock().unwrap().register(new_token);
                         self.queues.insert(new_token, rx);
                     }
                     return Some((new_token, ReceiverRecv::Open(open_req.opening_value))).into();
@@ -293,10 +302,8 @@ impl<T> Receiver<T> {
             let token = {
                 let ready = self.ready.lock().unwrap();
                 if ready.is_empty() {
-                    // dbg!("empty ready");
                     break;
                 }
-                // dbg!("some ready");
                 let Some(token) = ready.next(self.recv_queue_start) else {
                     self.recv_queue_start = Token(0);
                     continue;
@@ -308,7 +315,6 @@ impl<T> Receiver<T> {
             match queue.poll_recv(cx) {
                 Poll::Ready(Some(value)) => {
                     self.ready.lock().unwrap().sub(token);
-                    // dbg!("value", token);
                     return Some((token, ReceiverRecv::Value(value))).into();
                 }
                 Poll::Ready(None) => {
@@ -318,7 +324,6 @@ impl<T> Receiver<T> {
                         assert!(!ready.spurious_unready(token).is_spurious);
                     }
                     self.queues.remove(&token);
-                    // dbg!("close", token);
                     return Some((token, ReceiverRecv::Close)).into();
                 }
                 Poll::Pending => {
@@ -329,10 +334,8 @@ impl<T> Receiver<T> {
                         .spurious_unready(token)
                         .is_spurious
                     {
-                        // dbg!("spurious pending", token);
                         return Poll::Pending;
                     };
-                    // dbg!("accurate pending", token);
                 }
             }
         }
@@ -380,16 +383,9 @@ impl ReadyTree {
             ready_count: BTreeMap::new(),
         }
     }
-    pub fn register(&mut self, token: Token) {
-        let count = self.ready_count.entry(token).or_insert(0);
-        if *count != 0 {
-            panic!();
-        }
-    }
     pub fn add(&mut self, token: Token) {
         let count = self.ready_count.entry(token).or_insert(0);
         *count += 1;
-        // dbg!("insert");
     }
     pub fn sub(&mut self, token: Token) {
         let Some(count) = self.ready_count.get_mut(&token) else {
@@ -409,9 +405,8 @@ impl ReadyTree {
         };
         let is_spurious = *count != 0;
         if is_spurious {
-            return UnreadyResult { is_spurious };
+            return UnreadyResult { is_spurious: true };
         }
-        // dbg!("remove");
         self.ready_count.remove(&token);
         UnreadyResult { is_spurious: false }
     }
@@ -475,25 +470,19 @@ mod tests {
                 sender.send(1).await.unwrap();
             });
             tokio::time::sleep(Duration::from_millis(100)).await;
-            // dbg!("enter recv open");
             let (token_1, res) = receiver.recv().await.unwrap();
-            // dbg!("exit recv open");
             match res {
                 ReceiverRecv::Open(value) => assert_eq!(value, 0),
                 ReceiverRecv::Value(_) => panic!(),
                 ReceiverRecv::Close => panic!(),
             }
-            // dbg!("enter recv value");
             let (token_2, res) = receiver.recv().await.unwrap();
-            // dbg!("exit recv value");
             match res {
                 ReceiverRecv::Open(_) => panic!(),
                 ReceiverRecv::Value(value) => assert_eq!(value, 1),
                 ReceiverRecv::Close => panic!(),
             }
-            // dbg!("enter recv close");
             let (token_3, res) = receiver.recv().await.unwrap();
-            // dbg!("exit recv close");
             match res {
                 ReceiverRecv::Open(_) => panic!(),
                 ReceiverRecv::Value(_) => panic!(),
