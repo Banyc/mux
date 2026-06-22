@@ -20,7 +20,9 @@ use crate::{
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
         reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
-        stream_close_channel, DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
+        stream_close_channel,
+        writer::LiveStreamWriter,
+        DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
     },
     StreamReader, StreamWriter,
 };
@@ -159,11 +161,12 @@ async fn open_stream(
         stream_read_data_rx,
         stream_close_tx.derive(Side::Read, stream_id),
     );
-    let stream_writer = StreamWriter::new(
+    let live_stream_writer = LiveStreamWriter::new(
         stream_write_data_tx,
         write_broken_pipe,
         stream_close_tx.derive(Side::Write, stream_id),
     );
+    let stream_writer = StreamWriter::new(live_stream_writer);
     let msg = StreamAcceptMsg {
         reader: stream_reader,
         writer: stream_writer,

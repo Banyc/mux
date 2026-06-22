@@ -56,7 +56,7 @@ async fn manual_shutdown_reaches_peer() {
     let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
 
     // Perform the manual shutdown on the writer.
-    client_writer.shutdown().await.unwrap();
+    client_writer.shutdown().unwrap();
 
     // The peer must observe EOF on its reader: a read of any size returns 0.
     let mut buf = [0u8; 8];
@@ -85,7 +85,7 @@ async fn drop_writer_does_not_break_peer() {
 
     let payload = b"still alive";
     server_writer2.write_all(payload).await.unwrap();
-    server_writer2.shutdown().await.unwrap();
+    server_writer2.shutdown().unwrap();
 
     let mut got = [0u8; 11];
     client_reader2.read_exact(&mut got).await.unwrap();
@@ -100,5 +100,5 @@ async fn drop_writer_does_not_break_peer() {
 
     // The peer's writer on the first stream should still be usable enough to
     // be shut down cleanly without panicking.
-    server_writer.shutdown().await.unwrap();
+    server_writer.shutdown().unwrap();
 }

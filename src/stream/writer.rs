@@ -60,23 +60,20 @@ impl StreamWriterState {
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len).into()
     }
-    pub fn poll_shutdown(
-        &mut self,
-        data: &mut PollStreamWriteDataTx,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), SendError>> {
+    pub fn shutdown(&mut self, data: &mut PollStreamWriteDataTx) -> Result<(), SendError> {
         if self.close.is_none() {
-            return Ok(()).into();
+            return Ok(());
         }
         if self.broken_pipe.is_closed() {
-            return Err(SendError::PeerClosedStream).into();
+            return Err(SendError::PeerClosedStream);
         }
-        ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
-        data.send_item(StreamWriteData::Fin)
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = data
+            .poll_preserve(&mut cx)
             .map_err(SendError::DeadCentralIo)?;
         let mut close = self.close.take().unwrap();
         close.mark_close_sent_to_peer();
-        Ok(()).into()
+        Ok(())
     }
 }
 #[derive(Debug)]
@@ -87,17 +84,11 @@ pub enum SendError {
 }
 
 #[derive(Debug)]
-pub struct StreamWriter {
+pub(crate) struct LiveStreamWriter {
     data: PollStreamWriteDataTx,
     state: StreamWriterState,
 }
-impl Drop for StreamWriter {
-    fn drop(&mut self) {
-        let mut cx = Context::from_waker(Waker::noop());
-        let _ = self.poll_shutdown_(&mut cx);
-    }
-}
-impl StreamWriter {
+impl LiveStreamWriter {
     pub(crate) fn new(
         data: StreamWriteDataTx,
         broken_pipe: WriteBrokenPipe,
@@ -109,11 +100,44 @@ impl StreamWriter {
             state,
         }
     }
-    fn poll_write_(&mut self, buf: &[u8], cx: &mut Context<'_>) -> Poll<Result<usize, SendError>> {
+    pub(crate) fn shutdown(&mut self) -> Result<(), SendError> {
+        self.state.shutdown(&mut self.data)
+    }
+    pub(crate) fn poll_write(
+        &mut self,
+        buf: &[u8],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, SendError>> {
         self.state.poll_write(&mut self.data, buf, cx)
     }
-    fn poll_shutdown_(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SendError>> {
-        self.state.poll_shutdown(&mut self.data, cx)
+}
+
+#[derive(Debug)]
+pub struct StreamWriter {
+    live: Option<LiveStreamWriter>,
+}
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+impl StreamWriter {
+    pub(crate) fn new(live: LiveStreamWriter) -> Self {
+        Self { live: Some(live) }
+    }
+    pub fn shutdown(&mut self) -> Result<(), SendError> {
+        let Some(mut live) = self.live.take() else {
+            return Ok(());
+        };
+        live.shutdown()
+    }
+    pub fn poll_write(
+        &mut self,
+        buf: &[u8],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, SendError>> {
+        let live = self.live.as_mut().ok_or(SendError::LocalClosedStream)?;
+        live.poll_write(buf, cx)
     }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         struct StreamWriterWrite<'a> {
@@ -124,23 +148,10 @@ impl StreamWriter {
             type Output = Result<usize, SendError>;
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.deref_mut();
-                this.wtr.poll_write_(this.buf, cx)
+                this.wtr.poll_write(this.buf, cx)
             }
         }
         StreamWriterWrite { wtr: self, buf }.await
-    }
-    pub async fn shutdown(&mut self) -> Result<(), SendError> {
-        struct StreamWriterShutdown<'a> {
-            wtr: &'a mut StreamWriter,
-        }
-        impl Future for StreamWriterShutdown<'_> {
-            type Output = Result<(), SendError>;
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let this = self.deref_mut();
-                this.wtr.poll_shutdown_(cx)
-            }
-        }
-        StreamWriterShutdown { wtr: self }.await
     }
 }
 impl AsyncWrite for StreamWriter {
@@ -150,18 +161,17 @@ impl AsyncWrite for StreamWriter {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.deref_mut();
-        this.poll_write_(buf, cx)
-            .map_err(map_send_error_to_io_error)
+        this.poll_write(buf, cx).map_err(map_send_error_to_io_error)
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Ok(()).into()
     }
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         let this = self.deref_mut();
-        this.poll_shutdown_(cx).map_err(map_send_error_to_io_error)
+        this.shutdown().map_err(map_send_error_to_io_error).into()
     }
 }
 
