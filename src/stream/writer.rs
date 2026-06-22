@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     ops::DerefMut,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{ready, Context, Poll, Waker},
 };
 
 use primitive::arena::obj_pool::ArcObjPool;
@@ -28,14 +28,6 @@ struct StreamWriterState {
     broken_pipe: WriteBrokenPipe,
     close: Option<StreamCloseTx>,
     buf_pool: ArcObjPool<Vec<u8>>,
-}
-impl Drop for StreamWriterState {
-    fn drop(&mut self) {
-        let Some(mut close) = self.close.take() else {
-            return;
-        };
-        close.no_send_to_peer()
-    }
 }
 impl StreamWriterState {
     pub fn new(broken_pipe: WriteBrokenPipe, close: StreamCloseTx) -> Self {
@@ -68,6 +60,24 @@ impl StreamWriterState {
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len).into()
     }
+    pub fn poll_shutdown(
+        &mut self,
+        data: &mut PollStreamWriteDataTx,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), SendError>> {
+        if self.close.is_none() {
+            return Ok(()).into();
+        }
+        if self.broken_pipe.is_closed() {
+            return Err(SendError::PeerClosedStream).into();
+        }
+        ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
+        data.send_item(StreamWriteData::Fin)
+            .map_err(SendError::DeadCentralIo)?;
+        let mut close = self.close.take().unwrap();
+        close.mark_close_sent_to_peer();
+        Ok(()).into()
+    }
 }
 #[derive(Debug)]
 pub enum SendError {
@@ -81,6 +91,12 @@ pub struct StreamWriter {
     data: PollStreamWriteDataTx,
     state: StreamWriterState,
 }
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = self.poll_shutdown_(&mut cx);
+    }
+}
 impl StreamWriter {
     pub(crate) fn new(
         data: StreamWriteDataTx,
@@ -93,6 +109,12 @@ impl StreamWriter {
             state,
         }
     }
+    fn poll_write_(&mut self, buf: &[u8], cx: &mut Context<'_>) -> Poll<Result<usize, SendError>> {
+        self.state.poll_write(&mut self.data, buf, cx)
+    }
+    fn poll_shutdown_(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SendError>> {
+        self.state.poll_shutdown(&mut self.data, cx)
+    }
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         struct StreamWriterWrite<'a> {
             wtr: &'a mut StreamWriter,
@@ -102,10 +124,23 @@ impl StreamWriter {
             type Output = Result<usize, SendError>;
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.deref_mut();
-                this.wtr.state.poll_write(&mut this.wtr.data, this.buf, cx)
+                this.wtr.poll_write_(this.buf, cx)
             }
         }
         StreamWriterWrite { wtr: self, buf }.await
+    }
+    pub async fn shutdown(&mut self) -> Result<(), SendError> {
+        struct StreamWriterShutdown<'a> {
+            wtr: &'a mut StreamWriter,
+        }
+        impl Future for StreamWriterShutdown<'_> {
+            type Output = Result<(), SendError>;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.deref_mut();
+                this.wtr.poll_shutdown_(cx)
+            }
+        }
+        StreamWriterShutdown { wtr: self }.await
     }
 }
 impl AsyncWrite for StreamWriter {
@@ -115,18 +150,25 @@ impl AsyncWrite for StreamWriter {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.deref_mut();
-        this.state
-            .poll_write(&mut this.data, buf, cx)
-            .map_err(|e| match e {
-                SendError::LocalClosedStream => io::ErrorKind::NotConnected.into(),
-                SendError::PeerClosedStream => io::ErrorKind::BrokenPipe.into(),
-                SendError::DeadCentralIo(_) => io::ErrorKind::BrokenPipe.into(),
-            })
+        this.poll_write_(buf, cx)
+            .map_err(map_send_error_to_io_error)
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Ok(()).into()
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Ok(()).into()
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let this = self.deref_mut();
+        this.poll_shutdown_(cx).map_err(map_send_error_to_io_error)
+    }
+}
+
+fn map_send_error_to_io_error(e: SendError) -> io::Error {
+    match e {
+        SendError::LocalClosedStream => io::ErrorKind::NotConnected.into(),
+        SendError::PeerClosedStream => io::ErrorKind::BrokenPipe.into(),
+        SendError::DeadCentralIo(_) => io::ErrorKind::BrokenPipe.into(),
     }
 }

@@ -18,7 +18,7 @@ pub struct StreamInitHandle {
 pub struct StreamCloseMsg {
     pub side: Side,
     pub stream_id: StreamId,
-    pub no_send_to_peer: bool,
+    pub already_sent_to_peer: bool,
 }
 pub fn stream_close_channel() -> (StreamCloseTxPrototype, StreamCloseRx) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -36,7 +36,7 @@ impl StreamCloseTxPrototype {
             stream_id,
             side,
             tx: self.tx.clone(),
-            no_send_to_peer: false,
+            already_sent_to_peer: false,
         }
     }
 }
@@ -45,11 +45,11 @@ pub struct StreamCloseTx {
     stream_id: StreamId,
     side: Side,
     tx: tokio::sync::mpsc::UnboundedSender<StreamCloseMsg>,
-    no_send_to_peer: bool,
+    already_sent_to_peer: bool,
 }
 impl StreamCloseTx {
-    pub fn no_send_to_peer(&mut self) {
-        self.no_send_to_peer = true;
+    pub fn mark_close_sent_to_peer(&mut self) {
+        self.already_sent_to_peer = true;
     }
 }
 impl Drop for StreamCloseTx {
@@ -57,7 +57,7 @@ impl Drop for StreamCloseTx {
         let msg = StreamCloseMsg {
             stream_id: self.stream_id,
             side: self.side,
-            no_send_to_peer: self.no_send_to_peer,
+            already_sent_to_peer: self.already_sent_to_peer,
         };
         let _ = self.tx.send(msg);
     }

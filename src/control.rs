@@ -48,7 +48,7 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
             res = stream_close_rx.recv() => {
                 let msg = res.unwrap();
                 control.local_close(msg.stream_id, msg.side);
-                if !msg.no_send_to_peer {
+                if !msg.already_sent_to_peer {
                     let control_msg = WriteControlMsg::Close(msg.stream_id, msg.side);
                     if let Err(e) = write_control_tx.send(control_msg).await {
                         break e;
