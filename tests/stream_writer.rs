@@ -102,3 +102,76 @@ async fn drop_writer_does_not_break_peer() {
     // be shut down cleanly without panicking.
     server_writer.shutdown().unwrap();
 }
+
+// Regression test for mux frame ordering: data must not overtake Open on the
+// central byte stream.
+//
+// Before the fix, `StreamOpener::open()` resolved before the Open control
+// frame was queued on the central writer, and the central writer's select!
+// could pick a data frame before a ready control frame. A concurrent opener
+// could therefore write payload that reached the wire before the peer learned
+// the stream existed, so the receiver dropped the data for the unknown stream
+// and the remote proxy eventually hit early EOF.
+//
+// This test opens many streams concurrently and writes a payload immediately
+// after each `open()` returns. The server accepts every stream and verifies
+// each payload arrives intact. It flakes without the ordering fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_open_then_write_payload_arrives() {
+    const NUM_STREAMS: usize = 64;
+    const PAYLOAD_LEN: usize = 32;
+
+    let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair();
+
+    // Server: accept NUM_STREAMS streams and read one payload from each.
+    let mut server_handles = tokio::task::JoinSet::new();
+    server_handles.spawn(async move {
+        let mut expected: Vec<Vec<u8>> = (0..NUM_STREAMS)
+            .map(|i| {
+                let mut p = vec![0u8; PAYLOAD_LEN];
+                let seed = i as u8;
+                for (j, b) in p.iter_mut().enumerate() {
+                    *b = seed.wrapping_add(j as u8);
+                }
+                p
+            })
+            .collect();
+        for _ in 0..NUM_STREAMS {
+            let (mut reader, _writer) = server_accepter.accept().await.unwrap();
+            let mut buf = vec![0u8; PAYLOAD_LEN];
+            reader.read_exact(&mut buf).await.unwrap();
+            // The payload must match exactly one of the expected payloads.
+            let idx = expected
+                .iter()
+                .position(|p| *p == buf)
+                .expect("server received an unexpected/unknown payload");
+            expected.swap_remove(idx);
+        }
+        assert!(expected.is_empty(), "server did not receive all payloads");
+    });
+
+    // Client: open many streams concurrently and write a distinct payload to
+    // each immediately after open() returns.
+    let mut client_handles = tokio::task::JoinSet::new();
+    for i in 0..NUM_STREAMS {
+        let opener = client_opener.clone();
+        client_handles.spawn(async move {
+            let (_reader, mut writer) = opener.open().await.unwrap();
+            let mut payload = vec![0u8; PAYLOAD_LEN];
+            let seed = i as u8;
+            for (j, b) in payload.iter_mut().enumerate() {
+                *b = seed.wrapping_add(j as u8);
+            }
+            writer.write_all(&payload).await.unwrap();
+            writer.shutdown().unwrap();
+            // Keep the stream reader alive until the writer is done so the
+            // stream isn't torn down before the data is flushed.
+            drop(_reader);
+        });
+    }
+
+    while let Some(res) = client_handles.join_next().await {
+        res.unwrap();
+    }
+    server_handles.join_next().await.unwrap().unwrap();
+}

@@ -58,15 +58,9 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                 }
             }
             Ok(msg) = stream_init_handle.stream_open_rx.recv() => {
-                let stream_id = match handle_local_open(&mut control, &stream_close_tx, msg).await {
-                    Ok(stream_id) => stream_id,
-                    Err(DeadStreamInit {}) => continue,
-                };
-                if let Some(stream_id) = stream_id {
-                    let control_msg = WriteControlMsg::Open(stream_id);
-                    if let Err(e) = write_control_tx.send(control_msg).await {
-                        break e;
-                    };
+                match handle_local_open(&mut control, &stream_close_tx, &write_control_tx, msg).await {
+                    Ok(_) => (),
+                    Err(HandleLocalOpenError::DeadCentralIo(e)) => break e,
                 }
             }
             res = central_io_read_rx.recv() => {
@@ -97,15 +91,34 @@ pub enum RunControlError {
 async fn handle_local_open(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
+    write_control_tx: &WriteControlTx,
     msg: StreamOpenMsg,
-) -> Result<Option<StreamId>, DeadStreamInit> {
+) -> Result<(), HandleLocalOpenError> {
     let res = open_stream(control, stream_close_tx, None).await;
     let (resp, stream_id) = match res {
         Ok((stream_id, msg)) => (Ok(msg), Some(stream_id)),
         Err(e) => (Err(e), None),
     };
-    msg.stream.send(resp).map_err(|_| DeadStreamInit {})?;
-    Ok(stream_id)
+    // Queue the Open control frame on the central writer BEFORE resolving
+    // the opener. This guarantees the peer learns about the new stream
+    // before any data the opener writes can reach the wire, preventing data
+    // from overtaking Open on the central byte stream (which would cause the
+    // receiver to drop data for an unknown stream).
+    if let Some(stream_id) = stream_id {
+        let control_msg = WriteControlMsg::Open(stream_id);
+        write_control_tx
+            .send(control_msg)
+            .await
+            .map_err(HandleLocalOpenError::DeadCentralIo)?;
+    }
+    // If the opener's response channel is closed, the opener gave up; skip
+    // this stream but keep the control loop alive.
+    let _ = msg.stream.send(resp);
+    Ok(())
+}
+
+enum HandleLocalOpenError {
+    DeadCentralIo(DeadCentralIo),
 }
 async fn handle_central_read(
     control: &mut MuxControl,

@@ -29,9 +29,7 @@ where
 {
     loop {
         tokio::select! {
-            () = tokio::time::sleep(heartbeat_interval) => {
-                io_writer.send_heartbeat().await.map_err(RunCentralIoWriterError::IoWriter)?;
-            }
+            biased;
             res = control.recv() => {
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
                 io_writer.send_control(msg).await.map_err(RunCentralIoWriterError::IoWriter)?;
@@ -39,6 +37,9 @@ where
             res = data.recv() => {
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
                 io_writer.send_data(msg).await.map_err(RunCentralIoWriterError::IoWriter)?;
+            }
+            () = tokio::time::sleep(heartbeat_interval) => {
+                io_writer.send_heartbeat().await.map_err(RunCentralIoWriterError::IoWriter)?;
             }
         }
     }
