@@ -131,10 +131,7 @@ where
                 let n = if header_remaining.is_empty() {
                     self.io_writer.write(body_remaining).await?
                 } else {
-                    let bufs = &mut [
-                        IoSlice::new(header_remaining),
-                        IoSlice::new(body_remaining),
-                    ];
+                    let bufs = &mut [IoSlice::new(header_remaining), IoSlice::new(body_remaining)];
                     self.io_writer.write_vectored(bufs).await?
                 };
                 if n == 0 {
@@ -210,10 +207,7 @@ impl WriteDataRx {
         }
         WriteDataRecv(self).await
     }
-    fn poll_recv(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<WriteDataMsg, DeadControl>> {
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<WriteDataMsg, DeadControl>> {
         // Drain ready streams into `heads`, caching at most one message per
         // token. `poll_recv_excluding` skips tokens that already have a cached
         // head, so we never read a second message from a token that still has
@@ -221,9 +215,9 @@ impl WriteDataRx {
         // closure, so selection sees every currently-ready stream.
         while !self.rx_closed {
             let heads = &mut self.heads;
-            let res = self.rx.poll_recv_excluding(cx, |token| {
-                heads.contains_key(&token)
-            });
+            let res = self
+                .rx
+                .poll_recv_excluding(cx, |token| heads.contains_key(&token));
             match res {
                 Poll::Ready(Some((token, msg))) => {
                     let msg = match msg {
@@ -420,8 +414,8 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     use super::{
-        priority_size, round_robin_distance, write_data_channel, CentralIoWriter,
-        StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
+        priority_size, round_robin_distance, write_data_channel, CentralIoWriter, StreamWriteData,
+        StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
     };
     use crate::fair_queue;
     use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
@@ -512,7 +506,8 @@ mod tests {
     #[tokio::test]
     async fn vectored_partial_writes_output_exact_bytes() {
         let calls = Arc::new(Mutex::new(0usize));
-        let writer = MockWriter { out: Vec::new(),
+        let writer = MockWriter {
+            out: Vec::new(),
             max_per_write: Some(3),
             vectored: true,
             write_vectored_calls: Arc::clone(&calls),
@@ -533,7 +528,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_vectored_writer_uses_fallback_and_outputs_exact_bytes() {
-        let writer = MockWriter { out: Vec::new(),
+        let writer = MockWriter {
+            out: Vec::new(),
             max_per_write: Some(5),
             vectored: false,
             write_vectored_calls: Arc::new(Mutex::new(0)),
@@ -548,7 +544,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            central.io_writer.write_vectored_calls.lock().unwrap().clone(),
+            central
+                .io_writer
+                .write_vectored_calls
+                .lock()
+                .unwrap()
+                .clone(),
             0,
             "fallback path should not invoke write_vectored"
         );
@@ -558,7 +559,8 @@ mod tests {
 
     #[tokio::test]
     async fn body_larger_than_max_creates_multiple_frames_no_first_chunk_repeat() {
-        let writer = MockWriter { out: Vec::new(),
+        let writer = MockWriter {
+            out: Vec::new(),
             max_per_write: None,
             vectored: true,
             write_vectored_calls: Arc::new(Mutex::new(0)),
@@ -598,7 +600,7 @@ mod tests {
             frames += 1;
         }
         assert_eq!(reassembled, body);
-        let expected_count = (big_len + usize::from(BodyLen::MAX) - 1) / usize::from(BodyLen::MAX);
+        let expected_count = big_len.div_ceil(usize::from(BodyLen::MAX));
         assert_eq!(frames, expected_count);
     }
 
@@ -624,7 +626,9 @@ mod tests {
         let mut stream = None;
         let mut got_open = false;
         tokio::join!(
-            async { stream = Some(tx.derive(stream_id).await.unwrap()); },
+            async {
+                stream = Some(tx.derive(stream_id).await.unwrap());
+            },
             async {
                 while !got_open {
                     let msg = rx.recv().await.unwrap();
@@ -638,7 +642,11 @@ mod tests {
     }
 
     /// Send a data message on a cloned sender, for use with `tokio::spawn`.
-    async fn send_data_owned(tx: fair_queue::Sender<WriteDataMsg>, stream_id: StreamId, bytes: Vec<u8>) {
+    async fn send_data_owned(
+        tx: fair_queue::Sender<WriteDataMsg>,
+        stream_id: StreamId,
+        bytes: Vec<u8>,
+    ) {
         let msg = WriteDataMsg {
             stream_id,
             data: StreamWriteData::Data(make_data(&bytes)),
@@ -767,7 +775,9 @@ mod tests {
         assert_eq!(round_robin_distance(start, fair_queue::Token(5)), 0);
         assert_eq!(round_robin_distance(start, fair_queue::Token(6)), 1);
         assert_eq!(round_robin_distance(start, fair_queue::Token(7)), 2);
-        assert!(round_robin_distance(start, fair_queue::Token(6))
-            < round_robin_distance(start, fair_queue::Token(7)));
+        assert!(
+            round_robin_distance(start, fair_queue::Token(6))
+                < round_robin_distance(start, fair_queue::Token(7))
+        );
     }
 }

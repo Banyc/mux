@@ -1,5 +1,5 @@
 use crate::{
-    control::{DeadControl, ControlOpenError},
+    control::{ControlOpenError, DeadControl},
     StreamReader, StreamWriter,
 };
 

@@ -271,10 +271,7 @@ impl<T> Receiver<T> {
         }
         FairReceiverRecv(self).await
     }
-    pub fn poll_recv(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<(Token, ReceiverRecv<T>)>> {
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Token, ReceiverRecv<T>)>> {
         self.poll_recv_excluding(cx, |_| false)
     }
     /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`

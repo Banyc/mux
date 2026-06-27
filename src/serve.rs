@@ -187,7 +187,13 @@ where
             // instead of panicking.
             central_io_reader_spawner.abort_all();
             central_io_writer_spawner.abort_all();
-            return (None, MuxError::TaskJoin { task: "control", source: e });
+            return (
+                None,
+                MuxError::TaskJoin {
+                    task: "control",
+                    source: e,
+                },
+            );
         }
         ControlJoin::Stopped => {
             central_io_reader_spawner.abort_all();
