@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
-const DATA_QUEUE_SIZE: usize = 1;
+const DATA_QUEUE_SIZE: usize = 2;
 
 pub fn channel<T>() -> (Opener<T>, Receiver<T>) {
     let (opener_tx, opener_rx) = mpsc::channel(OPENER_QUEUE_SIZE);
