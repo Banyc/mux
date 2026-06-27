@@ -1,6 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    future::Future,
     io::{self, IoSlice},
+    pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
@@ -178,6 +180,9 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
     let rx = WriteDataRx {
         rx,
         token_to_stream: HashMap::new(),
+        heads: BTreeMap::new(),
+        head_pick_start: fair_queue::Token(0),
+        rx_closed: false,
     };
     (tx, rx)
 }
@@ -185,29 +190,120 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
     token_to_stream: HashMap<fair_queue::Token, StreamId>,
+    /// At most one cached message per stream/token. The token maps to the
+    /// *logical* stream message (Open/Value/Close already translated to a
+    /// `WriteDataMsg`) ready to be dispatched.
+    heads: BTreeMap<fair_queue::Token, WriteDataMsg>,
+    /// Round-robin cursor for selecting among cached heads.
+    head_pick_start: fair_queue::Token,
+    /// Set once the underlying fair-queue receiver reports closure.
+    rx_closed: bool,
 }
 impl WriteDataRx {
     pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
-        loop {
-            let (token, msg) = self.rx.recv().await.ok_or(DeadControl {})?;
-            match msg {
-                fair_queue::ReceiverRecv::Open(value) => {
-                    self.token_to_stream.insert(token, value.stream_id);
-                    return Ok(value);
-                }
-                fair_queue::ReceiverRecv::Value(value) => return Ok(value),
-                fair_queue::ReceiverRecv::Close => {
-                    let Some(stream_id) = self.token_to_stream.remove(&token) else {
-                        continue;
+        struct WriteDataRecv<'a>(&'a mut WriteDataRx);
+        impl Future for WriteDataRecv<'_> {
+            type Output = Result<WriteDataMsg, DeadControl>;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.0.poll_recv(cx)
+            }
+        }
+        WriteDataRecv(self).await
+    }
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<WriteDataMsg, DeadControl>> {
+        // Drain ready streams into `heads`, caching at most one message per
+        // token. `poll_recv_excluding` skips tokens that already have a cached
+        // head, so we never read a second message from a token that still has
+        // a pending head. Loop until it returns Pending (all ready drained) or
+        // closure, so selection sees every currently-ready stream.
+        while !self.rx_closed {
+            let heads = &mut self.heads;
+            let res = self.rx.poll_recv_excluding(cx, |token| {
+                heads.contains_key(&token)
+            });
+            match res {
+                Poll::Ready(Some((token, msg))) => {
+                    let msg = match msg {
+                        fair_queue::ReceiverRecv::Open(value) => {
+                            self.token_to_stream.insert(token, value.stream_id);
+                            value
+                        }
+                        fair_queue::ReceiverRecv::Value(value) => value,
+                        fair_queue::ReceiverRecv::Close => {
+                            let Some(stream_id) = self.token_to_stream.remove(&token) else {
+                                continue;
+                            };
+                            WriteDataMsg {
+                                stream_id,
+                                data: StreamWriteData::Fin,
+                            }
+                        }
                     };
-                    return Ok(WriteDataMsg {
-                        stream_id,
-                        data: StreamWriteData::Fin,
-                    });
+                    self.heads.insert(token, msg);
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    self.rx_closed = true;
+                    break;
+                }
+                Poll::Pending => {
+                    break;
                 }
             }
         }
+        // Select the best cached head: smallest (priority_size), then
+        // round-robin distance from `head_pick_start`.
+        if self.heads.is_empty() {
+            if self.rx_closed {
+                return Err(DeadControl {}).into();
+            }
+            return Poll::Pending;
+        }
+        let chosen = self.pick_head();
+        let (_, msg) = self.heads.remove_entry(&chosen).unwrap();
+        self.head_pick_start = fair_queue::Token(chosen.0.wrapping_add(1));
+        Ok(msg).into()
     }
+    /// Pick the next token to dispatch from `heads`.
+    ///
+    /// Selection key: `(priority_size, round_robin_distance_from_head_pick_start)`.
+    /// `priority_size`: Open = 0, Fin = 0, Data = data.len().
+    /// Equal-size tie-breaking is round-robin by distance from
+    /// `head_pick_start` (with wraparound), not lowest-token-first.
+    fn pick_head(&self) -> fair_queue::Token {
+        let start = self.head_pick_start;
+        let mut best: Option<(fair_queue::Token, (usize, usize))> = None;
+        for (&token, msg) in &self.heads {
+            let priority = priority_size(msg);
+            let distance = round_robin_distance(start, token);
+            let key = (priority, distance);
+            match best {
+                Some((_, best_key)) if best_key <= key => {}
+                _ => best = Some((token, key)),
+            }
+        }
+        best.unwrap().0
+    }
+}
+
+fn priority_size(msg: &WriteDataMsg) -> usize {
+    match msg.data {
+        StreamWriteData::Open => 0,
+        StreamWriteData::Fin => 0,
+        StreamWriteData::Data(ref data) => data.len(),
+    }
+}
+
+/// Forward cyclic distance from `start` to `token` in a `usize` wraparound
+/// space. Used only as a tie-breaker, so the exact modulus doesn't matter as
+/// long as it is consistent and monotonic in round-robin order.
+fn round_robin_distance(start: fair_queue::Token, token: fair_queue::Token) -> usize {
+    let start = start.0;
+    let token = token.0;
+    token.wrapping_sub(start)
 }
 #[derive(Debug, Clone)]
 pub struct WriteDataTxPrototype {
@@ -323,8 +419,12 @@ mod tests {
     use primitive::arena::obj_pool::arc_buf_pool;
     use tokio::io::AsyncWrite;
 
-    use super::{CentralIoWriter, StreamWriteData, WriteDataMsg};
-    use crate::protocol::{BodyLen, DataHeader, Header};
+    use super::{
+        priority_size, round_robin_distance, write_data_channel, CentralIoWriter,
+        StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
+    };
+    use crate::fair_queue;
+    use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
 
     /// A mock writer that records every byte and can simulate partial vectored
     /// writes. `max_per_write` caps the number of bytes any single `write` /
@@ -500,5 +600,174 @@ mod tests {
         assert_eq!(reassembled, body);
         let expected_count = (big_len + usize::from(BodyLen::MAX) - 1) / usize::from(BodyLen::MAX);
         assert_eq!(frames, expected_count);
+    }
+
+    // ---- Fairness tests ----
+
+    fn make_data(bytes: &[u8]) -> crate::central_io::DataBuf {
+        let pool = arc_buf_pool::<u8>(None, std::num::NonZeroUsize::new(1).unwrap());
+        let mut scoped = pool.take_scoped();
+        scoped.clear();
+        scoped.extend_from_slice(bytes);
+        scoped
+    }
+
+    /// Open stream `stream_id`, returning the `StreamWriteDataTx` once the
+    /// receiver has consumed the Open message. `derive` awaits the opener
+    /// response which is only produced when the receiver is polled, so the
+    /// two are driven concurrently.
+    async fn open_stream(
+        tx: &WriteDataTxPrototype,
+        rx: &mut WriteDataRx,
+        stream_id: StreamId,
+    ) -> StreamWriteDataTx {
+        let mut stream = None;
+        let mut got_open = false;
+        tokio::join!(
+            async { stream = Some(tx.derive(stream_id).await.unwrap()); },
+            async {
+                while !got_open {
+                    let msg = rx.recv().await.unwrap();
+                    assert_eq!(msg.stream_id, stream_id);
+                    assert!(matches!(msg.data, StreamWriteData::Open));
+                    got_open = true;
+                }
+            },
+        );
+        stream.unwrap()
+    }
+
+    /// Send a data message on a cloned sender, for use with `tokio::spawn`.
+    async fn send_data_owned(tx: fair_queue::Sender<WriteDataMsg>, stream_id: StreamId, bytes: Vec<u8>) {
+        let msg = WriteDataMsg {
+            stream_id,
+            data: StreamWriteData::Data(make_data(&bytes)),
+        };
+        tx.send(msg).await.unwrap();
+    }
+
+    fn data_len(data: &StreamWriteData) -> usize {
+        match data {
+            StreamWriteData::Open | StreamWriteData::Fin => 0,
+            StreamWriteData::Data(d) => d.len(),
+        }
+    }
+
+    /// Smaller ready data from stream B is emitted before larger ready data
+    /// from stream A.
+    #[tokio::test]
+    async fn smaller_ready_data_emitted_before_larger() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // Each send completes immediately (queue size 1, fresh stream) and
+        // leaves the message queued + the ready tree populated before we recv.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; 100]).await;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; 10]).await;
+
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 2, "smaller (B) should come first");
+        assert_eq!(data_len(&first.data), 10);
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.stream_id, 1, "larger (A) should come second");
+        assert_eq!(data_len(&second.data), 100);
+    }
+
+    /// Same-stream order is preserved when stream A has large then small and
+    /// stream B has small ready.
+    #[tokio::test]
+    async fn same_stream_order_preserved_with_interleaving() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // A's large message: send completes immediately (fresh stream, queue
+        // size 1) then we drain it.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; 100]).await;
+        let a_large = rx.recv().await.unwrap();
+        assert_eq!(a_large.stream_id, 1);
+        assert_eq!(data_len(&a_large.data), 100);
+
+        // Now A small and B small are both ready. Same-stream FIFO only
+        // requires A large -> A small ordering (already guaranteed by the
+        // queue-size-1 backpressure above), not that A small beats B small.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![2u8; 10]).await;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![3u8; 10]).await;
+
+        // Drain both; A small must appear (A large already consumed above).
+        let mut saw_a_small = false;
+        for _ in 0..2 {
+            let msg = rx.recv().await.unwrap();
+            if msg.stream_id == 1 {
+                saw_a_small = true;
+            }
+        }
+        assert!(saw_a_small, "A small eventually emitted after A large");
+    }
+
+    /// Equal-size messages rotate by round-robin order, not lowest-token-first.
+    #[tokio::test]
+    async fn equal_size_messages_rotate_round_robin() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+        let stream_c = open_stream(&tx, &mut rx, 3).await;
+
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; 10]).await;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; 10]).await;
+        send_data_owned(stream_c.tx.clone(), stream_c.stream_id, vec![2u8; 10]).await;
+
+        // All equal size. First pick is round-robin from head_pick_start=0, so
+        // lowest token wins the first round; afterwards the cursor advances
+        // past it, so subsequent picks rotate.
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.stream_id, 2, "round-robin advances to B");
+        let third = rx.recv().await.unwrap();
+        assert_eq!(third.stream_id, 3, "round-robin advances to C");
+
+        // Refill in the same order and confirm rotation continues: cursor is
+        // now past C, wraps around to A.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![3u8; 10]).await;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![4u8; 10]).await;
+        send_data_owned(stream_c.tx.clone(), stream_c.stream_id, vec![5u8; 10]).await;
+
+        let fourth = rx.recv().await.unwrap();
+        assert_eq!(fourth.stream_id, 1, "round-robin wraps to A");
+        let fifth = rx.recv().await.unwrap();
+        assert_eq!(fifth.stream_id, 2);
+        let sixth = rx.recv().await.unwrap();
+        assert_eq!(sixth.stream_id, 3);
+    }
+
+    #[test]
+    fn priority_size_open_and_fin_are_zero() {
+        let open = WriteDataMsg {
+            stream_id: 1,
+            data: StreamWriteData::Open,
+        };
+        let fin = WriteDataMsg {
+            stream_id: 1,
+            data: StreamWriteData::Fin,
+        };
+        let data = WriteDataMsg {
+            stream_id: 1,
+            data: StreamWriteData::Data(make_data(&[0u8; 42])),
+        };
+        assert_eq!(priority_size(&open), 0);
+        assert_eq!(priority_size(&fin), 0);
+        assert_eq!(priority_size(&data), 42);
+    }
+
+    #[test]
+    fn round_robin_distance_monotonic_from_start() {
+        let start = fair_queue::Token(5);
+        assert_eq!(round_robin_distance(start, fair_queue::Token(5)), 0);
+        assert_eq!(round_robin_distance(start, fair_queue::Token(6)), 1);
+        assert_eq!(round_robin_distance(start, fair_queue::Token(7)), 2);
+        assert!(round_robin_distance(start, fair_queue::Token(6))
+            < round_robin_distance(start, fair_queue::Token(7)));
     }
 }

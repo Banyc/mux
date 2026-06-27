@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
-const DATA_QUEUE_SIZE: usize = 1 << 10;
+const DATA_QUEUE_SIZE: usize = 1;
 
 pub fn channel<T>() -> (Opener<T>, Receiver<T>) {
     let (opener_tx, opener_rx) = mpsc::channel(OPENER_QUEUE_SIZE);
@@ -271,7 +271,25 @@ impl<T> Receiver<T> {
         }
         FairReceiverRecv(self).await
     }
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Token, ReceiverRecv<T>)>> {
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(Token, ReceiverRecv<T>)>> {
+        self.poll_recv_excluding(cx, |_| false)
+    }
+    /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`
+    /// returns true. Open handling is identical to `poll_recv`. If every ready
+    /// token is excluded, returns `Poll::Pending` rather than yielding a
+    /// message from an excluded stream.
+    pub fn poll_recv_excluding<E>(
+        &mut self,
+        cx: &mut Context<'_>,
+        excluded: E,
+    ) -> Poll<Option<(Token, ReceiverRecv<T>)>>
+    where
+        E: FnMut(Token) -> bool,
+    {
+        let mut excluded = excluded;
         if self.queues.len() != MAX_QUEUE_COUNT {
             match self.opener.poll_recv(cx) {
                 Poll::Ready(None) => (),
@@ -298,6 +316,9 @@ impl<T> Receiver<T> {
                 Poll::Pending => (),
             }
         }
+        let mut saw_ready = false;
+        let scan_start = self.recv_queue_start;
+        let mut wrapped = false;
         loop {
             let token = {
                 let ready = self.ready.lock().unwrap();
@@ -305,11 +326,29 @@ impl<T> Receiver<T> {
                     break;
                 }
                 let Some(token) = ready.next(self.recv_queue_start) else {
+                    if wrapped {
+                        break;
+                    }
                     self.recv_queue_start = Token(0);
+                    wrapped = true;
                     continue;
                 };
                 token
             };
+            // Stop once we've come all the way back around to the start of
+            // the scan; otherwise we'd revisit excluded tokens forever.
+            if wrapped && token >= scan_start {
+                break;
+            }
+            // Skip excluded tokens but still advance the scan pointer past
+            // them so we make progress across the wraparound. Same-stream
+            // FIFO is preserved because an excluded token is only ever one
+            // that already has a cached head upstream.
+            if excluded(token) {
+                saw_ready = true;
+                self.recv_queue_start = Token(token.0.wrapping_add(1));
+                continue;
+            }
             let queue = self.queues.get_mut(&token).unwrap();
             self.recv_queue_start = Token(token.0.wrapping_add(1));
             match queue.poll_recv(cx) {
@@ -339,6 +378,7 @@ impl<T> Receiver<T> {
                 }
             }
         }
+        let _ = saw_ready;
         let nothing_else_to_poll = self.opener.is_closed() && self.queues.is_empty();
         if nothing_else_to_poll {
             None.into()
