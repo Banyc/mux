@@ -24,6 +24,8 @@ use super::{DataBuf, DeadCentralIo};
 const CONTROL_CHANNEL_SIZE: usize = 1024;
 const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
+const DATA_HEAD_EXTREME_CONTENDED_CAP: usize = 1024;
+
 /// Maximum bytes emitted from a Data head when other stream heads are
 /// currently cached (contended). Small enough to let a later-arriving small
 /// stream preempt the remainder on the next dispatch.
@@ -32,6 +34,9 @@ const DATA_HEAD_CONTENDED_CAP: usize = 2 * 1024;
 /// Maximum bytes emitted from a Data head when it is the only cached head
 /// (uncontended). Larger so an uncontended stream drains at bulk throughput.
 const DATA_HEAD_UNCONTENDED_CAP: usize = 32 * 1024;
+
+const DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED: usize = 5;
+const DATA_HEAD_REPEAT_UNTIL_UNCONTENDED: usize = 20;
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoWriter<W>,
@@ -194,6 +199,8 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
         head_pick_start: fair_queue::Token(0),
         rx_closed: false,
         split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
+        heads_repeated_contended: 0,
+        heads_repeated_uncontended: 0,
     };
     (tx, rx)
 }
@@ -211,6 +218,8 @@ pub struct WriteDataRx {
     rx_closed: bool,
     /// Pool for prefix buffers produced by splitting a large Data head.
     split_pool: ArcObjPool<Vec<u8>>,
+    heads_repeated_contended: usize,
+    heads_repeated_uncontended: usize,
 }
 #[derive(Debug)]
 struct HeadEntry {
@@ -293,7 +302,22 @@ impl WriteDataRx {
         // an uncontended head drains at the larger cap for bulk throughput.
         if let StreamWriteData::Data(ref data) = entry.msg.data {
             let remaining = data.len() - entry.offset;
-            let cap = if self.heads.is_empty() {
+            if self.heads.is_empty() {
+                self.heads_repeated_uncontended += 1;
+                self.heads_repeated_uncontended = self
+                    .heads_repeated_uncontended
+                    .min(DATA_HEAD_REPEAT_UNTIL_UNCONTENDED);
+                self.heads_repeated_contended = 0;
+            } else {
+                self.heads_repeated_contended += 1;
+                self.heads_repeated_contended = self
+                    .heads_repeated_contended
+                    .min(DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED);
+                self.heads_repeated_uncontended = 0;
+            }
+            let cap = if self.heads_repeated_contended == DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED {
+                DATA_HEAD_EXTREME_CONTENDED_CAP
+            } else if self.heads_repeated_uncontended == DATA_HEAD_REPEAT_UNTIL_UNCONTENDED {
                 DATA_HEAD_UNCONTENDED_CAP
             } else {
                 DATA_HEAD_CONTENDED_CAP
