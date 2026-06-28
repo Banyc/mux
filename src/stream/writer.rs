@@ -16,7 +16,6 @@ use crate::{
         DeadCentralIo,
     },
     control::WriteBrokenPipe,
-    protocol::BodyLen,
 };
 
 use super::StreamCloseTx;
@@ -53,7 +52,7 @@ impl StreamWriterState {
             return Ok(0).into();
         }
         ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
-        let data_len = buf.len().min(usize::from(BodyLen::MAX));
+        let data_len = buf.len();
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         data.send_item(StreamWriteData::Data(data_buf))

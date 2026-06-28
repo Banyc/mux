@@ -2,12 +2,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
     io::{self, IoSlice},
+    num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
     common::Side,
@@ -19,6 +22,16 @@ use crate::{
 use super::{DataBuf, DeadCentralIo};
 
 const CONTROL_CHANNEL_SIZE: usize = 1024;
+const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+/// Maximum bytes emitted from a Data head when other stream heads are
+/// currently cached (contended). Small enough to let a later-arriving small
+/// stream preempt the remainder on the next dispatch.
+const DATA_HEAD_CONTENDED_CAP: usize = 2 * 1024;
+
+/// Maximum bytes emitted from a Data head when it is the only cached head
+/// (uncontended). Larger so an uncontended stream drains at bulk throughput.
+const DATA_HEAD_UNCONTENDED_CAP: usize = 32 * 1024;
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoWriter<W>,
@@ -180,6 +193,7 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
         heads: BTreeMap::new(),
         head_pick_start: fair_queue::Token(0),
         rx_closed: false,
+        split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
     };
     (tx, rx)
 }
@@ -187,14 +201,24 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
     token_to_stream: HashMap<fair_queue::Token, StreamId>,
-    /// At most one cached message per stream/token. The token maps to the
-    /// *logical* stream message (Open/Value/Close already translated to a
-    /// `WriteDataMsg`) ready to be dispatched.
-    heads: BTreeMap<fair_queue::Token, WriteDataMsg>,
+    /// At most one cached message per stream/token. The token maps to a
+    /// `HeadEntry` (the logical stream message plus a read offset into its
+    /// Data payload) ready to be dispatched.
+    heads: BTreeMap<fair_queue::Token, HeadEntry>,
     /// Round-robin cursor for selecting among cached heads.
     head_pick_start: fair_queue::Token,
     /// Set once the underlying fair-queue receiver reports closure.
     rx_closed: bool,
+    /// Pool for prefix buffers produced by splitting a large Data head.
+    split_pool: ArcObjPool<Vec<u8>>,
+}
+#[derive(Debug)]
+struct HeadEntry {
+    msg: WriteDataMsg,
+    /// Bytes already dispatched from this head's Data payload; the next
+    /// dispatch resumes at `data[offset..]`. Kept here so the original buffer
+    /// is reused in place instead of copying the tail on every split.
+    offset: usize,
 }
 impl WriteDataRx {
     pub async fn recv(&mut self) -> Result<WriteDataMsg, DeadControl> {
@@ -236,7 +260,7 @@ impl WriteDataRx {
                             }
                         }
                     };
-                    self.heads.insert(token, msg);
+                    self.heads.insert(token, HeadEntry { msg, offset: 0 });
                     continue;
                 }
                 Poll::Ready(None) => {
@@ -257,21 +281,64 @@ impl WriteDataRx {
             return Poll::Pending;
         }
         let chosen = self.pick_head();
-        let (_, msg) = self.heads.remove_entry(&chosen).unwrap();
+        let (_, mut entry) = self.heads.remove_entry(&chosen).unwrap();
         self.head_pick_start = fair_queue::Token(chosen.0.wrapping_add(1));
-        Ok(msg).into()
+        // Split a large Data head so later-arriving small streams can preempt
+        // the tail. Emit a bounded prefix (`data[offset..offset+emit]`) as a
+        // fresh buffer and reinsert the remainder under the same token by
+        // advancing `entry.offset`. Same-stream FIFO is preserved because the
+        // tail stays cached under `chosen`, so `poll_recv_excluding` skips the
+        // token until the tail is dispatched. The cap depends only on whether
+        // other heads are currently cached (contended) or not (uncontended);
+        // an uncontended head drains at the larger cap for bulk throughput.
+        if let StreamWriteData::Data(ref data) = entry.msg.data {
+            let remaining = data.len() - entry.offset;
+            let cap = if self.heads.is_empty() {
+                DATA_HEAD_UNCONTENDED_CAP
+            } else {
+                DATA_HEAD_CONTENDED_CAP
+            };
+            let emit = remaining.min(cap);
+            if emit < remaining {
+                // Emit a fresh buffer holding the prefix; the original `data`
+                // stays with the reinserted tail, its offset advanced past the
+                // emitted prefix.
+                let split_at = entry.offset + emit;
+                let mut prefix = self.split_pool.take_scoped();
+                prefix.clear();
+                prefix.extend_from_slice(&data[entry.offset..split_at]);
+                let stream_id = entry.msg.stream_id;
+                entry.offset = split_at;
+                self.heads.insert(chosen, entry);
+                return Ok(WriteDataMsg {
+                    stream_id,
+                    data: StreamWriteData::Data(prefix),
+                })
+                .into();
+            }
+            // Emit the final slice of the head. If the offset already consumed
+            // some prefix, copy the remaining tail into a fresh buffer so the
+            // emitted message owns exactly the remaining bytes.
+            if entry.offset != 0 {
+                let mut tail = self.split_pool.take_scoped();
+                tail.clear();
+                tail.extend_from_slice(&data[entry.offset..]);
+                entry.msg.data = StreamWriteData::Data(tail);
+            }
+        }
+        Ok(entry.msg).into()
     }
     /// Pick the next token to dispatch from `heads`.
     ///
     /// Selection key: `(priority_size, round_robin_distance_from_head_pick_start)`.
-    /// `priority_size`: Open = 0, Fin = 0, Data = data.len().
+    /// `priority_size`: Open = 0, Fin = 0, Data = remaining data length.
     /// Equal-size tie-breaking is round-robin by distance from
     /// `head_pick_start` (with wraparound), not lowest-token-first.
     fn pick_head(&self) -> fair_queue::Token {
         let start = self.head_pick_start;
         let mut best: Option<(fair_queue::Token, (usize, usize))> = None;
-        for (&token, msg) in &self.heads {
-            let priority = priority_size(msg);
+        for (&token, entry) in &self.heads {
+            let priority = priority_size(entry);
             let distance = round_robin_distance(start, token);
             let key = (priority, distance);
             match best {
@@ -283,11 +350,11 @@ impl WriteDataRx {
     }
 }
 
-fn priority_size(msg: &WriteDataMsg) -> usize {
-    match msg.data {
+fn priority_size(entry: &HeadEntry) -> usize {
+    match entry.msg.data {
         StreamWriteData::Open => 0,
         StreamWriteData::Fin => 0,
-        StreamWriteData::Data(ref data) => data.len(),
+        StreamWriteData::Data(ref data) => data.len() - entry.offset,
     }
 }
 
@@ -408,14 +475,16 @@ mod tests {
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
+        time::Duration,
     };
 
     use primitive::arena::obj_pool::arc_buf_pool;
     use tokio::io::AsyncWrite;
 
     use super::{
-        priority_size, round_robin_distance, write_data_channel, CentralIoWriter, StreamWriteData,
-        StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
+        priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
+        StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
+        DATA_HEAD_UNCONTENDED_CAP,
     };
     use crate::fair_queue;
     use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
@@ -752,17 +821,26 @@ mod tests {
 
     #[test]
     fn priority_size_open_and_fin_are_zero() {
-        let open = WriteDataMsg {
-            stream_id: 1,
-            data: StreamWriteData::Open,
+        let open = HeadEntry {
+            msg: WriteDataMsg {
+                stream_id: 1,
+                data: StreamWriteData::Open,
+            },
+            offset: 0,
         };
-        let fin = WriteDataMsg {
-            stream_id: 1,
-            data: StreamWriteData::Fin,
+        let fin = HeadEntry {
+            msg: WriteDataMsg {
+                stream_id: 1,
+                data: StreamWriteData::Fin,
+            },
+            offset: 0,
         };
-        let data = WriteDataMsg {
-            stream_id: 1,
-            data: StreamWriteData::Data(make_data(&[0u8; 42])),
+        let data = HeadEntry {
+            msg: WriteDataMsg {
+                stream_id: 1,
+                data: StreamWriteData::Data(make_data(&[0u8; 42])),
+            },
+            offset: 0,
         };
         assert_eq!(priority_size(&open), 0);
         assert_eq!(priority_size(&fin), 0);
@@ -779,5 +857,128 @@ mod tests {
             round_robin_distance(start, fair_queue::Token(6))
                 < round_robin_distance(start, fair_queue::Token(7))
         );
+    }
+
+    // ---- Large-head preemption tests ----
+
+    /// A large Data head is split across multiple dispatches and reassembles
+    /// to the original bytes when consumed in arrival order.
+    #[tokio::test]
+    async fn large_data_head_reassembles_after_splitting() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // Larger than DATA_HEAD_UNCONTENDED_CAP so even an uncontended head is
+        // split across multiple dispatches.
+        let big_len = DATA_HEAD_UNCONTENDED_CAP * 4 + 7;
+        let body: Vec<u8> = (0u8..big_len as u8).cycle().take(big_len).collect();
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, body.clone()).await;
+
+        let mut reassembled = Vec::new();
+        loop {
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.stream_id, 1);
+            match msg.data {
+                StreamWriteData::Data(data) => {
+                    reassembled.extend_from_slice(&data);
+                }
+                StreamWriteData::Fin => break,
+                StreamWriteData::Open => {}
+            }
+            if reassembled.len() >= big_len {
+                break;
+            }
+        }
+        assert_eq!(reassembled, body);
+    }
+
+    /// A small ready stream preempts a cached large tail: after the large head
+    /// is split (uncontended on first dispatch), the small stream's message
+    /// arrives and is dispatched before the large tail resumes because its
+    /// remaining length is smaller.
+    #[tokio::test]
+    async fn small_ready_stream_preempts_cached_large_tail() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // A's large head arrives first. First dispatch is uncontended (only A
+        // cached), so it emits DATA_HEAD_UNCONTENDED_CAP and leaves a tail
+        // cached under A's token.
+        let big_len = DATA_HEAD_UNCONTENDED_CAP * 3;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(data_len(&first.data), DATA_HEAD_UNCONTENDED_CAP);
+
+        // B's small message arrives. A's tail is still cached with remaining
+        // length > 10, so B (smaller priority) preempts the tail.
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; 10]).await;
+        let second = rx.recv().await.unwrap();
+        assert_eq!(
+            second.stream_id, 2,
+            "small ready B should preempt A's cached large tail"
+        );
+        assert_eq!(data_len(&second.data), 10);
+    }
+
+    /// `write_all` of a payload larger than `BodyLen::MAX` still reaches the
+    /// peer intact end-to-end through the mux stream pair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_write_all_reaches_peer_intact() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::{spawn_mux_no_reconnection, Initiation, MuxConfig};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let b = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let a = accept.await.unwrap().0;
+
+        let mut spawner = tokio::task::JoinSet::new();
+        let (a_r, a_w) = a.into_split();
+        let (opener, _) = spawn_mux_no_reconnection(
+            a_r,
+            a_w,
+            MuxConfig {
+                initiation: Initiation::Server,
+                heartbeat_interval: Duration::from_secs(5),
+            },
+            &mut spawner,
+        );
+        let (b_r, b_w) = b.into_split();
+        let (_, mut accepter) = spawn_mux_no_reconnection(
+            b_r,
+            b_w,
+            MuxConfig {
+                initiation: Initiation::Client,
+                heartbeat_interval: Duration::from_secs(5),
+            },
+            &mut spawner,
+        );
+
+        let (a_stream, b_stream) = tokio::join!(opener.open(), accepter.accept());
+        let mut a_stream = a_stream.unwrap().1;
+        let mut b_stream = b_stream.unwrap().0;
+
+        // Larger than BodyLen::MAX so it spans multiple wire frames and
+        // exercises the split/reinsert path.
+        let payload: Vec<u8> = (0u8..=255)
+            .cycle()
+            .take(usize::from(BodyLen::MAX) * 3 + 123)
+            .collect();
+        let expected = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            a_stream.write_all(&payload).await.unwrap();
+            a_stream.shutdown().unwrap();
+            a_stream
+        });
+        let mut received = Vec::new();
+        b_stream.read_to_end(&mut received).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(received, expected);
     }
 }
