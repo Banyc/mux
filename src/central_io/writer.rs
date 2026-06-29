@@ -9,6 +9,7 @@ use std::{
 };
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 use primitive::arena::obj_pool::ArcObjPool;
 
@@ -24,19 +25,128 @@ use super::{DataBuf, DeadCentralIo};
 const CONTROL_CHANNEL_SIZE: usize = 1024;
 const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
-const DATA_HEAD_EXTREME_CONTENDED_CAP: usize = 1024;
+const DATA_EXTREME_CAP: usize = 1200;
+const DATA_MEDIUM_CAP: usize = 2 * 1024;
+const DATA_BULK_CAP: usize = 32 * 1024;
 
-/// Maximum bytes emitted from a Data head when other stream heads are
-/// currently cached (contended). Small enough to let a later-arriving small
-/// stream preempt the remainder on the next dispatch.
-const DATA_HEAD_CONTENDED_CAP: usize = 2 * 1024;
+/// A stream is relegated from `MaybeLatencySensitive` (the default, protected)
+/// to `MustBulk` once at least two thirds of its recent sends were under
+/// [`DATA_QUANTUM`] and it has been idle for this long.
+const LATENCY_IDLE: Duration = Duration::from_secs(30);
 
-/// Maximum bytes emitted from a Data head when it is the only cached head
-/// (uncontended). Larger so an uncontended stream drains at bulk throughput.
-const DATA_HEAD_UNCONTENDED_CAP: usize = 32 * 1024;
+/// Minimum number of sends before the 2/3-under-QUANTUM ratio is evaluated.
+const LATENCY_HISTORY_MIN: usize = 3;
 
-const DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED: usize = 5;
-const DATA_HEAD_REPEAT_UNTIL_UNCONTENDED: usize = 20;
+/// Per-stream traffic class, keyed by fair-queue token.
+///
+/// - `MaybeLatencySensitive` (default): the stream is protected. While any
+///   open stream is in this class, every Data dispatch is capped at
+///   [`DATA_QUANTUM`] so a later-arriving small stream can preempt the tail.
+/// - `MustBulk`: the stream has been relegated. Only when every open stream is
+///   `MustBulk` does a dispatch use [`DATA_BULK_CAP`] for throughput.
+///
+/// The class is computed on demand from per-stream send observations (recent
+/// send sizes and last-sent time); it is not stored as a field. Global
+/// sensitivity is cheap to query in the common case: `bulk_count` and
+/// `next_bulk_transition` are maintained incrementally, and
+/// `any_latency_sensitive` is O(1) except when a time-driven transition is due
+/// (then it recomputes aggregates, O(open_count), and resets the timer).
+#[derive(Debug)]
+struct LatencyControl {
+    /// Send history per open stream token. `Small`/`Bulk` are tallied
+    /// incrementally so the 2/3-under-QUANTUM ratio is a cheap division, and
+    /// `last_sent` lets `MustBulk` revert to latency-sensitive if a stream
+    /// resumes after the idle window.
+    streams: HashMap<fair_queue::Token, StreamObs>,
+    /// Number of currently-open streams (`Open` seen, no `Close`/`Fin` yet).
+    open_count: usize,
+    /// Number of open streams currently classified `MustBulk`.
+    bulk_count: usize,
+    /// Earliest time at which some non-bulk stream may transition to `MustBulk`
+    /// (its `last_sent + LATENCY_IDLE`). `None` when no non-bulk stream could
+    /// ever transition (e.g. no history yet). `any_latency_sensitive` is O(1)
+    /// while `now < next_bulk_transition`; once `now` crosses it, aggregates
+    /// are recomputed and this is reset.
+    next_bulk_transition: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct StreamObs {
+    small_count: usize,
+    bulk_count: usize,
+}
+impl StreamObs {
+    fn is_bulk(&self) -> bool {
+        let total = self.small_count + self.bulk_count;
+        if total < LATENCY_HISTORY_MIN {
+            return false;
+        }
+        self.small_count * 3 < total * 2
+    }
+}
+
+impl LatencyControl {
+    fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+            open_count: 0,
+            bulk_count: 0,
+            next_bulk_transition: None,
+        }
+    }
+    fn open(&mut self, token: fair_queue::Token, now: Instant) {
+        let obs = StreamObs {
+            small_count: 0,
+            bulk_count: 0,
+        };
+        self.open_count += 1;
+        if obs.is_bulk() {
+            self.bulk_count += 1;
+        } else {
+            self.next_bulk_transition = Some(now + LATENCY_IDLE);
+        }
+        self.streams.insert(token, obs);
+    }
+    fn close(&mut self, token: fair_queue::Token) {
+        let Some(obs) = self.streams.remove(&token) else {
+            return;
+        };
+        if obs.is_bulk() {
+            self.bulk_count = self.bulk_count.strict_sub(1);
+        }
+        self.open_count = self.open_count.strict_sub(1);
+    }
+    fn record_send(&mut self, token: fair_queue::Token, size: usize, now: Instant) {
+        let Some(obs) = self.streams.get_mut(&token) else {
+            return;
+        };
+        let was_bulk = obs.is_bulk();
+        if size <= DATA_MEDIUM_CAP {
+            obs.small_count += 1;
+        } else {
+            obs.bulk_count += 1;
+        }
+        let is_bulk = obs.is_bulk();
+        if was_bulk != is_bulk {
+            if is_bulk {
+                self.bulk_count += 1;
+            } else {
+                self.bulk_count = self.bulk_count.strict_sub(1);
+            }
+        }
+        if !is_bulk {
+            self.next_bulk_transition = Some(now + LATENCY_IDLE);
+        }
+    }
+    pub fn any_latency_sensitive(&self) -> bool {
+        if self.open_count == self.bulk_count {
+            return false;
+        }
+        let t = self.next_bulk_transition.unwrap();
+        let now = Instant::now();
+        now < t
+    }
+}
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoWriter<W>,
@@ -199,8 +309,7 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
         head_pick_start: fair_queue::Token(0),
         rx_closed: false,
         split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
-        heads_repeated_contended: 0,
-        heads_repeated_uncontended: 0,
+        latency: LatencyControl::new(),
     };
     (tx, rx)
 }
@@ -218,8 +327,8 @@ pub struct WriteDataRx {
     rx_closed: bool,
     /// Pool for prefix buffers produced by splitting a large Data head.
     split_pool: ArcObjPool<Vec<u8>>,
-    heads_repeated_contended: usize,
-    heads_repeated_uncontended: usize,
+    /// Per-stream traffic-class observations, keyed by fair-queue token.
+    latency: LatencyControl,
 }
 #[derive(Debug)]
 struct HeadEntry {
@@ -246,6 +355,7 @@ impl WriteDataRx {
         // head, so we never read a second message from a token that still has
         // a pending head. Loop until it returns Pending (all ready drained) or
         // closure, so selection sees every currently-ready stream.
+        let now = Instant::now();
         while !self.rx_closed {
             let heads = &mut self.heads;
             let res = self
@@ -256,6 +366,7 @@ impl WriteDataRx {
                     let msg = match msg {
                         fair_queue::ReceiverRecv::Open(value) => {
                             self.token_to_stream.insert(token, value.stream_id);
+                            self.latency.open(token, now);
                             value
                         }
                         fair_queue::ReceiverRecv::Value(value) => value,
@@ -263,6 +374,7 @@ impl WriteDataRx {
                             let Some(stream_id) = self.token_to_stream.remove(&token) else {
                                 continue;
                             };
+                            self.latency.close(token);
                             WriteDataMsg {
                                 stream_id,
                                 data: StreamWriteData::Fin,
@@ -292,36 +404,22 @@ impl WriteDataRx {
         let chosen = self.pick_head();
         let (_, mut entry) = self.heads.remove_entry(&chosen).unwrap();
         self.head_pick_start = fair_queue::Token(chosen.0.wrapping_add(1));
-        // Split a large Data head so later-arriving small streams can preempt
-        // the tail. Emit a bounded prefix (`data[offset..offset+emit]`) as a
-        // fresh buffer and reinsert the remainder under the same token by
-        // advancing `entry.offset`. Same-stream FIFO is preserved because the
-        // tail stays cached under `chosen`, so `poll_recv_excluding` skips the
-        // token until the tail is dispatched. The cap depends only on whether
-        // other heads are currently cached (contended) or not (uncontended);
-        // an uncontended head drains at the larger cap for bulk throughput.
         if let StreamWriteData::Data(ref data) = entry.msg.data {
-            let remaining = data.len() - entry.offset;
-            if self.heads.is_empty() {
-                self.heads_repeated_uncontended += 1;
-                self.heads_repeated_uncontended = self
-                    .heads_repeated_uncontended
-                    .min(DATA_HEAD_REPEAT_UNTIL_UNCONTENDED);
-                self.heads_repeated_contended = 0;
+            let cap = if self.latency.any_latency_sensitive() {
+                if self.heads.is_empty() {
+                    DATA_MEDIUM_CAP
+                } else {
+                    DATA_EXTREME_CAP
+                }
             } else {
-                self.heads_repeated_contended += 1;
-                self.heads_repeated_contended = self
-                    .heads_repeated_contended
-                    .min(DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED);
-                self.heads_repeated_uncontended = 0;
-            }
-            let cap = if self.heads_repeated_contended == DATA_HEAD_REPEAT_UNTIL_EXTREME_CONTENDED {
-                DATA_HEAD_EXTREME_CONTENDED_CAP
-            } else if self.heads_repeated_uncontended == DATA_HEAD_REPEAT_UNTIL_UNCONTENDED {
-                DATA_HEAD_UNCONTENDED_CAP
-            } else {
-                DATA_HEAD_CONTENDED_CAP
+                DATA_BULK_CAP
             };
+            if entry.offset == 0 {
+                // First dispatch of this head: record one send using the
+                // original data length (not the capped emit size)
+                self.latency.record_send(chosen, data.len(), now);
+            }
+            let remaining = data.len() - entry.offset;
             let emit = remaining.min(cap);
             if emit < remaining {
                 // Emit a fresh buffer holding the prefix; the original `data`
@@ -508,10 +606,10 @@ mod tests {
     use super::{
         priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
         StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
-        DATA_HEAD_UNCONTENDED_CAP,
+        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_IDLE,
     };
-    use crate::fair_queue;
     use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
+    use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
 
     /// A mock writer that records every byte and can simulate partial vectored
     /// writes. `max_per_write` caps the number of bytes any single `write` /
@@ -892,9 +990,11 @@ mod tests {
         let (tx, mut rx) = write_data_channel();
         let stream_a = open_stream(&tx, &mut rx, 1).await;
 
-        // Larger than DATA_HEAD_UNCONTENDED_CAP so even an uncontended head is
-        // split across multiple dispatches.
-        let big_len = DATA_HEAD_UNCONTENDED_CAP * 4 + 7;
+        // Larger than DATA_BULK_CAP so the head is split across multiple
+        // dispatches. With a single freshly-opened stream the stream is
+        // latency-sensitive by default, so each dispatch is capped at
+        // DATA_QUANTUM.
+        let big_len = DATA_BULK_CAP * 4 + 7;
         let body: Vec<u8> = (0u8..big_len as u8).cycle().take(big_len).collect();
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, body.clone()).await;
 
@@ -917,23 +1017,23 @@ mod tests {
     }
 
     /// A small ready stream preempts a cached large tail: after the large head
-    /// is split (uncontended on first dispatch), the small stream's message
-    /// arrives and is dispatched before the large tail resumes because its
-    /// remaining length is smaller.
+    /// is split (latency-sensitive cap on first dispatch), the small stream's
+    /// message arrives and is dispatched before the large tail resumes because
+    /// its remaining length is smaller.
     #[tokio::test]
     async fn small_ready_stream_preempts_cached_large_tail() {
         let (tx, mut rx) = write_data_channel();
         let stream_a = open_stream(&tx, &mut rx, 1).await;
         let stream_b = open_stream(&tx, &mut rx, 2).await;
 
-        // A's large head arrives first. First dispatch is uncontended (only A
-        // cached), so it emits DATA_HEAD_UNCONTENDED_CAP and leaves a tail
-        // cached under A's token.
-        let big_len = DATA_HEAD_UNCONTENDED_CAP * 3;
+        // A's large head arrives first. A is latency-sensitive (freshly opened,
+        // default class), so the dispatch is capped at DATA_QUANTUM and leaves
+        // a tail cached under A's token.
+        let big_len = DATA_BULK_CAP * 3;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
         let first = rx.recv().await.unwrap();
         assert_eq!(first.stream_id, 1);
-        assert_eq!(data_len(&first.data), DATA_HEAD_UNCONTENDED_CAP);
+        assert_eq!(data_len(&first.data), DATA_MEDIUM_CAP);
 
         // B's small message arrives. A's tail is still cached with remaining
         // length > 10, so B (smaller priority) preempts the tail.
@@ -1004,5 +1104,127 @@ mod tests {
         b_stream.read_to_end(&mut received).await.unwrap();
         writer.await.unwrap();
         assert_eq!(received, expected);
+    }
+
+    // ---- LatencyControl integration tests ----
+
+    /// Send `n` messages of `size` bytes on `stream`, draining each from the
+    /// receiver so the LatencyControl `record_send` bookkeeping runs once per
+    /// message. The send/recv are driven concurrently because the per-stream
+    /// fair queue has depth 1.
+    async fn send_and_drain(
+        stream: &StreamWriteDataTx,
+        rx: &mut WriteDataRx,
+        n: usize,
+        size: usize,
+    ) {
+        for _ in 0..n {
+            let tx = stream.tx.clone();
+            let sid = stream.stream_id;
+            let bytes = vec![0u8; size];
+            tokio::join!(
+                async {
+                    tx.send(WriteDataMsg {
+                        stream_id: sid,
+                        data: StreamWriteData::Data(make_data(&bytes)),
+                    })
+                    .await
+                    .unwrap();
+                },
+                async {
+                    let _ = rx.recv().await.unwrap();
+                }
+            );
+        }
+    }
+
+    /// A freshly opened stream is latency-sensitive by default: a large head
+    /// is split at DATA_QUANTUM (not DATA_BULK_CAP) because no stream has met
+    /// the bulk transition condition.
+    #[tokio::test]
+    async fn fresh_stream_is_latency_sensitive_caps_at_quantum() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // Two sends under QUANTUM so the stream has history but is not idle.
+        send_and_drain(&stream_a, &mut rx, 2, DATA_EXTREME_CAP - 1).await;
+
+        // A large head is split at DATA_QUANTUM (latency-sensitive cap), not
+        // DATA_BULK_CAP, because the stream is not yet MustBulk (idle window
+        // has not elapsed).
+        let big_len = DATA_BULK_CAP * 2;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(
+            data_len(&first.data),
+            DATA_MEDIUM_CAP,
+            "fresh stream should be latency-sensitive and cap at DATA_QUANTUM"
+        );
+    }
+
+    /// If the only open stream is `MustBulk` (enough small sends + idle for
+    /// LATENCY_IDLE), a large head is split at DATA_BULK_CAP for throughput.
+    ///
+    /// Uses `tokio::time::pause` so the 30s idle window elapses quickly.
+    #[tokio::test(start_paused = true)]
+    async fn only_bulk_stream_caps_at_bulk_cap() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // 3 small sends: enough history, and >= 2/3 under QUANTUM.
+        send_and_drain(&stream_a, &mut rx, 3, DATA_EXTREME_CAP - 1).await;
+
+        // Advance past the idle window so the stream transitions to MustBulk.
+        tokio::time::advance(LATENCY_IDLE + Duration::from_millis(10)).await;
+
+        // A large head should now split at DATA_BULK_CAP, not DATA_QUANTUM,
+        // because the only open stream is MustBulk (any_latency_sensitive is
+        // false).
+        let big_len = DATA_BULK_CAP * 2 + 5;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(
+            data_len(&first.data),
+            DATA_BULK_CAP,
+            "only-bulk open stream should cap at DATA_BULK_CAP"
+        );
+    }
+
+    /// Closing the only sensitive stream lets the remaining MustBulk stream
+    /// drain at DATA_BULK_CAP. This exercises the close bookkeeping and the
+    /// aggregate recompute path.
+    #[tokio::test(start_paused = true)]
+    async fn closing_sensitive_stream_lets_bulk_drain_at_bulk_cap() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let _stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // A -> MustBulk.
+        send_and_drain(&stream_a, &mut rx, 3, DATA_EXTREME_CAP - 1).await;
+        tokio::time::advance(LATENCY_IDLE + Duration::from_millis(10)).await;
+
+        // Close B (the only sensitive stream) by dropping its sender.
+        drop(_stream_b);
+
+        // Drain any pending messages (Open/Fin) until B's close is observed.
+        loop {
+            let msg = rx.recv().await.unwrap();
+            if msg.stream_id == 2 && matches!(msg.data, StreamWriteData::Fin) {
+                break;
+            }
+        }
+
+        // Now only A (MustBulk) is open: large head should cap at DATA_BULK_CAP.
+        let big_len = DATA_BULK_CAP * 2 + 5;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(
+            data_len(&first.data),
+            DATA_BULK_CAP,
+            "after closing the only sensitive stream, bulk cap should apply"
+        );
     }
 }
