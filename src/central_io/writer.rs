@@ -1227,4 +1227,70 @@ mod tests {
             "after closing the only sensitive stream, bulk cap should apply"
         );
     }
+
+    /// Regression for the two `fair_queue` defects (phantom per-clone Drop
+    /// marks + spurious `Poll::Pending` aborting the scan): dropping a
+    /// `Sender` clone after each send (any helper taking `Sender` by value)
+    /// concurrently with the receiver drain. Pre-fix this deadlocks: the
+    /// sender task completes all sends while the receiver stalls with two
+    /// undelivered messages. Each `recv` is wrapped in a 10 s `timeout` so a
+    /// regression fails instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clone_drop_per_send_does_not_strand_receiver() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // Byte totals the receiver must observe.
+        const A_LEN: usize = 16 * 1024;
+        const B_SMALL: usize = 100;
+        const B_LARGE: usize = 4096;
+        const CYCLES: usize = 6;
+        let a_total = A_LEN * CYCLES;
+        let b_total = (B_SMALL * 5 + B_LARGE) * CYCLES;
+
+        let a_tx = stream_a.tx.clone();
+        let b_tx = stream_b.tx.clone();
+        let a_sid = stream_a.stream_id;
+        let b_sid = stream_b.stream_id;
+
+        // Sender task: per cycle, one 16 KiB on A then five 100 B and one
+        // 4096 B on B. `send_data_owned` takes the Sender by value, so each
+        // call drops a clone — the trigger. The per-stream queue depth is
+        // small, so once a queue fills the sender task naturally yields to
+        // the receiver, interleaving sends with drains — the contention
+        // window in which the spurious scan abort strands later-ready
+        // tokens.
+        let sender = tokio::spawn(async move {
+            for _ in 0..CYCLES {
+                send_data_owned(a_tx.clone(), a_sid, vec![0u8; A_LEN]).await;
+                for _ in 0..5 {
+                    send_data_owned(b_tx.clone(), b_sid, vec![1u8; B_SMALL]).await;
+                }
+                send_data_owned(b_tx.clone(), b_sid, vec![2u8; B_LARGE]).await;
+            }
+            drop(a_tx);
+            drop(b_tx);
+        });
+
+        // Concurrent drain until both byte totals arrive.
+        let mut a_seen = 0usize;
+        let mut b_seen = 0usize;
+        while a_seen < a_total || b_seen < b_total {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("receiver stalled: messages stranded by fair-queue defect")
+                .unwrap();
+            if let StreamWriteData::Data(bytes) = msg.data {
+                if msg.stream_id == a_sid {
+                    a_seen += bytes.len();
+                } else if msg.stream_id == b_sid {
+                    b_seen += bytes.len();
+                }
+            }
+        }
+        assert_eq!(a_seen, a_total);
+        assert_eq!(b_seen, b_total);
+        sender.await.unwrap();
+    }
 }

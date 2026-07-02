@@ -176,26 +176,39 @@ impl<T> Sender<T> {
         self.queue.state.send(&self.queue.sender, value).await
     }
 }
-#[derive(Debug, Clone)]
-struct SenderState {
+/// Inner fields shared across all clones of a channel's `SenderState`. The
+/// ready-mark `Drop` lives here rather than on `SenderState` itself so it
+/// fires exactly once — when the *last* clone drops — instead of on every
+/// clone drop, which previously injected phantom `ReadyTree` counts backed by
+/// no message and accumulated forever (counts only drain via `sub` per
+/// received message). Coinciding with the mpsc channel's actual close keeps
+/// the mark semantically a "channel closed" signal.
+#[derive(Debug)]
+struct SenderStateShared {
     ready: Arc<Mutex<ReadyTree>>,
     token: Token,
 }
-impl Drop for SenderState {
+impl Drop for SenderStateShared {
     fn drop(&mut self) {
         self.ready.lock().unwrap().add(self.token);
     }
 }
+#[derive(Debug, Clone)]
+struct SenderState {
+    shared: Arc<SenderStateShared>,
+}
 impl SenderState {
     pub fn new(ready: Arc<Mutex<ReadyTree>>, token: Token) -> Self {
-        Self { ready, token }
+        Self {
+            shared: Arc::new(SenderStateShared { ready, token }),
+        }
     }
     pub fn try_send<T>(
         &self,
         queue: &mpsc::Sender<T>,
         value: T,
     ) -> Result<(), mpsc::error::TrySendError<T>> {
-        let mut undo = ready_incr(&self.ready, self.token);
+        let mut undo = ready_incr(&self.shared.ready, self.shared.token);
         queue.try_send(value)?;
         undo.cancel();
         Ok(())
@@ -208,7 +221,7 @@ impl SenderState {
         queue: &mpsc::Sender<T>,
         value: T,
     ) -> Result<(), mpsc::error::SendError<T>> {
-        let mut undo = ready_incr(&self.ready, self.token);
+        let mut undo = ready_incr(&self.shared.ready, self.shared.token);
         queue.send(value).await?;
         undo.cancel();
         Ok(())
@@ -233,7 +246,7 @@ impl SenderState {
         queue: &mut tokio_util::sync::PollSender<T>,
         value: T,
     ) -> Result<(), T> {
-        let mut undo = ready_incr(&self.ready, self.token);
+        let mut undo = ready_incr(&self.shared.ready, self.shared.token);
         if let Err(e) = queue.send_item(value) {
             return Err(e.into_inner().unwrap());
         }
@@ -370,8 +383,25 @@ impl<T> Receiver<T> {
                         .spurious_unready(token)
                         .is_spurious
                     {
-                        return Poll::Pending;
-                    };
+                        // The just-polled queue registered our waker (its
+                        // last poll returned Pending). `continue` rather
+                        // than `return Poll::Pending`: tokio mpsc wakes are
+                        // edge-triggered — a push consumes the receiver's
+                        // registered waker, and a queue only holds a waker
+                        // if its own last poll returned Pending — so
+                        // returning here would permanently lose wakeups for
+                        // any later-ready token, stranding deliverable
+                        // messages in a queue that is never polled again.
+                        // Every other in-tree token is either polled later
+                        // this pass (registering our waker on Pending) or
+                        // excluded, and callers guarantee excluded tokens
+                        // have a cached head upstream, so the receiver
+                        // never sleeps while one exists. Scan termination
+                        // is unchanged (monotonic cursor + wrapped /
+                        // scan_start stop; each token polled once per
+                        // pass).
+                        continue;
+                    }
                 }
             }
         }
