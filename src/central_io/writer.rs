@@ -183,10 +183,17 @@ pub enum RunCentralIoWriterError {
 #[derive(Debug)]
 pub struct CentralIoWriter<W> {
     io_writer: W,
+    /// Reused staging buffer for coalescing a non-vectored Data frame's fixed
+    /// header and body into a single transport write. Grows to at most
+    /// `Header::SIZE + DataHeader::SIZE + usize::from(BodyLen::MAX)`.
+    frame_buf: Vec<u8>,
 }
 impl<W> CentralIoWriter<W> {
     pub fn new(io_writer: W) -> Self {
-        Self { io_writer }
+        Self {
+            io_writer,
+            frame_buf: Vec::new(),
+        }
     }
 }
 impl<W> CentralIoWriter<W>
@@ -277,11 +284,20 @@ where
                 }
             }
         } else {
-            if !fixed_header.is_empty() {
-                self.io_writer.write_all(fixed_header).await?;
-            }
-            if !body.is_empty() {
-                self.io_writer.write_all(body).await?;
+            if fixed_header.is_empty() || body.is_empty() {
+                // Keep the existing single-write behaviour when either part is
+                // empty; only coalesce when both are non-empty.
+                if !fixed_header.is_empty() {
+                    self.io_writer.write_all(fixed_header).await?;
+                }
+                if !body.is_empty() {
+                    self.io_writer.write_all(body).await?;
+                }
+            } else {
+                self.frame_buf.clear();
+                self.frame_buf.extend_from_slice(fixed_header);
+                self.frame_buf.extend_from_slice(body);
+                self.io_writer.write_all(&self.frame_buf).await?;
             }
             Ok(())
         }
@@ -746,6 +762,68 @@ mod tests {
         );
         let got = central.io_writer.out.clone();
         assert_eq!(got, expected_frame(7, &body));
+    }
+
+    /// On a non-vectored transport a Data frame must be emitted as exactly one
+    /// write call whose bytes are the fixed header immediately followed by the
+    /// body. The frame_buf is reused across frames, so after two frames it holds
+    /// the second frame's contents and the byte output reassembles correctly.
+    #[tokio::test]
+    async fn non_vectored_data_frame_coalesces_into_single_write() {
+        struct CountingWriter {
+            out: Vec<u8>,
+            write_calls: Arc<Mutex<usize>>,
+        }
+        impl AsyncWrite for CountingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                *this.write_calls.lock().unwrap() += 1;
+                this.out.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let writer = CountingWriter {
+            out: Vec::new(),
+            write_calls: Arc::clone(&calls),
+        };
+        let mut central = CentralIoWriter::new(writer);
+
+        let body: Vec<u8> = (0u8..=255).cycle().take(1234).collect();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+
+        let got = central.io_writer.out.clone();
+        assert_eq!(got, expected_frame(7, &body));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "non-vectored Data frame should reach transport as exactly one write"
+        );
+        assert_eq!(
+            central.frame_buf,
+            expected_frame(7, &body),
+            "staging buffer should retain the last coalesced frame"
+        );
     }
 
     #[tokio::test]
