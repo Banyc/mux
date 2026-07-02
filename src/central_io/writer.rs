@@ -37,6 +37,12 @@ const LATENCY_IDLE: Duration = Duration::from_secs(30);
 /// Minimum number of sends before the 2/3-under-QUANTUM ratio is evaluated.
 const LATENCY_HISTORY_MIN: usize = 3;
 
+/// Maximum send history kept per stream. Once the counters reach this size
+/// they are halved before tallying the new observation, so classification
+/// tracks recent behaviour and a MustBulk stream reverts to latency-sensitive
+/// within a bounded number of small sends.
+const LATENCY_HISTORY_MAX: usize = 16;
+
 /// Per-stream traffic class, keyed by fair-queue token.
 ///
 /// - `MaybeLatencySensitive` (default): the stream is protected. While any
@@ -121,6 +127,13 @@ impl LatencyControl {
             return;
         };
         let was_bulk = obs.is_bulk();
+        // Halve the counters when the history would exceed the bound, so the
+        // classification reflects recent behaviour and MustBulk reverts within
+        // a bounded number of small sends.
+        if obs.small_count + obs.bulk_count >= LATENCY_HISTORY_MAX {
+            obs.small_count /= 2;
+            obs.bulk_count /= 2;
+        }
         if size <= DATA_MEDIUM_CAP {
             obs.small_count += 1;
         } else {
@@ -430,9 +443,12 @@ impl WriteDataRx {
             } else {
                 DATA_BULK_CAP
             };
-            if entry.offset == 0 {
-                // First dispatch of this head: record one send using the
-                // original data length (not the capped emit size)
+            if entry.offset == 0 || data.len() > DATA_BULK_CAP {
+                // Record once at first dispatch, and additionally on every
+                // dispatch for heads larger than DATA_BULK_CAP so a sustained
+                // bulk transfer accumulates LATENCY_HISTORY_MIN observations
+                // and escapes the small caps mid-transfer. Always use the
+                // original message length, never the capped emit size.
                 self.latency.record_send(chosen, data.len(), now);
             }
             let remaining = data.len() - entry.offset;
@@ -622,7 +638,7 @@ mod tests {
     use super::{
         priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
         StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
-        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_IDLE,
+        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE,
     };
     use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
     use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
@@ -1197,20 +1213,41 @@ mod tests {
         size: usize,
     ) {
         for _ in 0..n {
-            let tx = stream.tx.clone();
-            let sid = stream.stream_id;
-            let bytes = vec![0u8; size];
+            send_and_drain_message(stream, rx, size).await;
+        }
+    }
+
+    /// Send one message of `size` bytes and drain every dispatch produced from
+    /// it. This is needed when `size` is larger than the active cap and splits
+    /// into multiple dispatches, because a single `recv` would leave the rest
+    /// cached and the next send would queue behind an incomplete head.
+    async fn send_and_drain_message(stream: &StreamWriteDataTx, rx: &mut WriteDataRx, size: usize) {
+        let tx = stream.tx.clone();
+        let sid = stream.stream_id;
+        let bytes = vec![0u8; size];
+        let mut sent = false;
+        let mut seen = 0usize;
+        while !sent || seen < size {
             tokio::join!(
                 async {
-                    tx.send(WriteDataMsg {
-                        stream_id: sid,
-                        data: StreamWriteData::Data(make_data(&bytes)),
-                    })
-                    .await
-                    .unwrap();
+                    if !sent {
+                        tx.send(WriteDataMsg {
+                            stream_id: sid,
+                            data: StreamWriteData::Data(make_data(&bytes)),
+                        })
+                        .await
+                        .unwrap();
+                        sent = true;
+                    }
                 },
                 async {
-                    let _ = rx.recv().await.unwrap();
+                    if seen < size {
+                        let msg = rx.recv().await.unwrap();
+                        assert_eq!(msg.stream_id, sid);
+                        if let StreamWriteData::Data(data) = msg.data {
+                            seen += data.len();
+                        }
+                    }
                 }
             );
         }
@@ -1361,6 +1398,189 @@ mod tests {
                 .unwrap();
             if let StreamWriteData::Data(bytes) = msg.data {
                 if msg.stream_id == a_sid {
+                    a_seen += bytes.len();
+                } else if msg.stream_id == b_sid {
+                    b_seen += bytes.len();
+                }
+            }
+        }
+        assert_eq!(a_seen, a_total);
+        assert_eq!(b_seen, b_total);
+        sender.await.unwrap();
+    }
+
+    // ---- Latency ramp tests ----
+
+    /// A single sustained bulk transfer ramps to MustBulk mid-transfer and
+    /// starts using DATA_BULK_CAP for dispatch 4. The first three dispatches
+    /// are capped at DATA_MEDIUM_CAP; the fourth is capped at DATA_BULK_CAP.
+    #[tokio::test]
+    async fn sole_bulk_head_escapes_latency_caps_mid_transfer() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // One head larger than DATA_BULK_CAP so every dispatch records an
+        // observation. With DATA_MEDIUM_CAP = 2 KiB, the first three emits are
+        // 2 KiB each, producing 3 bulk observations. The fourth dispatch is
+        // computed after the third record_send, when the stream is MustBulk.
+        let big_len = DATA_BULK_CAP * 2;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+
+        let mut sizes = Vec::new();
+        let mut seen = 0usize;
+        while seen < big_len {
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.stream_id, 1);
+            if let StreamWriteData::Data(data) = msg.data {
+                seen += data.len();
+                sizes.push(data.len());
+            }
+        }
+        assert!(
+            sizes.len() >= 4,
+            "expected at least 4 dispatches, got {:?}",
+            sizes
+        );
+        assert_eq!(
+            sizes[..4],
+            [
+                DATA_MEDIUM_CAP,
+                DATA_MEDIUM_CAP,
+                DATA_MEDIUM_CAP,
+                DATA_BULK_CAP
+            ]
+        );
+    }
+
+    /// A new latency-sensitive stream restores small caps over a ramped
+    /// MustBulk stream.
+    #[tokio::test]
+    async fn new_stream_restores_small_caps_over_ramped_bulk_stream() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // Ramp A to MustBulk with a large head. The first three dispatches are
+        // DATA_MEDIUM_CAP, then the fourth (computed after the third bulk
+        // observation) uses DATA_BULK_CAP. Drain until that ramped dispatch is
+        // observed.
+        let big_len = DATA_BULK_CAP * 2;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let mut seen = 0usize;
+        let mut ramped = false;
+        while seen < big_len {
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.stream_id, 1);
+            if let StreamWriteData::Data(data) = msg.data {
+                seen += data.len();
+                if data.len() == DATA_BULK_CAP {
+                    ramped = true;
+                    break;
+                }
+            }
+        }
+        assert!(ramped, "stream A should have ramped to DATA_BULK_CAP");
+        assert!(!rx.latency.any_latency_sensitive());
+
+        // Open a fresh sensitive stream B and send 10 bytes. The presence of
+        // any latency-sensitive stream caps every dispatch at DATA_MEDIUM_CAP,
+        // so A's next dispatch drops back from DATA_BULK_CAP.
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; 10]).await;
+
+        // B's small message is emitted first (priority), but more importantly
+        // A's next dispatch after B arrives is capped at DATA_MEDIUM_CAP.
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 2);
+        assert_eq!(data_len(&first.data), 10);
+
+        // A's remaining large tail is now emitted under the small cap because
+        // B is sensitive.
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.stream_id, 1);
+        assert_eq!(
+            data_len(&second.data),
+            DATA_MEDIUM_CAP,
+            "ramped bulk stream must drop back to DATA_MEDIUM_CAP when a sensitive stream is open"
+        );
+    }
+
+    /// MustBulk reverts to latency-sensitive within a bounded number of small
+    /// record_send calls thanks to LATENCY_HISTORY_MAX.
+    #[tokio::test]
+    async fn must_bulk_reverts_after_bounded_small_sends() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // Saturate the token with 100 bulk observations. Use a message larger
+        // than DATA_BULK_CAP so every dispatch records; drain each message
+        // fully so the observations are tallied.
+        for _ in 0..100 {
+            send_and_drain_message(&stream_a, &mut rx, DATA_BULK_CAP + 1).await;
+        }
+        assert!(!rx.latency.any_latency_sensitive());
+
+        // Now send small messages. The total number of record_send calls
+        // required to flip back is bounded by 2 * LATENCY_HISTORY_MAX because
+        // each small send is recorded and the halving keeps recent small sends
+        // dominant.
+        let mut calls = 0usize;
+        while !rx.latency.any_latency_sensitive() {
+            send_and_drain_message(&stream_a, &mut rx, DATA_MEDIUM_CAP).await;
+            calls += 1;
+            assert!(
+                calls <= 2 * LATENCY_HISTORY_MAX,
+                "MustBulk should revert within 2 * LATENCY_HISTORY_MAX small record_send calls"
+            );
+        }
+    }
+
+    /// Mixed small and medium streams keep a truly bulk stream capped so the
+    /// interactive-preemption guarantee holds. B's 4096 B message is split
+    /// into DATA_EXTREME_CAP slices and still counts as one observation, so
+    /// B remains sensitive and A never dispatches more than DATA_MEDIUM_CAP.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_small_and_medium_stream_keeps_bulk_capped() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        const A_LEN: usize = 16 * 1024;
+        const B_SMALL: usize = 100;
+        const B_LARGE: usize = 4096;
+        const CYCLES: usize = 6;
+        let a_total = A_LEN * CYCLES;
+        let b_total = (B_SMALL * 5 + B_LARGE) * CYCLES;
+
+        let a_tx = stream_a.tx.clone();
+        let b_tx = stream_b.tx.clone();
+        let a_sid = stream_a.stream_id;
+        let b_sid = stream_b.stream_id;
+
+        let sender = tokio::spawn(async move {
+            for _ in 0..CYCLES {
+                send_data_owned(a_tx.clone(), a_sid, vec![0u8; A_LEN]).await;
+                for _ in 0..5 {
+                    send_data_owned(b_tx.clone(), b_sid, vec![1u8; B_SMALL]).await;
+                }
+                send_data_owned(b_tx.clone(), b_sid, vec![2u8; B_LARGE]).await;
+            }
+            drop(a_tx);
+            drop(b_tx);
+        });
+
+        let mut a_seen = 0usize;
+        let mut b_seen = 0usize;
+        while a_seen < a_total || b_seen < b_total {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("receiver stalled")
+                .unwrap();
+            if let StreamWriteData::Data(bytes) = msg.data {
+                if msg.stream_id == a_sid {
+                    assert!(
+                        bytes.len() <= DATA_MEDIUM_CAP,
+                        "stream A must stay capped at DATA_MEDIUM_CAP while B is sensitive"
+                    );
                     a_seen += bytes.len();
                 } else if msg.stream_id == b_sid {
                     b_seen += bytes.len();
