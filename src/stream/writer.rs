@@ -21,6 +21,13 @@ use crate::{
 use super::StreamCloseTx;
 
 const BUF_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+/// Per-poll_write staging ceiling. Bounds the pooled buffer for this stream
+/// writer (an uncapped stage pins one Vec as large as the largest write_all
+/// for the writer's lifetime) while keeping the fair-queue message count low.
+/// At exactly [`DATA_BULK_CAP`] the extra reserve/send/wake cycle per message
+/// costs ~8-11% echo throughput on loopback, so stage a few bulk dispatches
+/// per message instead.
+const DATA_STAGING_CAP: usize = 4 * DATA_BULK_CAP;
 
 #[derive(Debug)]
 struct StreamWriterState {
@@ -52,7 +59,7 @@ impl StreamWriterState {
             return Ok(0).into();
         }
         ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
-        let data_len = buf.len().min(DATA_BULK_CAP);
+        let data_len = buf.len().min(DATA_STAGING_CAP);
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         data.send_item(StreamWriteData::Data(data_buf))
@@ -192,11 +199,11 @@ mod tests {
     };
     use std::task::{Context, Waker};
 
-    /// `poll_write` stages at most DATA_BULK_CAP bytes per call, so a larger
+    /// `poll_write` stages at most DATA_STAGING_CAP bytes per call, so a larger
     /// caller buffer is split and the returned length never exceeds the cap.
     /// This keeps the per-stream object-pool buffer bounded.
     #[tokio::test]
-    async fn poll_write_stages_at_most_bulk_cap() {
+    async fn poll_write_stages_at_most_staging_cap() {
         let (prototype, mut rx) = write_data_channel();
 
         // `derive` sends an Open request that only completes while the receiver
@@ -220,19 +227,19 @@ mod tests {
         let mut writer = StreamWriterState::new(broken_pipe, close);
         let mut data_tx: PollStreamWriteDataTx = tx.into();
 
-        let big = vec![0u8; DATA_BULK_CAP * 4];
+        let big = vec![0u8; DATA_STAGING_CAP * 2];
         let mut cx = Context::from_waker(Waker::noop());
         let n = match writer.poll_write(&mut data_tx, &big, &mut cx) {
             Poll::Ready(Ok(n)) => n,
             other => panic!("poll_write should return Ready(Ok(...)): {other:?}"),
         };
-        assert_eq!(n, DATA_BULK_CAP, "first poll_write must return DATA_BULK_CAP");
+        assert_eq!(n, DATA_STAGING_CAP, "first poll_write must return DATA_STAGING_CAP");
 
-        // The staged chunk is DATA_BULK_CAP bytes. The downstream dispatcher may
-        // split it into smaller caps, so drain every Data dispatch for stream 1
-        // until the full staged amount has been observed.
+        // The staged chunk is DATA_STAGING_CAP bytes. The downstream dispatcher
+        // may split it into smaller caps, so drain every Data dispatch for
+        // stream 1 until the full staged amount has been observed.
         let mut seen = 0usize;
-        while seen < DATA_BULK_CAP {
+        while seen < DATA_STAGING_CAP {
             let msg = rx.recv().await.unwrap();
             assert_eq!(msg.stream_id, 1u32);
             if let StreamWriteData::Data(buf) = msg.data {
@@ -241,6 +248,6 @@ mod tests {
                 panic!("expected Data, got {:?}", msg.data);
             }
         }
-        assert_eq!(seen, DATA_BULK_CAP, "total drained bytes must equal staged chunk");
+        assert_eq!(seen, DATA_STAGING_CAP, "total drained bytes must equal staged chunk");
     }
 }

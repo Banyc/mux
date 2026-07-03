@@ -450,7 +450,8 @@ impl WriteDataRx {
                 // LATENCY_HISTORY_MIN observations and escapes the small caps
                 // mid-transfer. Always use the original message length, never
                 // the capped emit size. (offset == 0 prevents double-counting
-                // a head whose original size is exactly DATA_BULK_CAP.)
+                // a head whose original size is exactly DATA_BULK_CAP; the
+                // StreamWriter staging cap is unrelated and may be larger.)
                 self.latency.record_send(chosen, data.len(), now);
             }
             let remaining = data.len() - entry.offset;
