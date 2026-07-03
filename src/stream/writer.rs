@@ -137,6 +137,13 @@ impl StreamWriter {
         };
         live.shutdown()
     }
+    /// Stage at most `DATA_STAGING_CAP` (`4 * DATA_BULK_CAP`) bytes of `buf`,
+    /// returning how many were accepted. Writes are PARTIAL: a slice larger than
+    /// the cap is never accepted in one call, so callers must loop (or use
+    /// `AsyncWriteExt::write_all`) for full delivery. A future that is dropped
+    /// after `Ready(n)` has irrevocably committed those `n` bytes to the stream —
+    /// a cancelled `write_all` may therefore have written a prefix, and retrying
+    /// it from the start corrupts the byte stream.
     pub fn poll_write(
         &mut self,
         buf: &[u8],
@@ -145,6 +152,10 @@ impl StreamWriter {
         let live = self.live.as_mut().ok_or(SendError::LocalClosedStream)?;
         live.poll_write(buf, cx)
     }
+
+    /// Stage a prefix of `buf` and return its length; see [`Self::poll_write`]
+    /// for the partial-write contract (at most `DATA_STAGING_CAP` (`4 *
+    /// DATA_BULK_CAP`) bytes are accepted per call).
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         struct StreamWriterWrite<'a> {
             wtr: &'a mut StreamWriter,
