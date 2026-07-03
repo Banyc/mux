@@ -12,7 +12,7 @@ use tokio::io::AsyncWrite;
 
 use crate::{
     central_io::{
-        writer::{PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx},
+        writer::{PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx, DATA_BULK_CAP},
         DeadCentralIo,
     },
     control::WriteBrokenPipe,
@@ -52,7 +52,7 @@ impl StreamWriterState {
             return Ok(0).into();
         }
         ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
-        let data_len = buf.len();
+        let data_len = buf.len().min(DATA_BULK_CAP);
         let mut data_buf = self.buf_pool.take_scoped();
         data_buf.extend(&buf[..data_len]);
         data.send_item(StreamWriteData::Data(data_buf))
@@ -179,5 +179,68 @@ fn map_send_error_to_io_error(e: SendError) -> io::Error {
         SendError::LocalClosedStream => io::ErrorKind::NotConnected.into(),
         SendError::PeerClosedStream => io::ErrorKind::BrokenPipe.into(),
         SendError::DeadCentralIo(_) => io::ErrorKind::BrokenPipe.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        central_io::writer::{write_data_channel, StreamWriteData},
+        control::WriteBrokenPipe,
+        Side,
+    };
+    use std::task::{Context, Waker};
+
+    /// `poll_write` stages at most DATA_BULK_CAP bytes per call, so a larger
+    /// caller buffer is split and the returned length never exceeds the cap.
+    /// This keeps the per-stream object-pool buffer bounded.
+    #[tokio::test]
+    async fn poll_write_stages_at_most_bulk_cap() {
+        let (prototype, mut rx) = write_data_channel();
+
+        // `derive` sends an Open request that only completes while the receiver
+        // is being polled, so drive `rx` concurrently until the Open is
+        // consumed.
+        let derive_fut = prototype.derive(1u32);
+        let drive_open = async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if msg.stream_id == 1u32 && matches!(msg.data, StreamWriteData::Open) {
+                    break;
+                }
+            }
+        };
+        let (tx, ()) = tokio::join!(derive_fut, drive_open);
+        let tx = tx.unwrap();
+
+        let broken_pipe = WriteBrokenPipe::new();
+        let (close_tx, _close_rx) = crate::stream::stream_close_channel();
+        let close = close_tx.derive(Side::Write, 1u32);
+        let mut writer = StreamWriterState::new(broken_pipe, close);
+        let mut data_tx: PollStreamWriteDataTx = tx.into();
+
+        let big = vec![0u8; DATA_BULK_CAP * 4];
+        let mut cx = Context::from_waker(Waker::noop());
+        let n = match writer.poll_write(&mut data_tx, &big, &mut cx) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("poll_write should return Ready(Ok(...)): {other:?}"),
+        };
+        assert_eq!(n, DATA_BULK_CAP, "first poll_write must return DATA_BULK_CAP");
+
+        // The staged chunk is DATA_BULK_CAP bytes. The downstream dispatcher may
+        // split it into smaller caps, so drain every Data dispatch for stream 1
+        // until the full staged amount has been observed.
+        let mut seen = 0usize;
+        while seen < DATA_BULK_CAP {
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.stream_id, 1u32);
+            if let StreamWriteData::Data(buf) = msg.data {
+                seen += buf.len();
+            } else {
+                panic!("expected Data, got {:?}", msg.data);
+            }
+        }
+        assert_eq!(seen, DATA_BULK_CAP, "total drained bytes must equal staged chunk");
     }
 }

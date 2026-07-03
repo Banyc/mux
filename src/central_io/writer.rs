@@ -27,7 +27,7 @@ const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
 const DATA_EXTREME_CAP: usize = 1200;
 const DATA_MEDIUM_CAP: usize = 2 * 1024;
-const DATA_BULK_CAP: usize = 32 * 1024;
+pub(crate) const DATA_BULK_CAP: usize = 32 * 1024;
 
 /// A stream is relegated from `MaybeLatencySensitive` (the default, protected)
 /// to `MustBulk` once at least two thirds of its recent sends were under
@@ -443,12 +443,14 @@ impl WriteDataRx {
             } else {
                 DATA_BULK_CAP
             };
-            if entry.offset == 0 || data.len() > DATA_BULK_CAP {
+            if entry.offset == 0 || data.len() >= DATA_BULK_CAP {
                 // Record once at first dispatch, and additionally on every
-                // dispatch for heads larger than DATA_BULK_CAP so a sustained
-                // bulk transfer accumulates LATENCY_HISTORY_MIN observations
-                // and escapes the small caps mid-transfer. Always use the
-                // original message length, never the capped emit size.
+                // dispatch for heads whose original length is at least
+                // DATA_BULK_CAP so a sustained bulk transfer accumulates
+                // LATENCY_HISTORY_MIN observations and escapes the small caps
+                // mid-transfer. Always use the original message length, never
+                // the capped emit size. (offset == 0 prevents double-counting
+                // a head whose original size is exactly DATA_BULK_CAP.)
                 self.latency.record_send(chosen, data.len(), now);
             }
             let remaining = data.len() - entry.offset;
@@ -1410,6 +1412,51 @@ mod tests {
     }
 
     // ---- Latency ramp tests ----
+
+    /// A head of exactly DATA_BULK_CAP bytes ramps to MustBulk mid-transfer
+    /// and emits the tail under DATA_BULK_CAP. The first three dispatches are
+    /// capped at DATA_MEDIUM_CAP (accumulating LATENCY_HISTORY_MIN bulk
+    /// observations), and the fourth is the remaining tail.
+    /// Regression for the record condition: exactly-capped heads used to skip
+    /// recording after the first dispatch and therefore never ramped.
+    #[tokio::test]
+    async fn exactly_bulk_cap_head_ramps_mid_transfer() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+
+        // One head of exactly DATA_BULK_CAP bytes. The original length is
+        // >= DATA_BULK_CAP, so every dispatch records an observation. After
+        // three DATA_MEDIUM_CAP dispatches the stream has reached
+        // LATENCY_HISTORY_MIN bulk observations and ramps to MustBulk, so the
+        // fourth dispatch emits the rest of the head.
+        let big_len = DATA_BULK_CAP;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+
+        let mut sizes = Vec::new();
+        let mut seen = 0usize;
+        while seen < big_len {
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(msg.stream_id, 1);
+            if let StreamWriteData::Data(data) = msg.data {
+                seen += data.len();
+                sizes.push(data.len());
+            }
+        }
+        assert!(
+            sizes.len() >= 4,
+            "expected at least 4 dispatches, got {:?}",
+            sizes
+        );
+        assert_eq!(
+            sizes[..4],
+            [
+                DATA_MEDIUM_CAP,
+                DATA_MEDIUM_CAP,
+                DATA_MEDIUM_CAP,
+                DATA_BULK_CAP - 3 * DATA_MEDIUM_CAP
+            ]
+        );
+    }
 
     /// A single sustained bulk transfer ramps to MustBulk mid-transfer and
     /// starts using DATA_BULK_CAP for dispatch 4. The first three dispatches

@@ -1,7 +1,7 @@
 use std::{io, num::NonZeroUsize};
 
 use primitive::arena::obj_pool::ArcObjPool;
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use crate::{
     common::Side,
@@ -106,9 +106,19 @@ where
         let mut hdr = [0; DataHeader::SIZE];
         self.io_reader.read_exact(&mut hdr).await?;
         let hdr = DataHeader::decode(hdr);
+        let mut remaining = usize::from(hdr.body_len);
         let mut buf = self.buf_pool.take_scoped();
-        buf.extend(std::iter::repeat_n(0, usize::from(hdr.body_len)));
-        self.io_reader.read_exact(&mut buf).await?;
+        buf.reserve(remaining);
+        while remaining != 0 {
+            let chunk = self.io_reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let n = chunk.len().min(remaining);
+            buf.extend_from_slice(&chunk[..n]);
+            self.io_reader.consume(n);
+            remaining -= n;
+        }
         Ok((hdr.stream_id, buf))
     }
     async fn recv_stream_id(&mut self) -> io::Result<StreamId> {
