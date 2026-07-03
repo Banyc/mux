@@ -1,7 +1,7 @@
 use std::{io, num::NonZeroUsize};
 
 use primitive::arena::obj_pool::ArcObjPool;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
 use crate::{
     common::Side,
@@ -13,6 +13,7 @@ use super::{DataBuf, DeadCentralIo};
 
 const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const CHANNEL_SIZE: usize = 1024;
+const READ_BUF_CAPACITY: usize = 64 * 1024;
 
 pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
@@ -39,13 +40,26 @@ pub enum RunCentralIoReaderError {
 
 #[derive(Debug)]
 pub struct CentralIoReader<R> {
-    io_reader: R,
+    /// The transport reader wrapped in a buffer.
+    ///
+    /// Each frame is read in several small `read_exact` calls (a `Header::SIZE`
+    /// header, then either a `DataHeader::SIZE` + body or a
+    /// `StreamIdMsg::SIZE`). Buffering coalesces those small reads so they hit
+    /// an in-process buffer instead of each paying for a transport receive.
+    ///
+    /// This is safe because the reader half is owned by `CentralIoReader` until
+    /// the underlying connection dies; the buffered reader is never handed back,
+    /// so no buffered byte can be stranded or lost.
+    io_reader: BufReader<R>,
     buf_pool: ArcObjPool<Vec<u8>>,
 }
-impl<R> CentralIoReader<R> {
+impl<R> CentralIoReader<R>
+where
+    R: AsyncRead + Unpin,
+{
     pub fn new(io_reader: R) -> Self {
         Self {
-            io_reader,
+            io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, io_reader),
             buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
         }
     }
