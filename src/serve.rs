@@ -158,13 +158,12 @@ where
         run_control(args).await
     });
 
+    let heartbeat_interval = config.heartbeat_interval;
     let mut central_io_reader_spawner = JoinSet::new();
     central_io_reader_spawner.spawn(async move {
         let central_io_reader = CentralIoReader::new(io_reader);
-        run_central_io_reader(central_io_reader, central_io_read_tx).await
+        run_central_io_reader(central_io_reader, central_io_read_tx, heartbeat_interval).await
     });
-
-    let heartbeat_interval = config.heartbeat_interval;
     let mut central_io_writer_spawner = JoinSet::new();
     central_io_writer_spawner.spawn(async move {
         let central_io_writer = CentralIoWriter::new(io_writer);

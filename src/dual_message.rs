@@ -176,6 +176,12 @@ impl DualMessageSender {
     }
 }
 
+impl Drop for DualMessageSender {
+    fn drop(&mut self) {
+        self.semaphore.close();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DualMessageReceiver
 // ---------------------------------------------------------------------------
@@ -190,6 +196,7 @@ pub struct DualMessageReceiver {
     mode: DeliveryMode,
     max_message_len: usize,
     read_tasks: JoinSet<Option<Message>>,
+    inflight: usize,
     // Ordered-mode state
     ordered: BTreeMap<u64, Message>,
     next_seq: u64,
@@ -218,6 +225,7 @@ impl DualMessageReceiver {
             mode,
             max_message_len: DEFAULT_MAX_MESSAGE_LEN,
             read_tasks: JoinSet::new(),
+            inflight: 0,
             ordered: BTreeMap::new(),
             next_seq: 0,
             reorder_cap: DEFAULT_REORDER_CAP,
@@ -251,9 +259,10 @@ impl DualMessageReceiver {
                         }
                     }
                 }
-                res = self.read_tasks.join_next() => {
+                res = self.read_tasks.join_next(), if self.inflight > 0 => {
                     match res {
                         Some(Ok(Some(msg))) => {
+                            self.inflight -= 1;
                             match self.mode {
                                 DeliveryMode::Unordered => {
                                     return Ok(Some(msg.payload));
@@ -266,15 +275,34 @@ impl DualMessageReceiver {
                                 }
                             }
                         }
-                        Some(Ok(None)) => {}
-                        Some(Err(_)) => {}
+                        Some(Ok(None)) => {
+                            self.inflight -= 1;
+                        }
+                        Some(Err(_)) => {
+                            self.inflight -= 1;
+                        }
                         None => {
-                            if self.accepter_dead {
-                                return Ok(None);
-                            }
+                            self.inflight = 0;
                         }
                     }
                 }
+            }
+
+            if self.accepter_dead && self.inflight == 0 {
+                if matches!(self.mode, DeliveryMode::Ordered) {
+                    while self.ordered.len() >= self.reorder_cap
+                        || self.ordered.first_key_value().is_some()
+                    {
+                        if let Some(payload) = self.pop_ordered() {
+                            return Ok(Some(payload));
+                        }
+                        if self.ordered.is_empty() {
+                            break;
+                        }
+                        self.next_seq = *self.ordered.first_key_value().unwrap().0;
+                    }
+                }
+                return Ok(None);
             }
         }
     }
@@ -282,6 +310,7 @@ impl DualMessageReceiver {
     fn spawn_read_task(&mut self, mut reader: StreamReader) {
         let max_message_len = self.max_message_len;
         let mode = self.mode;
+        self.inflight += 1;
         self.read_tasks.spawn(async move {
             // Read 4-byte length prefix (LE)
             let mut len_buf = [0u8; 4];
@@ -318,16 +347,14 @@ impl DualMessageReceiver {
 
     fn insert_ordered(&mut self, msg: Message) {
         let seq = msg.seq.unwrap_or(0);
-        // Drop stale messages (seq below next_expected)
         if seq < self.next_seq {
             return;
         }
         self.ordered.insert(seq, msg);
-        // Force-advance if buffer exceeds cap: skip the gap to the
-        // smallest buffered message.
         while self.ordered.len() > self.reorder_cap {
             let (&first_seq, _) = self.ordered.first_key_value().unwrap();
             self.next_seq = first_seq;
+            self.ordered.remove(&first_seq);
         }
     }
 
@@ -339,16 +366,16 @@ impl DualMessageReceiver {
                 self.next_seq = seq + 1;
                 return Some(msg.payload);
             }
-            if seq > self.next_seq {
-                // Gap — wait for the missing message.
-                // But if buffer is at capacity, force-advance.
-                if self.ordered.len() >= self.reorder_cap {
-                    let msg = self.ordered.remove(&seq).unwrap();
-                    self.next_seq = seq + 1;
-                    return Some(msg.payload);
-                }
-                return None;
+            if seq < self.next_seq {
+                self.ordered.remove(&seq);
+                continue;
             }
+            if self.ordered.len() >= self.reorder_cap {
+                let msg = self.ordered.remove(&seq).unwrap();
+                self.next_seq = seq + 1;
+                return Some(msg.payload);
+            }
+            return None;
         }
     }
 }
@@ -558,33 +585,67 @@ mod tests {
     // Sender semaphore backpressure
     // -------------------------------------------------------------------
 
-    /// The semaphore bounds in-flight sends. With an unread transport
-    /// end, sends eventually block when the semaphore is exhausted.
+    /// The semaphore bounds in-flight sends. With a tiny transport
+    /// buffer and concurrent sends, the semaphore limits how many
+    /// sends are truly in-flight at once.
     #[tokio::test(flavor = "multi_thread")]
     async fn semaphore_backpressure_limits_inflight() {
-        let (opener, _accepter, _srv, _cli) = paired_sessions().await;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::Barrier;
 
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered)
-            .with_max_inflight(2);
+        // Tiny duplex — fills fast, so writes don't complete instantly.
+        let (_cli_r, srv_w) = duplex(128);
+        let (srv_r, _cli_w) = duplex(128);
 
-        // Send 2 messages — should all succeed (within limit)
-        tx.send(&[1u8; 100]).await.unwrap();
-        tx.send(&[2u8; 100]).await.unwrap();
+        let mut srv_spawner = JoinSet::new();
+        let (srv_opener, _srv_accepter) = spawn_mux_no_reconnection(
+            srv_r,
+            srv_w,
+            config(),
+            &mut srv_spawner,
+        );
 
-        // Send more concurrently — the 3rd send may or may not
-        // complete depending on whether the peer drains. With an
-        // active peer, all complete. The semaphore at least correctly
-        // limits concurrency.
-        let tx = Arc::new(tx);
-        let mut handles = vec![];
+        let (bulk_r, _bulk_cli_w) = duplex(128);
+        let (_bulk_cli_r, bulk_w) = duplex(128);
+        let mut bulk_spawner = JoinSet::new();
+        let (bulk_opener, _) =
+            spawn_mux_no_reconnection(bulk_r, bulk_w, config(), &mut bulk_spawner);
+        tokio::task::spawn(async move { let _ = bulk_spawner.join_next().await; });
+
+        let opener = DualStreamOpener::new(srv_opener, bulk_opener, Liveness::new());
+
+        let tx = Arc::new(
+            DualMessageSender::new(opener, DeliveryMode::Unordered)
+                .with_max_inflight(2),
+        );
+
+        // Barrier ensures tasks start concurrently.
+        let barrier = Arc::new(Barrier::new(10));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
         for i in 0..10u8 {
             let tx = tx.clone();
+            let barrier = barrier.clone();
+            let finished = finished.clone();
             handles.push(tokio::spawn(async move {
-                tx.send(&[i; 100]).await
+                barrier.wait().await;
+                let r = tx.send(&[i; 500]).await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                r
             }));
         }
+
+        // Let them run briefly — at most 2 should finish quickly
+        // (filled the tiny transport buffer; permits are held).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let done = finished.load(Ordering::SeqCst);
+        assert!(done <= 2, "at most 2 permits, but {done} finished at start");
+
+        // Wait for all to complete.
+        drop(tx);
         for h in handles {
-            assert!(h.await.unwrap().is_ok());
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
     }
 

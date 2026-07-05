@@ -1,4 +1,4 @@
-use std::{io, num::NonZeroUsize};
+use std::{io, num::NonZeroUsize, time::Duration};
 
 use primitive::arena::obj_pool::ArcObjPool;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -14,17 +14,20 @@ use super::{DataBuf, DeadCentralIo};
 const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const CHANNEL_SIZE: usize = 1024;
 const READ_BUF_CAPACITY: usize = 64 * 1024;
+const RECEIVE_DEADLINE_INTERVALS: u32 = 4;
 
 pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
     tx: CentralIoReadTx,
+    heartbeat_interval: Duration,
 ) -> Result<(), RunCentralIoReaderError>
 where
     R: AsyncRead + Unpin,
 {
+    let deadline = heartbeat_interval * RECEIVE_DEADLINE_INTERVALS;
     loop {
         let msg = io_reader
-            .recv()
+            .recv(deadline)
             .await
             .map_err(RunCentralIoReaderError::IoReader)?;
         tx.send(msg)
@@ -36,6 +39,12 @@ where
 pub enum RunCentralIoReaderError {
     IoReader(io::Error),
     Control(DeadControl),
+}
+
+impl From<io::Error> for RunCentralIoReaderError {
+    fn from(e: io::Error) -> Self {
+        RunCentralIoReaderError::IoReader(e)
+    }
 }
 
 #[derive(Debug)]
@@ -68,9 +77,15 @@ impl<R> CentralIoReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub async fn recv(&mut self) -> io::Result<CentralIoReadMsg> {
+    pub async fn recv(&mut self, deadline: Duration) -> io::Result<CentralIoReadMsg> {
         loop {
-            let res = self.recv_pkt().await?;
+            let res = tokio::time::timeout(deadline, self.recv_pkt()).await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "receive deadline — session timed out",
+                    )
+                })??;
             if let Some(res) = res {
                 return Ok(res);
             }

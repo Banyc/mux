@@ -1,14 +1,16 @@
 use std::{
+    collections::hash_map::RandomState,
     future::Future,
+    hash::{BuildHasher, Hasher},
     io,
     ops::DerefMut,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     task::{ready, Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use tokio::{
@@ -73,22 +75,17 @@ impl LaneClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PairingNonce([u8; PAIRING_NONCE_LEN]);
 
-static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 impl PairingNonce {
     pub fn generate() -> Self {
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let c = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let rs = RandomState::new();
         let mut buf = [0u8; PAIRING_NONCE_LEN];
-        buf[0..8].copy_from_slice(&t.to_le_bytes());
-        buf[8..16].copy_from_slice(&c.to_le_bytes());
-        // Simple mixing so the nonce isn't trivially predictable.
-        for b in &mut buf {
-            *b = b.wrapping_mul(0x9d).wrapping_add(0x3f);
-        }
+        // Fill each u64 word from a separate OS-seeded hasher for full entropy.
+        let mut h0 = rs.build_hasher();
+        h0.write_u64(0);
+        buf[0..8].copy_from_slice(&h0.finish().to_le_bytes());
+        let mut h1 = rs.build_hasher();
+        h1.write_u64(1);
+        buf[8..16].copy_from_slice(&h1.finish().to_le_bytes());
         Self(buf)
     }
 }
@@ -172,6 +169,8 @@ pub enum DualMuxError {
 pub enum DualStreamOpenError {
     LaneDead,
     StreamOpen(StreamOpenError),
+    /// Writer was dropped before its first write — peer should see clean EOF.
+    CleanClose,
 }
 
 impl From<StreamOpenError> for DualStreamOpenError {
@@ -302,10 +301,16 @@ pub struct AutoWriter {
     liveness: Liveness,
 }
 
+type OpenFuture = Pin<Box<dyn Future<Output = Result<(StreamReader, StreamWriter), StreamOpenError>> + Send>>;
+
 enum AutoWriterState {
     Pending {
         interactive: StreamOpener,
         bulk: StreamOpener,
+        reader_tx: Option<oneshot::Sender<Result<StreamReader, DualStreamOpenError>>>,
+    },
+    Opening {
+        open_fut: OpenFuture,
         reader_tx: Option<oneshot::Sender<Result<StreamReader, DualStreamOpenError>>>,
     },
     Active {
@@ -347,48 +352,38 @@ impl AutoWriter {
 
     /// Synchronously attempt to open the stream. Called from `poll_write`
     /// (inside an async runtime context).
-    fn try_open(&mut self, total_len: usize) -> Result<(), AutoWriteError> {
-        let (state, reader_tx) = match std::mem::replace(&mut self.state, AutoWriterState::Failed) {
-            AutoWriterState::Pending {
-                interactive,
-                bulk,
-                reader_tx,
-            } => {
-                let class = Self::classify_len(total_len);
-                let opener = match class {
-                    LaneClass::Interactive => interactive,
-                    LaneClass::Bulk => bulk,
-                };
-                ((class, opener), reader_tx)
-            }
-            other => {
-                self.state = other;
-                return Ok(());
-            }
+    fn try_open(&mut self, total_len: usize) {
+        let (class, interactive, bulk, reader_tx) =
+            match std::mem::replace(&mut self.state, AutoWriterState::Failed) {
+                AutoWriterState::Pending {
+                    interactive,
+                    bulk,
+                    reader_tx,
+                } => {
+                    let class = Self::classify_len(total_len);
+                    let (interactive, bulk) = match class {
+                        LaneClass::Interactive => (Some(interactive), None),
+                        LaneClass::Bulk => (None, Some(bulk)),
+                    };
+                    (class, interactive, bulk, reader_tx)
+                }
+                other => {
+                    self.state = other;
+                    return;
+                }
+            };
+        let opener = match class {
+            LaneClass::Interactive => interactive.unwrap(),
+            LaneClass::Bulk => bulk.unwrap(),
         };
-        let (_class, opener) = state;
-
-        // Open the stream synchronously — we are inside a tokio runtime.
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(opener.open())
-        });
-
-        match result {
-            Ok((reader, writer)) => {
-                if let Some(tx) = reader_tx {
-                    let _ = tx.send(Ok(reader));
-                }
-                self.state = AutoWriterState::Active { writer };
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(tx) = reader_tx {
-                    let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e)));
-                }
-                self.state = AutoWriterState::Failed;
-                Err(AutoWriteError::OpenFailed(DualStreamOpenError::LaneDead))
-            }
-        }
+        let open_fut = {
+            let opener = opener.clone();
+            Box::pin(async move { opener.open().await })
+        };
+        self.state = AutoWriterState::Opening {
+            open_fut,
+            reader_tx,
+        };
     }
 
     fn active_writer(&mut self) -> Result<&mut StreamWriter, AutoWriteError> {
@@ -401,6 +396,42 @@ impl AutoWriter {
         }
     }
 
+    fn poll_open(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), AutoWriteError>> {
+        let state = std::mem::replace(&mut self.state, AutoWriterState::Failed);
+        let (mut open_fut, reader_tx) = match state {
+            AutoWriterState::Opening { open_fut, reader_tx } => {
+                (open_fut, reader_tx)
+            }
+            other => {
+                self.state = other;
+                return Poll::Ready(Ok(()));
+            }
+        };
+        match open_fut.as_mut().poll(cx) {
+            Poll::Ready(Ok((reader, writer))) => {
+                if let Some(tx) = reader_tx {
+                    let _ = tx.send(Ok(reader));
+                }
+                self.state = AutoWriterState::Active { writer };
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                if let Some(tx) = reader_tx {
+                    let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e)));
+                }
+                self.state = AutoWriterState::Failed;
+                Poll::Ready(Err(AutoWriteError::OpenFailed(DualStreamOpenError::LaneDead)))
+            }
+            Poll::Pending => {
+                self.state = AutoWriterState::Opening { open_fut, reader_tx };
+                Poll::Pending
+            }
+        }
+    }
+
     pub fn poll_write(
         &mut self,
         buf: &[u8],
@@ -410,9 +441,10 @@ impl AutoWriter {
             return Poll::Ready(Err(AutoWriteError::LaneDead));
         }
         if matches!(self.state, AutoWriterState::Pending { .. }) {
-            if let Err(e) = self.try_open(buf.len()) {
-                return Poll::Ready(Err(e));
-            }
+            self.try_open(buf.len());
+        }
+        if matches!(self.state, AutoWriterState::Opening { .. }) {
+            ready!(self.poll_open(cx))?;
         }
         let writer = match self.active_writer() {
             Ok(w) => w,
@@ -433,9 +465,10 @@ impl AutoWriter {
         }
         if matches!(self.state, AutoWriterState::Pending { .. }) {
             let total_len: usize = bufs.iter().map(|s| s.len()).sum();
-            if let Err(e) = self.try_open(total_len) {
-                return Poll::Ready(Err(e));
-            }
+            self.try_open(total_len);
+        }
+        if matches!(self.state, AutoWriterState::Opening { .. }) {
+            ready!(self.poll_open(cx))?;
         }
         let writer = match self.active_writer() {
             Ok(w) => w,
@@ -474,8 +507,16 @@ impl AutoWriter {
                 .map_err(AutoWriteError::SendFailed),
             AutoWriterState::Pending { reader_tx, .. } => {
                 if let Some(tx) = reader_tx.take() {
-                    let _ = tx.send(Err(DualStreamOpenError::LaneDead));
+                    let _ = tx.send(Err(DualStreamOpenError::CleanClose));
                 }
+                self.state = AutoWriterState::Failed;
+                Ok(())
+            }
+            AutoWriterState::Opening { reader_tx, .. } => {
+                if let Some(tx) = reader_tx.take() {
+                    let _ = tx.send(Err(DualStreamOpenError::CleanClose));
+                }
+                self.state = AutoWriterState::Failed;
                 Ok(())
             }
             AutoWriterState::Failed => Ok(()),
@@ -501,6 +542,10 @@ impl AsyncWrite for AutoWriter {
         let this = self.deref_mut();
         this.poll_write_vectored(bufs, cx)
             .map_err(auto_write_to_io)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -584,6 +629,10 @@ impl AsyncRead for AutoReader {
                         Ok(Ok(reader)) => {
                             this.state = AutoReaderState::Ready { reader };
                             continue;
+                        }
+                        Ok(Err(DualStreamOpenError::CleanClose)) => {
+                            this.state = AutoReaderState::Failed;
+                            return Poll::Ready(Ok(()));
                         }
                         Ok(Err(_)) | Err(_) => {
                             this.state = AutoReaderState::Failed;
@@ -831,37 +880,32 @@ pub fn complete_pairing(
     let liveness = Liveness::new();
     let alive = liveness.alive.clone();
 
-    // Fold both lane spawners into the caller's spawner.
-    // When either lane's session dies, the liveness guard is killed
-    // and the other lane's tasks are aborted.
-    let alive_int = alive.clone();
+    // One supervisor races both lane spawners: when either lane's session
+    // finishes (or errors), it aborts the OTHER lane and kills the liveness
+    // guard so every extant stream handle on the surviving lane errors promptly.
     spawner.spawn(async move {
-        let mut s = int_pending.spawner;
-        let res = s.join_next().await;
-        alive_int.store(false, Ordering::SeqCst);
-        match res {
-            Some(Ok(err)) => err,
-            Some(Err(_)) => MuxError::TaskStopped {
-                task: "interactive_lane",
-            },
-            None => MuxError::TaskStopped {
-                task: "interactive_lane",
-            },
-        }
-    });
-    spawner.spawn(async move {
-        let mut s = bulk_pending.spawner;
-        let res = s.join_next().await;
-        alive.store(false, Ordering::SeqCst);
-        match res {
-            Some(Ok(err)) => err,
-            Some(Err(_)) => MuxError::TaskStopped {
-                task: "bulk_lane",
-            },
-            None => MuxError::TaskStopped {
-                task: "bulk_lane",
-            },
-        }
+        let mut int_s = int_pending.spawner;
+        let mut bulk_s = bulk_pending.spawner;
+        let (died, err) = tokio::select! {
+            res = int_s.join_next() => {
+                bulk_s.abort_all();
+                alive.store(false, Ordering::SeqCst);
+                ("interactive", match res {
+                    Some(Ok(err)) => err,
+                    _ => MuxError::TaskStopped { task: "interactive_lane" },
+                })
+            }
+            res = bulk_s.join_next() => {
+                int_s.abort_all();
+                alive.store(false, Ordering::SeqCst);
+                ("bulk", match res {
+                    Some(Ok(err)) => err,
+                    _ => MuxError::TaskStopped { task: "bulk_lane" },
+                })
+            }
+        };
+        let _ = died;
+        err
     });
 
     let opener = DualStreamOpener::new(
