@@ -453,7 +453,7 @@ mod tests {
         tx_handle.await.unwrap();
 
         // Unordered: both messages arrive; order not guaranteed
-        let mut msgs = vec![msg1, msg2];
+        let mut msgs = [msg1, msg2];
         msgs.sort();
         assert_eq!(msgs[0], b"hello");
         assert_eq!(msgs[1], b"world");

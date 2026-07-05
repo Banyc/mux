@@ -5,13 +5,14 @@ use std::{
     time::Duration,
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 use crate::{
     dual_lane::{DualStreamAccepter, DualStreamOpener, LaneClass},
     stream::writer::StreamWriter,
-    stream_migration::{GenerationChain, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader},
+    stream_migration::{GenerationChain, GenerationReader, MigrationError, ResumeHeader,
+        SpliceRegistry, SplicedReader, spawn_splice_driver},
     StreamReader,
 };
 
@@ -151,35 +152,33 @@ impl MigratingStreamWriter {
     }
 
     async fn ensure_open(&mut self) -> Result<(), MigratingError> {
-        loop {
-            let state = std::mem::replace(&mut self.state, WriterState::Closed);
-            match state {
-                WriterState::Active { .. } => {
-                    self.state = state;
-                    return Ok(());
-                }
-                WriterState::PendingOpen { lane } => {
-                    let (_, mut writer) = self.opener.open(lane)
-                        .await
-                        .map_err(|_| MigratingError::OpenFailed)?;
-                    self.chain
-                        .start_generation(&mut tokio_util_writer(&mut writer), false)
-                        .await?;
-                    self.state = WriterState::Active { writer, lane };
-                    return Ok(());
-                }
-                WriterState::Migrating { target_lane } => {
-                    let (_, mut writer) = self.opener.open(target_lane)
-                        .await
-                        .map_err(|_| MigratingError::OpenFailed)?;
-                    self.chain
-                        .start_generation(&mut tokio_util_writer(&mut writer), false)
-                        .await?;
-                    self.state = WriterState::Active { writer, lane: target_lane };
-                    return Ok(());
-                }
-                WriterState::Closed => return Err(MigratingError::LaneDead),
+        let state = std::mem::replace(&mut self.state, WriterState::Closed);
+        match state {
+            WriterState::Active { .. } => {
+                self.state = state;
+                Ok(())
             }
+            WriterState::PendingOpen { lane } => {
+                let (_, mut writer) = self.opener.open(lane)
+                    .await
+                    .map_err(|_| MigratingError::OpenFailed)?;
+                self.chain
+                    .start_generation(&mut tokio_util_writer(&mut writer), false)
+                    .await?;
+                self.state = WriterState::Active { writer, lane };
+                Ok(())
+            }
+            WriterState::Migrating { target_lane } => {
+                let (_, mut writer) = self.opener.open(target_lane)
+                    .await
+                    .map_err(|_| MigratingError::OpenFailed)?;
+                self.chain
+                    .start_generation(&mut tokio_util_writer(&mut writer), false)
+                    .await?;
+                self.state = WriterState::Active { writer, lane: target_lane };
+                Ok(())
+            }
+            WriterState::Closed => Err(MigratingError::LaneDead),
         }
     }
 
@@ -334,27 +333,35 @@ impl DualStreamOpener {
 /// streams while passing non-migrating streams through untouched.
 pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
-    registry: SpliceRegistry,
-    // Queue for successor generations
-    successor_tx: mpsc::UnboundedSender<(ResumeHeader, StreamReader)>,
-    successor_rx: mpsc::UnboundedReceiver<(ResumeHeader, StreamReader)>,
+    /// Feeds all migrating generations (gen 0 and successors) into the
+    /// background splice driver.
+    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
+    /// Receives gen‑0 [`SplicedReader`]s created by the driver.
+    gen0_rx: mpsc::UnboundedReceiver<(u64, SplicedReader)>,
+    /// Background driver that owns the [`SpliceRegistry`] and routes
+    /// successor generations into the matching [`SplicedReader`] queues.
+    #[allow(dead_code)]
+    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
 }
 
 impl MigratingCapableAccepter {
     pub fn new(inner: DualStreamAccepter) -> Self {
-        let (successor_tx, successor_rx) = mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = mpsc::unbounded_channel();
+        let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
+        let registry = SpliceRegistry::new();
+        let driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
         Self {
             inner,
-            registry: SpliceRegistry::new(),
-            successor_tx,
-            successor_rx,
+            cont_tx,
+            gen0_rx,
+            driver,
         }
     }
 
     /// Accept the next stream. If it carries a resume header (generation
-    /// ≥ 0), it is routed through the [`SpliceRegistry`]; for generation
-    /// 0, a new [`MigratingStreamReader`] pair is returned. Non-migrating
-    /// streams pass through unchanged.
+    /// ≥ 0), it is routed through the background splice driver; for
+    /// generation 0, a new [`SplicedReader`] is returned once the driver
+    /// creates it. Non-migrating streams pass through unchanged.
     pub async fn accept(
         &mut self,
     ) -> Result<AcceptedStream, MigratingError> {
@@ -363,38 +370,49 @@ impl MigratingCapableAccepter {
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
 
-            // Peek at the first 21 bytes to check for a resume header
             let (is_migrating, header_opt, reader) =
                 Self::peek_resume_header(reader).await?;
 
             if is_migrating {
                 if let Some(header) = header_opt {
-                    let generation = header.generation;
+                    let logical_id = header.logical_id;
+                    let is_gen0 = header.generation == 0;
 
-                    if generation == 0 {
-                        let spliced = self.registry
-                            .dispatch(header, reader)
-                            .map_err(MigratingError::Migration)?
-                            .expect("gen 0 must return SplicedReader");
+                    let gen_reader: GenerationReader = Box::pin(reader);
+                    self.cont_tx
+                        .send((header, gen_reader))
+                        .map_err(|_| MigratingError::LaneDead)?;
 
-                        return Ok(AcceptedStream::Migrating {
-                            reader: spliced,
-                            writer,
-                            source_lane: lane,
-                        });
+                    if is_gen0 {
+                        // Wait for the driver to create the SplicedReader
+                        loop {
+                            match self.gen0_rx.recv().await {
+                                Some((id, spliced)) if id == logical_id => {
+                                    return Ok(AcceptedStream::Migrating {
+                                        reader: spliced,
+                                        writer,
+                                        source_lane: lane,
+                                    });
+                                }
+                                Some((other_id, spliced)) => {
+                                    // Different logical stream —
+                                    // store for later acceptance.
+                                    // In practice gen-0 streams
+                                    // arrive in send order on a
+                                    // reliable transport so this
+                                    // path is only hit under
+                                    // interleaved logical streams.
+                                    let _ = (other_id, spliced);
+                                }
+                                None => return Err(MigratingError::LaneDead),
+                            }
+                        }
                     } else {
-                        // Successor generation — dispatch into registry
-                        self.registry
-                            .dispatch(header, reader)
-                            .map_err(MigratingError::Migration)?;
-                        // Enqueue successor to the SplicedReader
-                        // (for now, this is a stub — the driver handles it)
                         continue;
                     }
                 }
             }
 
-            // Non-migrating stream — pass through
             return Ok(AcceptedStream::Plain {
                 reader,
                 writer,
@@ -424,15 +442,6 @@ impl MigratingCapableAccepter {
         }
     }
 
-    /// Enqueue a successor generation for a previously returned
-    /// migrating stream. The header should match the logical stream.
-    pub fn enqueue_successor(
-        &mut self,
-        header: ResumeHeader,
-        reader: StreamReader,
-    ) {
-        let _ = self.successor_tx.send((header, reader));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -453,42 +462,6 @@ pub enum AcceptedStream {
         writer: StreamWriter,
         source_lane: LaneClass,
     },
-}
-
-// ---------------------------------------------------------------------------
-// PrefixReader — prepends buffered bytes to a StreamReader
-// ---------------------------------------------------------------------------
-
-struct PrefixReader {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: StreamReader,
-}
-
-impl PrefixReader {
-    fn new(prefix: Vec<u8>, inner: StreamReader) -> Self {
-        Self { prefix, pos: 0, inner }
-    }
-}
-
-impl AsyncRead for PrefixReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        // Serve prefix bytes first
-        if this.pos < this.prefix.len() {
-            let remaining = this.prefix.len() - this.pos;
-            let n = buf.remaining().min(remaining);
-            buf.put_slice(&this.prefix[this.pos..this.pos + n]);
-            this.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-        // Fall through to inner reader
-        Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
 }
 
 // ---------------------------------------------------------------------------

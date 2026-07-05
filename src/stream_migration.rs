@@ -20,7 +20,7 @@
 //!   after the successor deadline expires, never clean EOF.
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap, VecDeque},
+    collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
     fmt,
     io,
     pin::Pin,
@@ -30,7 +30,7 @@ use std::{
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     time::Instant,
 };
 
@@ -242,7 +242,7 @@ impl GenerationChain {
 // SpliceRegistry (receiver side)
 // ---------------------------------------------------------------------------
 
-type GenerationReader = Pin<Box<dyn AsyncRead + Send + 'static>>;
+pub(crate) type GenerationReader = Pin<Box<dyn AsyncRead + Send + 'static>>;
 
 struct StreamQueue {
     /// Pending generations (waiting for the current one to be consumed).
@@ -351,7 +351,6 @@ impl SpliceRegistry {
                         logical_id: header.logical_id,
                         current: Some(reader),
                         queue_rx: None,
-                        successor_deadline: self.successor_deadline,
                         is_closed: header.is_final,
                     };
                     Ok(Some(spliced))
@@ -411,13 +410,6 @@ impl SpliceRegistry {
             .map(|(_, r)| r)
     }
 
-    /// Check whether a FINAL marker was seen for a logical stream.
-    pub(crate) fn is_final(&self, logical_id: u64) -> bool {
-        self.streams
-            .get(&logical_id)
-            .map(|q| q.final_seen)
-            .unwrap_or(false)
-    }
 }
 
 impl Default for SpliceRegistry {
@@ -436,7 +428,6 @@ pub struct SplicedReader {
     logical_id: u64,
     current: Option<GenerationReader>,
     queue_rx: Option<mpsc::UnboundedReceiver<GenerationReader>>,
-    successor_deadline: Duration,
     is_closed: bool,
 }
 
@@ -528,54 +519,45 @@ impl AsyncRead for SplicedReader {
 /// Spawn a background task that reads continuation readers from a
 /// channel and dispatches them into the [`SpliceRegistry`], feeding
 /// successor generations into the [`SplicedReader`]'s queue.
+///
+/// Gen‑0 generations produce a [`SplicedReader`] sent back on `gen0_tx`;
+/// successor generations are dequeued from the registry and pushed into
+/// the matching [`SplicedReader`]'s queue.
 pub fn spawn_splice_driver(
-    mut registry: SpliceRegistry,
+    registry: SpliceRegistry,
     mut cont_rx: mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
-) -> (
-    SplicedReader,
-    tokio::task::JoinHandle<Result<(), MigrationError>>,
-) {
-    let (reader_tx, reader_rx) = oneshot::channel();
-    let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+    gen0_tx: mpsc::UnboundedSender<(u64, SplicedReader)>,
+) -> tokio::task::JoinHandle<Result<(), MigrationError>> {
+    tokio::spawn(async move {
+        let mut registry = registry;
+        let mut queues: HashMap<u64, mpsc::UnboundedSender<GenerationReader>> =
+            HashMap::new();
 
-    let handle = tokio::spawn(async move {
-        // Wait for generation 0
-        let mut spliced = loop {
-            let Some((header, reader)) = cont_rx.recv().await else {
-                return Err(MigrationError::BrokenPipe);
-            };
-            if header.generation == 0 {
-                match registry.dispatch(header, reader)? {
-                    Some(spliced) => break spliced.with_queue(queue_rx),
-                    None => continue,
-                }
-            }
-        };
-
-        let _ = reader_tx.send(spliced);
-
-        // Process remaining generations
         while let Some((header, reader)) = cont_rx.recv().await {
             let logical_id = header.logical_id;
+            let is_gen0 = header.generation == 0;
             match registry.dispatch(header, reader)? {
-                Some(_) => {} // should not happen after gen 0
+                Some(spliced) => {
+                    if is_gen0 {
+                        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+                        let spliced = spliced.with_queue(queue_rx);
+                        queues.insert(logical_id, queue_tx);
+                        let _ = gen0_tx.send((logical_id, spliced));
+                    }
+                }
                 None => {
-                    if let Some(next) = registry.enqueue_successor(logical_id) {
-                        let _ = queue_tx.send(next);
+                    if !is_gen0 {
+                        if let Some(queue_tx) = queues.get(&logical_id) {
+                            if let Some(next) = registry.enqueue_successor(logical_id) {
+                                let _ = queue_tx.send(next);
+                            }
+                        }
                     }
                 }
             }
         }
         Ok(())
-    });
-
-    let spliced = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            reader_rx.await.expect("splice driver died before gen 0")
-        })
-    });
-
-    (spliced, handle)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_magic_rejected() {
-        let mut buf = [0u8; RESUME_HEADER_LEN];
+        let buf = [0u8; RESUME_HEADER_LEN];
         let result = ResumeHeader::parse(&buf);
         assert!(result.is_none());
     }

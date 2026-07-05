@@ -86,8 +86,8 @@ impl PairingNonce {
         buf[0..8].copy_from_slice(&t.to_le_bytes());
         buf[8..16].copy_from_slice(&c.to_le_bytes());
         // Simple mixing so the nonce isn't trivially predictable.
-        for i in 0..16 {
-            buf[i] = buf[i].wrapping_mul(0x9d).wrapping_add(0x3f);
+        for b in &mut buf {
+            *b = b.wrapping_mul(0x9d).wrapping_add(0x3f);
         }
         Self(buf)
     }
@@ -213,6 +213,12 @@ impl Liveness {
     }
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
