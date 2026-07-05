@@ -8,6 +8,7 @@ mod central_io;
 mod common;
 mod control;
 mod dual_lane;
+mod dual_message;
 #[allow(unused)]
 mod fair_queue;
 mod protocol;
@@ -22,6 +23,10 @@ pub use dual_lane::{
     spawn_dual_mux_paired, write_lane_hello, AutoReader, AutoWriteError, AutoWriter,
     DualAcceptError, DualMuxError, DualStreamAccepter, DualStreamOpenError, DualStreamOpener,
     LaneClass, LaneHelloError, PendingAcceptor, AUTO_BULK_THRESHOLD,
+};
+pub use dual_message::{
+    DeliveryMode, DualMessageReceiver, DualMessageSender, RecvError, SendError,
+    DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP,
 };
 pub use serve::{spawn_mux_no_reconnection, spawn_mux_with_reconnection, MuxConfig, MuxError};
 pub use stream::{

@@ -202,7 +202,7 @@ pub(crate) struct Liveness {
 }
 
 impl Liveness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(true)),
         }
