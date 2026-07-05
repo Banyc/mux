@@ -9,6 +9,7 @@ mod common;
 mod control;
 mod dual_lane;
 mod dual_message;
+mod stream_migration;
 #[allow(unused)]
 mod fair_queue;
 mod protocol;
@@ -34,4 +35,8 @@ pub use stream::{
     opener::{StreamOpenError, StreamOpener},
     reader::StreamReader,
     writer::StreamWriter,
+};
+pub use stream_migration::{
+    GenerationChain, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader,
+    DEFAULT_SUCCESSOR_DEADLINE, MAX_PENDING_GENERATIONS, RESUME_HEADER_LEN,
 };
