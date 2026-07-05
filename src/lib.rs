@@ -24,7 +24,7 @@ pub use dual_lane::{
     complete_pairing, read_lane_hello, spawn_dual_mux_acceptor, spawn_dual_mux_connector,
     spawn_dual_mux_paired, write_lane_hello, AutoReader, AutoWriteError, AutoWriter,
     DualAcceptError, DualMuxError, DualStreamAccepter, DualStreamOpenError, DualStreamOpener,
-    LaneClass, LaneHelloError, PendingAcceptor, AUTO_BULK_THRESHOLD,
+    LaneClass, LaneHelloError, Liveness, PairingNonce, PendingAcceptor, AUTO_BULK_THRESHOLD,
 };
 pub use dual_message::{
     DeliveryMode, DualMessageReceiver, DualMessageSender, RecvError, SendError,

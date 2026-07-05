@@ -197,12 +197,12 @@ pub enum DualAcceptError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(crate) struct Liveness {
+pub struct Liveness {
     alive: Arc<AtomicBool>,
 }
 
 impl Liveness {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(true)),
         }
