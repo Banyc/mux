@@ -309,6 +309,10 @@ impl SpliceRegistry {
         match self.streams.entry(header.logical_id) {
             Entry::Occupied(mut entry) => {
                 let queue = entry.get_mut();
+                // Generation-0 re-claims are dropped.
+                if header.generation == 0 {
+                    return Ok(None);
+                }
                 // Duplicate generation numbers are dropped.
                 if queue
                     .pending
@@ -318,10 +322,11 @@ impl SpliceRegistry {
                     return Err(MigrationError::DuplicateGeneration);
                 }
                 // FINAL with payload rejected.
+                // Note: we cannot check payload emptiness without reading,
+                // so we trust the sender per start_generation's contract.
                 if header.is_final {
-                    return Err(MigrationError::FinalWithPayload);
-                }
-                if queue.pending.len() >= MAX_PENDING_GENERATIONS {
+                    queue.final_seen = true;
+                } else if queue.pending.len() >= MAX_PENDING_GENERATIONS {
                     return Err(MigrationError::TooManyPendingGenerations);
                 }
                 queue.pending.push_back((header.generation, reader));
@@ -458,7 +463,6 @@ impl SplicedReader {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Option<()>>> {
-        // Try the queue first
         if let Some(ref mut rx) = self.queue_rx {
             match rx.poll_recv(cx) {
                 Poll::Ready(Some(reader)) => {
@@ -466,13 +470,7 @@ impl SplicedReader {
                     return Poll::Ready(Ok(Some(())));
                 }
                 Poll::Ready(None) => {
-                    // Queue closed
-                    if self.is_closed {
-                        return Poll::Ready(Ok(None)); // clean EOF
-                    }
-                    return Poll::Ready(Err(io::Error::from(
-                        MigrationError::BrokenPipe,
-                    )));
+                    return Poll::Ready(Ok(None)); // clean end of stream
                 }
                 Poll::Pending => {}
             }
@@ -528,6 +526,11 @@ impl AsyncRead for SplicedReader {
 /// Gen‑0 generations produce a [`SplicedReader`] sent back on `gen0_tx`;
 /// successor generations are dequeued from the registry and pushed into
 /// the matching [`SplicedReader`]'s queue.
+///
+/// When a FINAL-marker successor is dispatched, the matching
+/// queue sender is kept alive until the caller drops `cont_tx`
+/// (by dropping the [`MigratingCapableAccepter`] or the drain task).
+/// The queue close then signals clean end-of-stream.
 pub fn spawn_splice_driver(
     registry: SpliceRegistry,
     mut cont_rx: mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
@@ -663,11 +666,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Invariant: FINAL with payload = InvalidData
+    // Invariant: FINAL successor is accepted (sender contract: no payload)
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn final_with_payload_rejected() {
+    async fn final_successor_accepted() {
         let mut registry = SpliceRegistry::new();
         let (c, _s) = duplex(1);
 
@@ -679,7 +682,7 @@ mod tests {
         };
         let _gen0 = registry.dispatch(h0, c).unwrap();
 
-        // Now try a successor with is_final — should be rejected
+        // Successor with is_final — accepted (sender contract ensures no payload)
         let (c2, _s2) = duplex(1);
         let h1 = ResumeHeader {
             logical_id: 1,
@@ -687,7 +690,8 @@ mod tests {
             is_final: true,
         };
         let result = registry.dispatch(h1, c2);
-        assert!(matches!(result, Err(MigrationError::FinalWithPayload)));
+        assert!(result.is_ok(), "FINAL successor should be accepted");
+        assert!(result.unwrap().is_none(), "FINAL successor is not gen0");
     }
 
     // -------------------------------------------------------------------
@@ -887,11 +891,75 @@ mod tests {
         let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
 
-        // Second gen0 for this logical_id — currently accepted by
-        // the Occupied branch as a "successor" with generation 0
-        // (which bypasses the duplicate check since gen 0 isn't in
-        // the pending list). Verify it doesn't panic.
+        // Second gen0 for this logical_id is dropped silently.
         let (c0b, _) = duplex(1);
-        let _result = registry.dispatch(h0, c0b);
+        let result = registry.dispatch(h0, c0b);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "gen0 re-claim must be dropped");
+    }
+
+    // ---------------------------------------------------------------
+    // Invariant: MAX_ORPHANS (32) boundary rejects excess orphans
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn too_many_orphans_rejected() {
+        let mut registry = SpliceRegistry::new();
+
+        for i in 0..MAX_ORPHANS as u64 {
+            let (c, _) = duplex(1);
+            let h = ResumeHeader {
+                logical_id: 100 + i,
+                generation: 1,
+                is_final: false,
+            };
+            assert!(registry.dispatch(h, c).is_ok(), "orphan {i} should be accepted");
+        }
+
+        let (c_over, _) = duplex(1);
+        let h_over = ResumeHeader {
+            logical_id: 200,
+            generation: 1,
+            is_final: false,
+        };
+        let result = registry.dispatch(h_over, c_over);
+        assert!(matches!(result, Err(MigrationError::TooManyOrphans)));
+    }
+
+    // ---------------------------------------------------------------
+    // Invariant: orphan TTL reaping frees capacity after expiry
+    // ---------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn orphan_ttl_reaping_frees_capacity() {
+        let mut registry = SpliceRegistry::new();
+
+        // Fill with MAX_ORPHANS - 1
+        for i in 0..(MAX_ORPHANS - 1) as u64 {
+            let (c, _) = duplex(1);
+            let h = ResumeHeader {
+                logical_id: 200 + i,
+                generation: 1,
+                is_final: false,
+            };
+            assert!(registry.dispatch(h, c).is_ok());
+        }
+
+        // Advance past ORPHAN_TTL
+        tokio::time::advance(ORPHAN_TTL + Duration::from_millis(1)).await;
+
+        // Now we can add MAX_ORPHANS more (the old ones were reaped)
+        for i in 0..MAX_ORPHANS as u64 {
+            let (c, _) = duplex(1);
+            let h = ResumeHeader {
+                logical_id: 300 + i,
+                generation: 1,
+                is_final: false,
+            };
+            assert!(
+                registry.dispatch(h, c).is_ok(),
+                "after TTL expiry, orphan {i} should be accepted"
+            );
+        }
     }
 }
