@@ -1268,6 +1268,48 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Nonce mismatch rejection
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nonce_mismatch_rejected() {
+        let nonce_a = PairingNonce([0x01u8; PAIRING_NONCE_LEN]);
+        let nonce_b = PairingNonce([0x02u8; PAIRING_NONCE_LEN]);
+
+        let (c2s, s2c) = duplex(64);
+        let (int_r, mut int_w) = tokio::io::split(c2s);
+        let (bulk_r, mut bulk_w) = tokio::io::split(s2c);
+
+        write_lane_hello(&mut int_w, LaneClass::Interactive, nonce_a)
+            .await
+            .unwrap();
+        write_lane_hello(&mut bulk_w, LaneClass::Bulk, nonce_b)
+            .await
+            .unwrap();
+
+        let mut set = JoinSet::new();
+        let (_, _, pending_int) = spawn_dual_mux_acceptor(
+            int_r,
+            duplex(1).1,
+            srv_config(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let (_, _, pending_bulk) = spawn_dual_mux_acceptor(
+            bulk_r,
+            duplex(1).1,
+            srv_config(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let result = complete_pairing(pending_int, pending_bulk, &mut set);
+        assert!(matches!(result, Err(DualMuxError::NonceMismatch)));
+    }
+
+    // -------------------------------------------------------------------
     // failed-open on dead lane
     // -------------------------------------------------------------------
 
