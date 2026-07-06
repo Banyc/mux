@@ -498,6 +498,9 @@ impl MigratingCapableAccepter {
                 if let Some(header) = ResumeHeader::parse(&buf) {
                     Ok((true, Some(header), reader))
                 } else {
+                    // Not a resume header: restore the 21 consumed bytes
+                    // so the caller sees the full original byte stream.
+                    reader.prepend(&buf);
                     Ok((false, None, reader))
                 }
             }

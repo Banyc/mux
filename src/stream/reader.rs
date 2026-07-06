@@ -16,6 +16,10 @@ const CHANNEL_SIZE: usize = 1024;
 #[derive(Debug)]
 struct StreamReaderState {
     leftover: Option<(DataBuf, usize)>,
+    /// Bytes consumed by a peek (e.g. resume-header probe) that must be
+    /// yielded again before any channel data.  Read front-to-back.
+    prepend: Vec<u8>,
+    prepend_pos: usize,
     is_eof: bool,
     _close: StreamCloseTx,
 }
@@ -23,9 +27,23 @@ impl StreamReaderState {
     pub fn new(close: StreamCloseTx) -> Self {
         Self {
             leftover: None,
+            prepend: Vec::new(),
+            prepend_pos: 0,
             is_eof: false,
             _close: close,
         }
+    }
+    pub fn prepend(&mut self, bytes: &[u8]) {
+        // If there are already prepended bytes, splice the new ones in
+        // front of the unconsumed portion.
+        if self.prepend_pos < self.prepend.len() {
+            let mut combined = bytes.to_vec();
+            combined.extend_from_slice(&self.prepend[self.prepend_pos..]);
+            self.prepend = combined;
+        } else {
+            self.prepend = bytes.to_vec();
+        }
+        self.prepend_pos = 0;
     }
     pub fn poll_recv(
         &mut self,
@@ -35,6 +53,18 @@ impl StreamReaderState {
     ) -> Poll<Result<usize, DeadControl>> {
         if self.is_eof {
             return Ok(0).into();
+        }
+        // Drain prepend buffer first.
+        if self.prepend_pos < self.prepend.len() {
+            let src = &self.prepend[self.prepend_pos..];
+            let n = buf.len().min(src.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            self.prepend_pos += n;
+            if self.prepend_pos >= self.prepend.len() {
+                self.prepend.clear();
+                self.prepend_pos = 0;
+            }
+            return Ok(n).into();
         }
         let (data_buf, pos) = match self.leftover.take() {
             Some(x) => x,
@@ -70,6 +100,13 @@ impl StreamReader {
     pub(crate) fn new(data: StreamReadDataRx, close: StreamCloseTx) -> Self {
         let state = StreamReaderState::new(close);
         Self { data, state }
+    }
+    /// Push `bytes` back to the front of the reader so they are returned
+    /// before any subsequent channel data.  Used by peek-style probes
+    /// (e.g. resume-header detection) that consume bytes and need to
+    /// restore them for plain streams.
+    pub fn prepend(&mut self, bytes: &[u8]) {
+        self.state.prepend(bytes);
     }
 }
 impl AsyncRead for StreamReader {
