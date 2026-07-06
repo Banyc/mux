@@ -61,8 +61,16 @@ impl StreamClassifier {
         }
     }
 
+    /// Mirrors `LatencyControl::is_bulk` in `central_io::writer`:
+    /// `small_count * 3 < total * 2` with a minimum of 3 observations.
+    /// Equivalent to `small_count < 2 * bulk_count` when total ≥ 3.
     fn is_bulk(&self) -> bool {
-        self.bulk_count > self.small_count
+        let total = self.small_count + self.bulk_count;
+        const HISTORY_MIN: u32 = 3; // mirrors LATENCY_HISTORY_MIN in central_io::writer
+        if total < HISTORY_MIN {
+            return false;
+        }
+        self.small_count * 3 < total * 2
     }
 }
 
@@ -248,10 +256,46 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
+    /// Synchronous shutdown — closes the active writer (if any) without
+    /// sending a FINAL-marker generation. The peer will receive a broken
+    /// pipe rather than clean EOF. Prefer [`finalize`](Self::finalize) for
+    /// clean close.
     pub fn shutdown(&mut self) -> Result<(), MigratingError> {
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
+        self.state = WriterState::Closed;
+        Ok(())
+    }
+
+    /// Clean close: opens a new subs-stream for a FINAL-marker generation,
+    /// writes the FINAL resume header, and closes. The peer receives a
+    /// clean EOF (the [`SplicedReader`] sees `is_closed = true`). If no
+    /// data was ever written (still [`PendingOpen`](WriterState::PendingOpen)),
+    /// this is a no-op — the peer was never aware of the stream.
+    pub async fn finalize(&mut self) -> Result<(), MigratingError> {
+        match &self.state {
+            WriterState::PendingOpen { .. } | WriterState::Closed => {
+                self.state = WriterState::Closed;
+                return Ok(());
+            }
+            _ => {}
+        }
+        // Close the data-carrying generation first.
+        if let WriterState::Active { writer, .. } = &mut self.state {
+            let _ = writer.shutdown();
+        }
+        // Open a fresh subs-tream for the FINAL-only generation.
+        // Any lane works — the resume header is 21 bytes.
+        let (_, mut final_writer) = self
+            .opener
+            .open(LaneClass::Interactive)
+            .await
+            .map_err(|_| MigratingError::OpenFailed)?;
+        self.chain
+            .start_generation(&mut tokio_util_writer(&mut final_writer), true)
+            .await?;
+        let _ = final_writer.shutdown();
         self.state = WriterState::Closed;
         Ok(())
     }
@@ -331,6 +375,11 @@ impl DualStreamOpener {
 
 /// Wraps a [`DualStreamAccepter`] and transparently handles migrating
 /// streams while passing non-migrating streams through untouched.
+///
+/// When the accept loop receives a gen-0 [`SplicedReader`] whose
+/// `logical_id` does not match the incoming stream, the reader is
+/// stashed and re-tried on the next accept — this handles interleaved
+/// logical streams arriving out of order.
 pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
     /// Feeds all migrating generations (gen 0 and successors) into the
@@ -342,6 +391,8 @@ pub struct MigratingCapableAccepter {
     /// successor generations into the matching [`SplicedReader`] queues.
     #[allow(dead_code)]
     driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
+    /// Stash for gen-0 readers that arrive out of logical-id order.
+    stash: std::collections::VecDeque<(u64, SplicedReader)>,
 }
 
 impl MigratingCapableAccepter {
@@ -355,6 +406,7 @@ impl MigratingCapableAccepter {
             cont_tx,
             gen0_rx,
             driver,
+            stash: std::collections::VecDeque::new(),
         }
     }
 
@@ -362,10 +414,17 @@ impl MigratingCapableAccepter {
     /// ≥ 0), it is routed through the background splice driver; for
     /// generation 0, a new [`SplicedReader`] is returned once the driver
     /// creates it. Non-migrating streams pass through unchanged.
+    ///
+    /// Gen-0 readers arriving out of logical-id order are stashed in
+    /// a [`VecDeque`] and re-tried on subsequent accepts.
     pub async fn accept(
         &mut self,
     ) -> Result<AcceptedStream, MigratingError> {
+        // Check stash first for previously-mismatched gen-0 readers.
         loop {
+            // We need a full accept cycle (inner.accept → peek → maybe
+            // check stash). Drain the stash when there's no pending
+            // accept in progress.
             let (reader, writer, lane) = self.inner.accept()
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
@@ -384,8 +443,21 @@ impl MigratingCapableAccepter {
                         .map_err(|_| MigratingError::LaneDead)?;
 
                     if is_gen0 {
-                        // Wait for the driver to create the SplicedReader
+                        // Drain gen-0 rx, checking stash first.
                         loop {
+                            // Check stash.
+                            if let Some(pos) = self
+                                .stash
+                                .iter()
+                                .position(|(id, _)| *id == logical_id)
+                            {
+                                let (_, spliced) = self.stash.remove(pos).unwrap();
+                                return Ok(AcceptedStream::Migrating {
+                                    reader: spliced,
+                                    writer,
+                                    source_lane: lane,
+                                });
+                            }
                             match self.gen0_rx.recv().await {
                                 Some((id, spliced)) if id == logical_id => {
                                     return Ok(AcceptedStream::Migrating {
@@ -395,14 +467,7 @@ impl MigratingCapableAccepter {
                                     });
                                 }
                                 Some((other_id, spliced)) => {
-                                    // Different logical stream —
-                                    // store for later acceptance.
-                                    // In practice gen-0 streams
-                                    // arrive in send order on a
-                                    // reliable transport so this
-                                    // path is only hit under
-                                    // interleaved logical streams.
-                                    let _ = (other_id, spliced);
+                                    self.stash.push_back((other_id, spliced));
                                 }
                                 None => return Err(MigratingError::LaneDead),
                             }
@@ -448,6 +513,7 @@ impl MigratingCapableAccepter {
 // AcceptedStream
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub enum AcceptedStream {
     /// A migrating stream whose reader yields a continuous byte stream
     /// across generation boundaries.
@@ -500,8 +566,11 @@ mod tests {
         tokio::task::JoinSet<crate::serve::MuxError>,
         tokio::task::JoinSet<crate::serve::MuxError>,
     ) {
-        let (int_c2s, int_s2c) = duplex(32768);
-        let (bulk_c2s, bulk_s2c) = duplex(32768);
+        // Large duplex buffers so writes don't block when the receiver
+        // hasn't started accepting yet.
+        let buf_size = 4 * 1024 * 1024; // 4 MiB
+        let (int_c2s, int_s2c) = duplex(buf_size);
+        let (bulk_c2s, bulk_s2c) = duplex(buf_size);
 
         let (int_srv_r, int_srv_w) = tokio::io::split(int_c2s);
         let (int_cli_r, int_cli_w) = tokio::io::split(int_s2c);
@@ -671,5 +740,391 @@ mod tests {
             AcceptedStream::Plain { .. } => {} // expected
             _ => panic!("expected Plain stream"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Migrating stream: concurrent send + accept + read (no FINAL)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrating_stream_concurrent_basic() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating(42, LaneClass::Interactive);
+            writer.write_all(b"hello-world").await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        // Accept gen0
+        let accepted = mac.accept().await.unwrap();
+        let reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            other => panic!("expected Migrating, got: {other:?}"),
+        };
+
+        // Drop mac to close the splice-driver queue, unblocking SplicedReader
+        drop(mac);
+
+        send.await.unwrap();
+
+        // Read from SplicedReader — gets EOF after payload (no FINAL)
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut Box::pin(reader), &mut data)
+            .await
+            .unwrap();
+        assert_eq!(data, b"hello-world");
+    }
+
+    // -------------------------------------------------------------------
+    // Multi-MB integrity across many forced migrations
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_mb_integrity_across_many_forced_migrations() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let chunk_size = 10 * 1024;
+        let migrations = 100;
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating_manual(77, LaneClass::Interactive);
+            for i in 0..migrations {
+                let mut chunk = vec![0u8; chunk_size];
+                for (j, b) in chunk.iter_mut().enumerate() {
+                    *b = ((i as usize).wrapping_mul(chunk_size).wrapping_add(j)) as u8;
+                }
+                writer.write_all(&chunk).await.unwrap();
+                let target = if i % 2 == 0 { LaneClass::Bulk } else { LaneClass::Interactive };
+                writer.force_migrate(target).await.unwrap();
+            }
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating stream"),
+        };
+
+        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+        assert_eq!(data.len(), chunk_size * migrations, "byte count mismatch");
+
+        send.await.unwrap();
+        drain.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Migration during peer-stall
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_during_peer_stall() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let first = b"AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH";
+        let second = b"1111 2222 3333 4444 5555 6666 7777 8888";
+        let third = b"xxxx yyyy zzzz wwww vvvv uuuu tttt ssss";
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+            writer.write_all(first).await.unwrap();
+            writer.force_migrate(LaneClass::Bulk).await.unwrap();
+            writer.write_all(second).await.unwrap();
+            writer.force_migrate(LaneClass::Interactive).await.unwrap();
+            writer.write_all(third).await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating stream"),
+        };
+
+        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+        let expected: Vec<u8> = first.iter().chain(second).chain(third).copied().collect();
+        assert_eq!(data, expected, "data mismatch");
+
+        send.await.unwrap();
+        drain.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Close with finalize (FINAL-marker clean EOF)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_with_final_marker_gives_clean_eof() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        // Sender writes gen0 data then finalize (gen1 FINAL)
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating(42, LaneClass::Interactive);
+            writer.write_all(b"Hello, world!").await.unwrap();
+            writer.finalize().await.unwrap();
+        });
+
+        // Accept gen0 → SplicedReader with payload
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating"),
+        };
+
+        // Continuously drain successor generations so the FINAL gen
+        // reaches the SplicedReader's queue.
+        let drain = tokio::spawn(async move {
+            loop {
+                match mac.accept().await {
+                    Ok(_) => {} // successor routed internally
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // SplicedReader should read payload, then see FINAL and get clean EOF
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
+            .await
+            .unwrap();
+        assert_eq!(data, b"Hello, world!");
+
+        send.await.unwrap();
+        drain.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Close with finalize after migration
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_with_finalize_after_migration() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating(1, LaneClass::Interactive);
+            writer.write_all(b"Prologue ").await.unwrap();
+            writer.write_all(&[0u8; 3000]).await.unwrap();
+            writer.write_all(b" Epilogue.").await.unwrap();
+            writer.finalize().await.unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating stream"),
+        };
+
+        let drain = tokio::spawn(async move {
+            loop { let _ = mac.accept().await; }
+        });
+
+        let mut buf = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await.unwrap();
+        assert!(buf.starts_with("Prologue "), "got: {buf:?}");
+        assert!(buf.contains("Epilogue."), "got: {buf:?}");
+
+        send.await.unwrap();
+        drain.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Both-directions simultaneous migration
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simultaneous_bidirectional_migration() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let opener2 = opener.clone();
+        let send_a = tokio::spawn(async move {
+            let mut w = opener.open_migrating_manual(10, LaneClass::Interactive);
+            w.write_all(b"stream-A-chunk-1").await.unwrap();
+            w.force_migrate(LaneClass::Bulk).await.unwrap();
+            w.write_all(b"stream-A-chunk-2").await.unwrap();
+            w.shutdown().unwrap();
+        });
+
+        let opener3 = opener2.clone();
+        let send_b = tokio::spawn(async move {
+            let mut w = opener3.open_migrating_manual(20, LaneClass::Bulk);
+            w.write_all(b"stream-B-chunk-1").await.unwrap();
+            w.force_migrate(LaneClass::Interactive).await.unwrap();
+            w.write_all(b"stream-B-chunk-2").await.unwrap();
+            w.shutdown().unwrap();
+        });
+
+        // Accept first gen0
+        let a = mac.accept().await.unwrap();
+        let reader_a = match a {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating"),
+        };
+
+        // Accept second gen0
+        let b = mac.accept().await.unwrap();
+        let reader_b = match b {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating"),
+        };
+
+        // Drain successors while readers consume data
+        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+
+        let (ra, rb) = tokio::join!(
+            async {
+                let mut reader = reader_a;
+                let mut s = String::new();
+                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s).await.unwrap();
+                s
+            },
+            async {
+                let mut reader = reader_b;
+                let mut s = String::new();
+                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s).await.unwrap();
+                s
+            }
+        );
+
+        let mut results = vec![ra, rb];
+        results.sort();
+        assert_eq!(results, vec![
+            "stream-A-chunk-1stream-A-chunk-2".to_string(),
+            "stream-B-chunk-1stream-B-chunk-2".to_string(),
+        ]);
+
+        send_a.await.unwrap();
+        send_b.await.unwrap();
+        drain.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Gaming pattern: big sync phase then small deltas
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gaming_pattern_big_sync_then_small_deltas() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let sync_size = 3 * 1024 * 1024;
+        let deltas = 10;
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating(1, LaneClass::Interactive);
+            writer.write_all(&vec![0xABu8; sync_size]).await.unwrap();
+            for i in 0..deltas {
+                writer.write_all(format!("delta-{:02}-", i).as_bytes()).await.unwrap();
+            }
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating stream"),
+        };
+
+        drop(mac);
+
+        let mut data = Vec::with_capacity(sync_size + 200);
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+
+        assert_eq!(data.len(), sync_size + 9 * deltas, "total size mismatch");
+        for b in &data[..sync_size] {
+            assert_eq!(*b, 0xAB, "sync data corrupted");
+        }
+        let deltas_str = std::str::from_utf8(&data[sync_size..]).unwrap();
+        for i in 0..deltas {
+            assert!(deltas_str.contains(&format!("delta-{:02}-", i)), "missing delta {i}");
+        }
+
+        send.await.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Policy: demotion respects cooldown
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demotion_respects_cooldown() {
+        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut writer = opener.open_migrating(1, LaneClass::Bulk);
+        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        writer.write_all(&[0u8; 3000]).await.unwrap();
+        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        for _ in 0..4 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        writer.shutdown().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Policy: demotion after cooldown expires
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demotion_after_cooldown_expires() {
+        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut writer = opener.open_migrating(1, LaneClass::Bulk);
+        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        writer.write_all(&[0u8; 3000]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        writer.shutdown().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Finalize with no data written (PendingOpen) is a no-op
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finalize_no_data_no_panic() {
+        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+
+        let mut writer = opener.open_migrating(1, LaneClass::Interactive);
+        writer.finalize().await.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Force migrate from PendingOpen (before any writes)
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_migrate_from_pending_open() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let send = tokio::spawn(async move {
+            let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+            writer.force_migrate(LaneClass::Bulk).await.unwrap();
+            writer.write_all(b"data-on-bulk").await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating stream"),
+        };
+
+        drop(mac);
+
+        let mut data = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data).await.unwrap();
+        assert_eq!(data, "data-on-bulk");
+
+        send.await.unwrap();
     }
 }
