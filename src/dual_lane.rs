@@ -706,7 +706,11 @@ impl DualStreamAccepter {
 
 /// Pair two already-established mux sessions' openers/accepters into a
 /// dual-lane facade. The caller is responsible for ensuring the two sessions
-/// belong to the same logical peer (e.g. via the lane-hello protocol).
+/// belong to the same logical peer (e.g. via the lane-hello protocol) AND
+/// for wiring joint-liveness supervision — if either lane dies, the
+/// caller must kill the other lane and drop the [`Liveness`] guard so
+/// extant stream handles error promptly. For a supervised variant that
+/// wires this automatically, see [`spawn_dual_mux_paired_supervised`].
 pub fn spawn_dual_mux_paired(
     interactive_opener: StreamOpener,
     interactive_accepter: StreamAccepter,
@@ -724,6 +728,60 @@ pub fn spawn_dual_mux_paired(
         bulk_accepter,
         liveness,
     );
+    (opener, accepter)
+}
+
+/// Like [`spawn_dual_mux_paired`] but also wires a joint-liveness
+/// supervisor: the two lane spawners are folded into `supervisor`. When
+/// either lane's mux session finishes (or errors), the supervisor
+/// aborts the other lane and kills the shared [`Liveness`] guard so
+/// every extant stream handle on the surviving lane errors (rather
+/// than hanging) — the two lanes are one session.
+///
+/// The lane sessions already enforce a receive deadline derived from
+/// the heartbeat interval (`RECEIVE_DEADLINE_INTERVALS` in
+/// `central_io::reader`), so a dead peer is detected on quiet lanes
+/// too — the supervisor propagates that detection across the pair.
+pub fn spawn_dual_mux_paired_supervised(
+    interactive_opener: StreamOpener,
+    interactive_accepter: StreamAccepter,
+    interactive_spawner: JoinSet<MuxError>,
+    bulk_opener: StreamOpener,
+    bulk_accepter: StreamAccepter,
+    bulk_spawner: JoinSet<MuxError>,
+    supervisor: &mut JoinSet<MuxError>,
+) -> (DualStreamOpener, DualStreamAccepter) {
+    let liveness = Liveness::new();
+    let alive = liveness.alive.clone();
+
+    let mut int_s = interactive_spawner;
+    let mut bulk_s = bulk_spawner;
+
+    supervisor.spawn(async move {
+        let (died, err) = tokio::select! {
+            res = int_s.join_next() => {
+                bulk_s.abort_all();
+                alive.store(false, Ordering::SeqCst);
+                ("interactive", match res {
+                    Some(Ok(err)) => err,
+                    _ => MuxError::TaskStopped { task: "interactive_lane" },
+                })
+            }
+            res = bulk_s.join_next() => {
+                int_s.abort_all();
+                alive.store(false, Ordering::SeqCst);
+                ("bulk", match res {
+                    Some(Ok(err)) => err,
+                    _ => MuxError::TaskStopped { task: "bulk_lane" },
+                })
+            }
+        };
+        let _ = died;
+        err
+    });
+
+    let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
+    let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
     (opener, accepter)
 }
 
@@ -1326,5 +1384,76 @@ mod tests {
         let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
         let result = opener.open(LaneClass::Interactive).await;
         assert!(matches!(result, Err(DualStreamOpenError::LaneDead)));
+    }
+
+    // -------------------------------------------------------------------
+    // Joint liveness via spawn_dual_mux_paired_supervised: killing one
+    // lane's spawner kills the shared Liveness, so opens on the
+    // surviving lane fail (rather than hanging).
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_supervised_kills_pair_on_lane_death() {
+        // Build two lanes with their spawners accessible so we can kill
+        // one lane and observe the supervisor propagate the death.
+        let (int_c2s, int_s2c) = duplex(32768);
+        let (bulk_c2s, bulk_s2c) = duplex(32768);
+        let (int_srv_r, int_srv_w) = tokio::io::split(int_c2s);
+        let (int_cli_r, int_cli_w) = tokio::io::split(int_s2c);
+        let (bulk_srv_r, bulk_srv_w) = tokio::io::split(bulk_c2s);
+        let (bulk_cli_r, bulk_cli_w) = tokio::io::split(bulk_s2c);
+
+        let srv_cfg = MuxConfig {
+            initiation: Initiation::Server,
+            heartbeat_interval: Duration::from_secs(1),
+        };
+        let cli_cfg = MuxConfig {
+            initiation: Initiation::Client,
+            heartbeat_interval: Duration::from_secs(1),
+        };
+        let mut int_spawner = JoinSet::new();
+        let (int_op, _int_srv_acc) =
+            spawn_mux_no_reconnection(int_srv_r, int_srv_w, srv_cfg.clone(), &mut int_spawner);
+        let mut bulk_spawner = JoinSet::new();
+        let (bulk_op, _bulk_srv_acc) =
+            spawn_mux_no_reconnection(bulk_srv_r, bulk_srv_w, srv_cfg, &mut bulk_spawner);
+
+        let mut cli_int = JoinSet::new();
+        let (_, int_cli_acc) =
+            spawn_mux_no_reconnection(int_cli_r, int_cli_w, cli_cfg.clone(), &mut cli_int);
+        let mut cli_bulk = JoinSet::new();
+        let (_, bulk_cli_acc) =
+            spawn_mux_no_reconnection(bulk_cli_r, bulk_cli_w, cli_cfg, &mut cli_bulk);
+
+        let mut supervisor = JoinSet::new();
+        let (opener, _accepter) = spawn_dual_mux_paired_supervised(
+            int_op,
+            int_cli_acc,
+            int_spawner,
+            bulk_op,
+            bulk_cli_acc,
+            bulk_spawner,
+            &mut supervisor,
+        );
+
+        // Drop the client-side lanes so the server-side detects a dead
+        // peer via the receive deadline (heartbeat=1s, ~4x deadline).
+        drop(cli_int);
+        drop(cli_bulk);
+
+        // Wait long enough for the receive deadline to fire on both lanes.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        // Opens on either lane must now fail (LaneDead), not hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            opener.open(LaneClass::Bulk),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(DualStreamOpenError::LaneDead))),
+            "surviving lane must report LaneDead after pair death, got {result:?}"
+        );
+        let _ = supervisor;
     }
 }

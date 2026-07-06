@@ -347,14 +347,23 @@ impl DualMessageReceiver {
 
     fn insert_ordered(&mut self, msg: Message) {
         let seq = msg.seq.unwrap_or(0);
+        // Drop stale seqs already below the cursor (a stale message
+        // inserted behind the cursor can never match the normal pop
+        // path and is withheld indefinitely).
         if seq < self.next_seq {
             return;
         }
         self.ordered.insert(seq, msg);
+        // Force-advance past a permanent gap when the buffer exceeds the
+        // cap: jump next_seq to the lowest buffered seq so pop_ordered
+        // delivers it next. Do NOT discard the buffered message — that
+        // would silently drop data.
         while self.ordered.len() > self.reorder_cap {
             let (&first_seq, _) = self.ordered.first_key_value().unwrap();
             self.next_seq = first_seq;
-            self.ordered.remove(&first_seq);
+            // The gap below first_seq is permanent; advance past it but
+            // keep first_seq in the buffer for pop_ordered to deliver.
+            break;
         }
     }
 
@@ -367,9 +376,13 @@ impl DualMessageReceiver {
                 return Some(msg.payload);
             }
             if seq < self.next_seq {
+                // Stale entry below the cursor — drop and continue.
                 self.ordered.remove(&seq);
                 continue;
             }
+            // seq > next_seq: there is a gap. If the buffer is at/over
+            // the cap, force-advance past the gap by jumping next_seq to
+            // seq and delivering it.
             if self.ordered.len() >= self.reorder_cap {
                 let msg = self.ordered.remove(&seq).unwrap();
                 self.next_seq = seq + 1;
@@ -585,15 +598,22 @@ mod tests {
     // Sender semaphore backpressure
     // -------------------------------------------------------------------
 
-    /// The semaphore bounds in-flight sends. With a tiny transport
-    /// buffer and concurrent sends, the semaphore limits how many
-    /// sends are truly in-flight at once.
+    /// The semaphore bounds in-flight sends. With a tiny transport buffer
+    /// and concurrent sends, the semaphore limits how many sends are
+    /// truly in-flight at once.
+    ///
+    /// The transport end is an UNREAD duplex half (NOT a live mux peer):
+    /// a live mux peer's central reader drains the wire (heartbeats /
+    /// control) even before `accept()`, silently absorbing megabytes and
+    /// defeating the backpressure assertion. An unread duplex half has no
+    /// draining task, so once its kernel buffer fills, writes block.
     #[tokio::test(flavor = "multi_thread")]
     async fn semaphore_backpressure_limits_inflight() {
         use std::sync::atomic::AtomicUsize;
         use tokio::sync::Barrier;
 
         // Tiny duplex — fills fast, so writes don't complete instantly.
+        // Nobody reads the other end, so once full, writes block.
         let (_cli_r, srv_w) = duplex(128);
         let (srv_r, _cli_w) = duplex(128);
 
@@ -605,11 +625,14 @@ mod tests {
             &mut srv_spawner,
         );
 
-        let (bulk_r, _bulk_cli_w) = duplex(128);
-        let (_bulk_cli_r, bulk_w) = duplex(128);
+        // Bulk lane: an unread duplex half with NO mux peer spawned on
+        // the reader side. The opener is fed by a mux session whose
+        // transport is a fresh duplex with no peer draining it.
+        let (bulk_srv_r, bulk_srv_w) = duplex(128);
+        let (_bulk_peer_r, _bulk_peer_w) = duplex(128); // dropped — nobody reads
         let mut bulk_spawner = JoinSet::new();
         let (bulk_opener, _) =
-            spawn_mux_no_reconnection(bulk_r, bulk_w, config(), &mut bulk_spawner);
+            spawn_mux_no_reconnection(bulk_srv_r, bulk_srv_w, config(), &mut bulk_spawner);
         tokio::task::spawn(async move { let _ = bulk_spawner.join_next().await; });
 
         let opener = DualStreamOpener::new(srv_opener, bulk_opener, Liveness::new());
@@ -698,5 +721,48 @@ mod tests {
         // force-advance yields seq 2 next (not seq 1).
         let next = rx.recv().await.unwrap().unwrap();
         assert_eq!(next.len(), 50);
+    }
+
+    // -------------------------------------------------------------------
+    // Ordered: force-advance does NOT drop buffered messages.
+    // Regression: the old insert_ordered discarded the lowest seq on
+    // force-advance, silently losing data. This test sends 257 distinct
+    // payloads and asserts ALL of them are delivered (except the
+    // permanently-missing seq 1).
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_force_advance_keeps_all_buffered_messages() {
+        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+        let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
+
+        // Send seq 0, skip seq 1, send seq 2..=257 with DISTINCT payloads.
+        tx.send(b"seq0").await.unwrap();
+        for i in 2..=257u16 {
+            let payload = format!("msg-{i}");
+            tx.send(payload.as_bytes()).await.unwrap();
+        }
+
+        // seq 0
+        assert_eq!(rx.recv().await.unwrap().unwrap(), b"seq0");
+
+        // Collect the rest. Every seq 2..=257 must be delivered exactly
+        // once — none dropped, none duplicated.
+        let mut delivered = Vec::new();
+        for _ in 0..256 {
+            delivered.push(rx.recv().await.unwrap().unwrap());
+        }
+
+        // Decode and assert every expected message appears exactly once.
+        let mut expected: Vec<String> = (2..=257).map(|i| format!("msg-{i}")).collect();
+        let mut got: Vec<String> = delivered
+            .iter()
+            .map(|b| String::from_utf8(b.clone()).unwrap())
+            .collect();
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected, "force-advance must not drop buffered messages");
     }
 }
