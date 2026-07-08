@@ -256,14 +256,45 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    /// Synchronous shutdown — closes the active writer (if any) without
-    /// sending a FINAL-marker generation. The peer will receive a broken
-    /// pipe rather than clean EOF. Prefer [`finalize`](Self::finalize) for
-    /// clean close.
+    /// Graceful shutdown — closes the active writer (if any) and emits a
+    /// FINAL-marker generation so the peer receives a clean EOF. The
+    /// FINAL generation is written by a detached background task (the
+    /// [`GenerationChain`] and an owned [`DualStreamOpener`] clone move
+    /// into it), so this method stays synchronous. If no data was ever
+    /// written (still [`PendingOpen`](WriterState::PendingOpen)), this is
+    /// a no-op — the peer was never aware of the stream, so no FINAL is
+    /// needed.
     pub fn shutdown(&mut self) -> Result<(), MigratingError> {
+        match self.state {
+            WriterState::PendingOpen { .. } | WriterState::Closed => {
+                self.state = WriterState::Closed;
+                return Ok(());
+            }
+            _ => {}
+        }
+        // Close the data-carrying generation first.
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
+        // Move the chain + a clone of the opener into a detached task
+        // that opens a fresh substream, writes the FINAL resume header,
+        // and closes — giving the peer a positive end-of-stream signal.
+        let opener = self.opener.clone();
+        let mut chain = std::mem::replace(
+            &mut self.chain,
+            GenerationChain::new(0),
+        );
+        tokio::spawn(async move {
+            if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
+                let _ = chain
+                    .start_generation(
+                        &mut tokio_util_writer(&mut final_writer),
+                        true,
+                    )
+                    .await;
+                let _ = final_writer.shutdown();
+            }
+        });
         self.state = WriterState::Closed;
         Ok(())
     }

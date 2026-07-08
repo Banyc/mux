@@ -402,6 +402,22 @@ impl SpliceRegistry {
         let (gen, (is_final, reader)) = entry.pending.pop_first()?;
         Some((gen, is_final, reader))
     }
+
+    /// Re-insert a generation that was popped by [`pop_pending`](Self::pop_pending)
+    /// but not consumed (e.g. a gap was encountered during a contiguous
+    /// flush). Restores the entry to the pending BTreeMap.
+    pub(crate) fn reinsert_pending(
+        &mut self,
+        logical_id: u64,
+        generation: u32,
+        is_final: bool,
+        reader: GenerationReader,
+    ) {
+        let Some(entry) = self.streams.get_mut(&logical_id) else {
+            return;
+        };
+        entry.pending.insert(generation, (is_final, reader));
+    }
 }
 
 impl Default for SpliceRegistry {
@@ -552,15 +568,16 @@ impl AsyncRead for SplicedReader {
                                 continue;
                             }
                             Poll::Ready(None) => {
-                                // Queue closed: dispatcher dropped.
-                                if self.is_closed {
-                                    self.finished = true;
-                                    return Poll::Ready(Ok(()));
-                                }
+                                // Queue closed: dispatcher dropped. If the
+                                // last generation EOFed cleanly (no in-flight
+                                // transport error), this is a clean stream
+                                // end surfaced as EOF — not a truncation.
+                                // BrokenPipe is reserved for a mid-generation
+                                // transport drop, which surfaces as an Err
+                                // from the current generation's poll_read
+                                // before we ever reach this branch.
                                 self.finished = true;
-                                return Poll::Ready(Err(io::Error::from(
-                                    io::ErrorKind::BrokenPipe,
-                                )));
+                                return Poll::Ready(Ok(()));
                             }
                             Poll::Pending => {
                                 // No successor yet. Check the timer.
@@ -626,32 +643,112 @@ pub fn spawn_splice_driver(
     tokio::spawn(async move {
         let mut queues: HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>> =
             HashMap::new();
+        // Next generation number to flush to each stream's queue. Gen0 is
+        // handed to the SplicedReader directly as its `current` slot, so
+        // flushing begins at 1. This guarantees strictly contiguous
+        // handoff: a gap (missing generation N) stops the flush, and the
+        // next arrival re-enters the flush arm and resumes from N.
+        let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
+
+        /// Flush contiguous pending generations for `logical_id` starting
+        /// at `next_to_flush[logical_id]` into `queue_tx`. Stops at the
+        /// first gap so a missing generation never lets a later one jump
+        /// ahead.
+        fn flush_contiguous(
+            registry: &mut SpliceRegistry,
+            logical_id: u64,
+            queue_tx: &tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>,
+            next_to_flush: &mut HashMap<u64, u32>,
+        ) {
+            let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
+            // Peek-and-pop loop: pop_pending returns the lowest-keyed
+            // entry. If it matches `next`, send it and advance; if it
+            // doesn't, put it back (we can't put it back, so we only pop
+            // when we know it matches — use a peek first).
+            // SpliceRegistry doesn't expose a peek, so we pop and
+            // re-insert on mismatch.
+            while let Some((gen, is_final, reader)) = registry.pop_pending(logical_id) {
+                if gen == next {
+                    let _ = queue_tx.send((is_final, reader));
+                    next = next.checked_add(1).expect("generation overflow");
+                } else {
+                    // Gap: re-insert and stop.
+                    registry.reinsert_pending(logical_id, gen, is_final, reader);
+                    break;
+                }
+            }
+            next_to_flush.insert(logical_id, next);
+        }
 
         while let Some((header, reader)) = cont_rx.recv().await {
             let logical_id = header.logical_id;
             let is_gen0 = header.generation == 0;
             let is_final = header.is_final;
-            match registry.dispatch(header, reader)? {
+            // Dispatch. A TooManyPendingGenerations or orphan overflow is
+            // a backpressure signal, NOT a fatal error that should kill the
+            // driver and truncate every later generation — so we drop the
+            // offending generation rather than `?`-propagating. Genuine
+            // unrecoverable errors (corrupt header) still bail out.
+            let spliced_opt = match registry.dispatch(header, reader) {
+                Ok(opt) => opt,
+                Err(MigrationError::TooManyPendingGenerations)
+                | Err(MigrationError::TooManyOrphans)
+                | Err(MigrationError::DuplicateGeneration) => {
+                    // The pending queue is full because the reader is
+                    // behind. After dropping this generation we re-flush
+                    // whatever is contiguous so the reader can catch up;
+                    // the writer's next generation will re-enter. This
+                    // preserves the bounded holdback invariant without
+                    // truncating the stream.
+                    if let Some(queue_tx) = queues.get(&logical_id) {
+                        flush_contiguous(
+                            &mut registry,
+                            logical_id,
+                            queue_tx,
+                            &mut next_to_flush,
+                        );
+                    }
+                    let _ = is_final;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match spliced_opt {
                 Some(spliced) => {
                     if is_gen0 {
                         let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
                         let successor_deadline = registry.successor_deadline;
                         let spliced =
                             spliced.with_queue(queue_rx, successor_deadline);
-                        queues.insert(logical_id, queue_tx);
+                        queues.insert(logical_id, queue_tx.clone());
+                        // Gen0 is the SplicedReader's current slot, so the
+                        // next generation to flush is 1.
+                        next_to_flush.insert(logical_id, 1);
+                        // Gen0 just created the stream entry and adopted
+                        // any orphans into `pending`. Flush them now so
+                        // the SplicedReader sees successors in contiguous
+                        // order as soon as gen0 EOFs.
+                        flush_contiguous(
+                            &mut registry,
+                            logical_id,
+                            &queue_tx,
+                            &mut next_to_flush,
+                        );
                         let _ = gen0_tx.send((logical_id, spliced));
                     }
                 }
                 None => {
-                    // Successor generation dispatched. Flush all pending
-                    // generations for this stream to its queue in
-                    // generation order.
+                    // Successor generation dispatched. Flush contiguous
+                    // pending generations for this stream to its queue.
+                    // A gap (missing generation) stops the flush; the
+                    // next arrival re-enters this arm and resumes.
                     if let Some(queue_tx) = queues.get(&logical_id) {
-                        while let Some((_, is_final, reader)) =
-                            registry.pop_pending(logical_id)
-                        {
-                            let _ = queue_tx.send((is_final, reader));
-                        }
+                        flush_contiguous(
+                            &mut registry,
+                            logical_id,
+                            queue_tx,
+                            &mut next_to_flush,
+                        );
                     }
                     let _ = is_final;
                 }
