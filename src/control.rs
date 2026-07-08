@@ -1035,7 +1035,7 @@ mod reassembly_tests {
         // Simulate the writer splitting a 200_000-byte write into
         // multiple Data frames at BodyLen::MAX (65535) boundaries.
         let total = 200_000u32;
-        let payload: Vec<u8> = (0u8..).cycle().take(total as usize).collect();
+        let payload: Vec<u8> = (0u8..=u8::MAX).cycle().take(total as usize).collect();
         let mut offset = 0u32;
         while offset < total {
             let len = (total - offset).min(u16::MAX as u32) as usize;
