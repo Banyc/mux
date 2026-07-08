@@ -614,10 +614,12 @@ mod tests {
         let srv_cfg = MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         };
         let cli_cfg = MuxConfig {
             initiation: Initiation::Client,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         };
 
         let mut srv_int = tokio::task::JoinSet::new();

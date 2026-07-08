@@ -161,6 +161,12 @@ impl StreamReadDataRx {
     ) -> Poll<Result<StreamReadDataMsg, DeadControl>> {
         ready!(self.rx.poll_recv(cx)).ok_or(DeadControl {}).into()
     }
+    /// Non-blocking receive: returns `Ok(msg)` if one is ready, `Err` if
+    /// the channel is empty or closed. Used by reassembly tests.
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Result<StreamReadDataMsg, ()> {
+        self.rx.try_recv().map_err(|_| ())
+    }
     // pub async fn recv(&mut self) -> Result<StreamReadDataMsg, DeadControl> {
     //     self.rx.recv().await.ok_or(DeadControl {})
     // }

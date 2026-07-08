@@ -6,7 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use crate::{
     common::Side,
     control::DeadControl,
-    protocol::{DataHeader, Header, StreamId, StreamIdMsg},
+    protocol::{
+        CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId, StreamIdMsg,
+    },
 };
 
 use super::{DataBuf, DeadCentralIo};
@@ -61,15 +63,19 @@ pub struct CentralIoReader<R> {
     /// so no buffered byte can be stranded or lost.
     io_reader: BufReader<R>,
     buf_pool: ArcObjPool<Vec<u8>>,
+    /// When true, Data frames carry a per-stream u32 offset and CloseWrite
+    /// carries a final offset, parsed via `DataHeaderExt` / `CloseWriteExtMsg`.
+    frame_reassembly: bool,
 }
 impl<R> CentralIoReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub fn new(io_reader: R) -> Self {
+    pub fn new(io_reader: R, frame_reassembly: bool) -> Self {
         Self {
             io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, io_reader),
             buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
+            frame_reassembly,
         }
     }
 }
@@ -104,37 +110,68 @@ where
             Header::Heartbeat => None,
             Header::Open => Some(CentralIoReadMsg::Open(self.recv_stream_id().await?)),
             Header::Data => {
-                let (stream, pkt) = self.recv_data().await?;
-                Some(CentralIoReadMsg::Data(stream, pkt))
+                let (stream, offset, pkt) = self.recv_data().await?;
+                Some(CentralIoReadMsg::Data(stream, offset, pkt))
             }
             Header::CloseRead => Some(CentralIoReadMsg::Close(
                 self.recv_stream_id().await?,
                 Side::Read,
+                0,
             )),
-            Header::CloseWrite => Some(CentralIoReadMsg::Close(
-                self.recv_stream_id().await?,
-                Side::Write,
-            )),
+            Header::CloseWrite => {
+                let (stream, final_offset) = self.recv_close_write().await?;
+                Some(CentralIoReadMsg::Close(stream, Side::Write, final_offset))
+            }
         })
     }
-    async fn recv_data(&mut self) -> io::Result<(StreamId, DataBuf)> {
-        let mut hdr = [0; DataHeader::SIZE];
-        self.io_reader.read_exact(&mut hdr).await?;
-        let hdr = DataHeader::decode(hdr);
-        let mut remaining = usize::from(hdr.body_len);
-        let mut buf = self.buf_pool.take_scoped();
-        buf.reserve(remaining);
-        while remaining != 0 {
-            let chunk = self.io_reader.fill_buf().await?;
-            if chunk.is_empty() {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+    async fn recv_data(&mut self) -> io::Result<(StreamId, Offset, DataBuf)> {
+        if self.frame_reassembly {
+            let mut hdr = [0; DataHeaderExt::SIZE];
+            self.io_reader.read_exact(&mut hdr).await?;
+            let hdr = DataHeaderExt::decode(hdr);
+            let mut remaining = usize::from(hdr.body_len);
+            let mut buf = self.buf_pool.take_scoped();
+            buf.reserve(remaining);
+            while remaining != 0 {
+                let chunk = self.io_reader.fill_buf().await?;
+                if chunk.is_empty() {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                let n = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..n]);
+                self.io_reader.consume(n);
+                remaining -= n;
             }
-            let n = chunk.len().min(remaining);
-            buf.extend_from_slice(&chunk[..n]);
-            self.io_reader.consume(n);
-            remaining -= n;
+            Ok((hdr.stream_id, hdr.offset, buf))
+        } else {
+            let mut hdr = [0; DataHeader::SIZE];
+            self.io_reader.read_exact(&mut hdr).await?;
+            let hdr = DataHeader::decode(hdr);
+            let mut remaining = usize::from(hdr.body_len);
+            let mut buf = self.buf_pool.take_scoped();
+            buf.reserve(remaining);
+            while remaining != 0 {
+                let chunk = self.io_reader.fill_buf().await?;
+                if chunk.is_empty() {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                let n = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..n]);
+                self.io_reader.consume(n);
+                remaining -= n;
+            }
+            Ok((hdr.stream_id, 0, buf))
         }
-        Ok((hdr.stream_id, buf))
+    }
+    async fn recv_close_write(&mut self) -> io::Result<(StreamId, Offset)> {
+        if self.frame_reassembly {
+            let mut buf = [0; CloseWriteExtMsg::SIZE];
+            self.io_reader.read_exact(&mut buf).await?;
+            let msg = CloseWriteExtMsg::decode(buf);
+            Ok((msg.stream_id, msg.final_offset))
+        } else {
+            Ok((self.recv_stream_id().await?, 0))
+        }
     }
     async fn recv_stream_id(&mut self) -> io::Result<StreamId> {
         let mut hdr = [0; StreamIdMsg::SIZE];
@@ -147,8 +184,13 @@ where
 #[derive(Debug)]
 pub enum CentralIoReadMsg {
     Open(StreamId),
-    Data(StreamId, DataBuf),
-    Close(StreamId, Side),
+    /// `(stream_id, byte_offset, body)`. In mode-off the offset is always 0
+    /// and is ignored by the control loop; in mode-on it is the per-stream
+    /// byte offset of the first byte in `body`.
+    Data(StreamId, Offset, DataBuf),
+    /// `(stream_id, side, final_offset)`. `final_offset` is meaningful only
+    /// for `Side::Write` in mode-on; in mode-off (or `Side::Read`) it is 0.
+    Close(StreamId, Side, Offset),
 }
 pub fn central_io_read_channel() -> (CentralIoReadTx, CentralIoReadRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);

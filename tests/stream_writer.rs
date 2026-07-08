@@ -31,6 +31,7 @@ fn spawn_mux_pair() -> (
         MuxConfig {
             initiation: Initiation::Client,
             heartbeat_interval: Duration::from_secs(60),
+            frame_reassembly: false,
         },
         &mut spawner,
     );
@@ -40,6 +41,7 @@ fn spawn_mux_pair() -> (
         MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(60),
+            frame_reassembly: false,
         },
         &mut spawner,
     );

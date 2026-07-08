@@ -90,12 +90,14 @@ mod benches {
             let config = MuxConfig {
                 initiation: Initiation::Server,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             };
             let (opener, _) = spawn_mux_no_reconnection(a_r, a_w, config, spawner);
             let (b_r, b_w) = b.into_split();
             let config = MuxConfig {
                 initiation: Initiation::Client,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             };
             let (_, mut accepter) = spawn_mux_no_reconnection(b_r, b_w, config, spawner);
             let a = opener.open().await.unwrap();

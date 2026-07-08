@@ -17,7 +17,10 @@ use crate::{
     common::Side,
     control::DeadControl,
     fair_queue,
-    protocol::{BodyLen, DataHeader, Header, StreamId, StreamIdMsg},
+    protocol::{
+        BodyLen, CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId,
+        StreamIdMsg,
+    },
 };
 
 use super::{DataBuf, DeadCentralIo};
@@ -198,14 +201,26 @@ pub struct CentralIoWriter<W> {
     io_writer: W,
     /// Reused staging buffer for coalescing a non-vectored Data frame's fixed
     /// header and body into a single transport write. Grows to at most
-    /// `Header::SIZE + DataHeader::SIZE + usize::from(BodyLen::MAX)`.
+    /// `Header::SIZE + DataHeaderExt::SIZE + usize::from(BodyLen::MAX)`.
     frame_buf: Vec<u8>,
+    /// When true, Data frames carry a per-stream u32 byte offset and
+    /// CloseWrite carries a final offset, emitted via `DataHeaderExt` /
+    /// `CloseWriteExtMsg`. When false, the stock headers are used and the
+    /// wire is byte-identical to the pre-reassembly protocol.
+    frame_reassembly: bool,
+    /// Next byte offset to emit for each stream, tracked as a u64 and
+    /// emitted as `Offset` (u32) per frame — wrap-safe because the reader
+    /// uses TCP-style serial-number comparison. Only used when
+    /// `frame_reassembly` is true.
+    next_offset: HashMap<StreamId, u64>,
 }
 impl<W> CentralIoWriter<W> {
-    pub fn new(io_writer: W) -> Self {
+    pub fn new(io_writer: W, frame_reassembly: bool) -> Self {
         Self {
             io_writer,
             frame_buf: Vec::new(),
+            frame_reassembly,
+            next_offset: HashMap::new(),
         }
     }
 }
@@ -220,17 +235,38 @@ where
         Ok(())
     }
     pub async fn send_control(&mut self, msg: WriteControlMsg) -> io::Result<()> {
-        let hdr = match &msg {
-            WriteControlMsg::Open(_) => Header::Open,
-            WriteControlMsg::Close(_, side) => match side {
-                Side::Read => Header::CloseRead,
-                Side::Write => Header::CloseWrite,
+        match msg {
+            WriteControlMsg::Open(stream_id) => self.send_control_(Header::Open, stream_id).await,
+            WriteControlMsg::Close(stream_id, side) => match side {
+                Side::Read => self.send_control_(Header::CloseRead, stream_id).await,
+                Side::Write => {
+                    if self.frame_reassembly {
+                        let final_offset = self.next_offset.remove(&stream_id).unwrap_or(0);
+                        self.send_close_write_ext(stream_id, final_offset as Offset).await
+                    } else {
+                        self.send_control_(Header::CloseWrite, stream_id).await
+                    }
+                }
             },
+        }
+    }
+    async fn send_close_write_ext(
+        &mut self,
+        stream_id: StreamId,
+        final_offset: Offset,
+    ) -> io::Result<()> {
+        let hdr = Header::CloseWrite;
+        let payload = CloseWriteExtMsg {
+            stream_id,
+            final_offset,
         };
-        let stream_id = match msg {
-            WriteControlMsg::Open(stream_id) | WriteControlMsg::Close(stream_id, _) => stream_id,
-        };
-        self.send_control_(hdr, stream_id).await
+        let hdr = hdr.encode();
+        let payload = payload.encode();
+        let mut concat = hdr.into_iter().chain(payload);
+        let buf: [u8; Header::SIZE + CloseWriteExtMsg::SIZE] =
+            core::array::from_fn(|_| concat.next().unwrap());
+        self.io_writer.write_all(&buf).await?;
+        Ok(())
     }
     async fn send_control_(&mut self, hdr: Header, stream_id: u32) -> io::Result<()> {
         let stream_id_msg = StreamIdMsg { stream_id };
@@ -246,6 +282,12 @@ where
         let data_buf = match msg.data {
             StreamWriteData::Open => return Ok(()),
             StreamWriteData::Fin => {
+                if self.frame_reassembly {
+                    let final_offset = self.next_offset.remove(&msg.stream_id).unwrap_or(0);
+                    return self
+                        .send_close_write_ext(msg.stream_id, final_offset as Offset)
+                        .await;
+                }
                 let hdr = Header::CloseWrite;
                 return self.send_control_(hdr, msg.stream_id).await;
             }
@@ -256,15 +298,34 @@ where
         while body_offset != data_buf.len() {
             let body_len = (data_buf.len() - body_offset).min(usize::from(BodyLen::MAX));
             let body_len_u16 = BodyLen::try_from(body_len).unwrap();
-            let data_hdr = DataHeader {
-                stream_id: msg.stream_id,
-                body_len: body_len_u16,
-            };
-            let hdr = hdr.encode();
-            let data_hdr = data_hdr.encode();
-            let mut concat = hdr.into_iter().chain(data_hdr);
-            let fixed_buf: [u8; Header::SIZE + DataHeader::SIZE] =
-                core::array::from_fn(|_| concat.next().unwrap());
+            let fixed_buf: Vec<u8>;
+            if self.frame_reassembly {
+                let cur_offset_64 = *self.next_offset.get(&msg.stream_id).unwrap_or(&0);
+                let data_hdr = DataHeaderExt {
+                    stream_id: msg.stream_id,
+                    body_len: body_len_u16,
+                    offset: cur_offset_64 as Offset,
+                };
+                let hdr_bytes = hdr.encode();
+                let data_hdr_bytes = data_hdr.encode();
+                let mut concat = hdr_bytes.into_iter().chain(data_hdr_bytes);
+                let buf: [u8; Header::SIZE + DataHeaderExt::SIZE] =
+                    core::array::from_fn(|_| concat.next().unwrap());
+                fixed_buf = buf.to_vec();
+                self.next_offset
+                    .insert(msg.stream_id, cur_offset_64 + body_len as u64);
+            } else {
+                let data_hdr = DataHeader {
+                    stream_id: msg.stream_id,
+                    body_len: body_len_u16,
+                };
+                let hdr_bytes = hdr.encode();
+                let data_hdr_bytes = data_hdr.encode();
+                let mut concat = hdr_bytes.into_iter().chain(data_hdr_bytes);
+                let buf: [u8; Header::SIZE + DataHeader::SIZE] =
+                    core::array::from_fn(|_| concat.next().unwrap());
+                fixed_buf = buf.to_vec();
+            }
             let body = &data_buf[body_offset..body_offset + body_len];
             body_offset += body_len;
             self.write_all_frame(&fixed_buf, body).await?;
@@ -738,7 +799,7 @@ mod tests {
             vectored: true,
             write_vectored_calls: Arc::clone(&calls),
         };
-        let mut central = CentralIoWriter::new(writer);
+        let mut central = CentralIoWriter::new(writer, false);
         let body = (0u8..200u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -760,7 +821,7 @@ mod tests {
             vectored: false,
             write_vectored_calls: Arc::new(Mutex::new(0)),
         };
-        let mut central = CentralIoWriter::new(writer);
+        let mut central = CentralIoWriter::new(writer, false);
         let body = (0u8..200u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -820,7 +881,7 @@ mod tests {
             out: Vec::new(),
             write_calls: Arc::clone(&calls),
         };
-        let mut central = CentralIoWriter::new(writer);
+        let mut central = CentralIoWriter::new(writer, false);
 
         let body: Vec<u8> = (0u8..=255).cycle().take(1234).collect();
         central
@@ -853,7 +914,7 @@ mod tests {
             vectored: true,
             write_vectored_calls: Arc::new(Mutex::new(0)),
         };
-        let mut central = CentralIoWriter::new(writer);
+        let mut central = CentralIoWriter::new(writer, false);
         let big_len = usize::from(BodyLen::MAX) * 2 + 10;
         let body = (0u8..big_len as u8)
             .cycle()
@@ -1166,6 +1227,7 @@ mod tests {
             MuxConfig {
                 initiation: Initiation::Server,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             },
             &mut spawner,
         );
@@ -1176,6 +1238,7 @@ mod tests {
             MuxConfig {
                 initiation: Initiation::Client,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             },
             &mut spawner,
         );
@@ -1638,5 +1701,113 @@ mod tests {
         assert_eq!(a_seen, a_total);
         assert_eq!(b_seen, b_total);
         sender.await.unwrap();
+    }
+
+    // ---- Frame-reassembly wire tests ----
+
+    /// Mode off: the writer emits the exact stock header bytes (1-byte
+    /// Header::Data + 6-byte DataHeader with no offset field). A fixed
+    /// input must produce a byte-identical frame to the pre-reassembly
+    /// protocol.
+    #[tokio::test]
+    async fn mode_off_wire_identical() {
+        struct SinkWriter(Vec<u8>);
+        impl AsyncWrite for SinkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), false);
+        let body = (0u8..100u8).collect::<Vec<u8>>();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 42,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.push(0x02);
+        expected.extend_from_slice(&42u32.to_be_bytes());
+        expected.extend_from_slice(&100u16.to_be_bytes());
+        expected.extend_from_slice(&body);
+        assert_eq!(
+            central.io_writer.0, expected,
+            "mode-off wire must be byte-identical to stock"
+        );
+    }
+
+    /// Mode on: Data header carries a u32 offset, CloseWrite carries a
+    /// final offset. Verify the wire layout is the extended form.
+    #[tokio::test]
+    async fn mode_on_wire_has_offset() {
+        struct SinkWriter(Vec<u8>);
+        impl AsyncWrite for SinkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+        let body = (0u8..50u8).collect::<Vec<u8>>();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.push(0x02);
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.extend_from_slice(&50u16.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        expected.extend_from_slice(&body);
+        assert_eq!(central.io_writer.0, expected);
+
+        // Second frame: offset advances by 50.
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        let mut expected2 = expected.clone();
+        expected2.push(0x02);
+        expected2.extend_from_slice(&7u32.to_be_bytes());
+        expected2.extend_from_slice(&50u16.to_be_bytes());
+        expected2.extend_from_slice(&50u32.to_be_bytes());
+        expected2.extend_from_slice(&body);
+        assert_eq!(central.io_writer.0, expected2);
     }
 }

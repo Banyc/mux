@@ -30,6 +30,26 @@ use crate::{
 pub struct MuxConfig {
     pub initiation: Initiation,
     pub heartbeat_interval: Duration,
+    /// Opt-in out-of-order frame reassembly. When enabled on both peers,
+    /// Data frames carry a per-stream u32 byte offset and CloseWrite
+    /// carries the stream's final offset, so the central reader can
+    /// reassemble each stream independently from a transport that delivers
+    /// complete frames out of order (e.g. `rtp`'s frame-delivery mode).
+    /// Default off = wire byte-identical to the stock protocol and zero
+    /// extra cost. Both peers must enable it together; there is no
+    /// in-band negotiation.
+    pub frame_reassembly: bool,
+}
+
+impl MuxConfig {
+    /// Stock defaults: server initiation, 5 s heartbeat, reassembly off.
+    pub fn new(initiation: Initiation, heartbeat_interval: Duration) -> Self {
+        Self {
+            initiation,
+            heartbeat_interval,
+            frame_reassembly: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -146,9 +166,10 @@ where
     let (central_io_read_tx, central_io_read_rx) = central_io_read_channel();
 
     let initiation = config.initiation;
+    let frame_reassembly = config.frame_reassembly;
     let mut control_spawner = JoinSet::new();
     control_spawner.spawn(async move {
-        let control = MuxControl::new(initiation, write_data_tx);
+        let control = MuxControl::new(initiation, write_data_tx, frame_reassembly);
         let args = RunControlArgs {
             control,
             central_io_read_rx,
@@ -159,14 +180,15 @@ where
     });
 
     let heartbeat_interval = config.heartbeat_interval;
+    let frame_reassembly = config.frame_reassembly;
     let mut central_io_reader_spawner = JoinSet::new();
     central_io_reader_spawner.spawn(async move {
-        let central_io_reader = CentralIoReader::new(io_reader);
+        let central_io_reader = CentralIoReader::new(io_reader, frame_reassembly);
         run_central_io_reader(central_io_reader, central_io_read_tx, heartbeat_interval).await
     });
     let mut central_io_writer_spawner = JoinSet::new();
     central_io_writer_spawner.spawn(async move {
-        let central_io_writer = CentralIoWriter::new(io_writer);
+        let central_io_writer = CentralIoWriter::new(io_writer, frame_reassembly);
         run_central_io_writer(
             central_io_writer,
             heartbeat_interval,

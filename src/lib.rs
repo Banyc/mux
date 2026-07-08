@@ -32,6 +32,8 @@ pub use dual_message::{
     DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP,
 };
 pub use serve::{spawn_mux_no_reconnection, spawn_mux_with_reconnection, MuxConfig, MuxError};
+pub use protocol::Offset;
+pub use control::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use stream::{
     accepter::StreamAccepter,
     opener::{StreamOpenError, StreamOpener},

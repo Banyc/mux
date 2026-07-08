@@ -993,6 +993,7 @@ mod tests {
         MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         }
     }
 
@@ -1077,6 +1078,7 @@ mod tests {
             MuxConfig {
                 initiation: srv_init,
                 heartbeat_interval: Duration::from_secs(1),
+                frame_reassembly: false,
             },
             &mut srv_spawner,
         );
@@ -1088,6 +1090,7 @@ mod tests {
             MuxConfig {
                 initiation: cli_init,
                 heartbeat_interval: Duration::from_secs(1),
+                frame_reassembly: false,
             },
             &mut cli_spawner,
         );
@@ -1406,10 +1409,12 @@ mod tests {
         let srv_cfg = MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         };
         let cli_cfg = MuxConfig {
             initiation: Initiation::Client,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         };
         let mut int_spawner = JoinSet::new();
         let (int_op, _int_srv_acc) =

@@ -41,6 +41,7 @@ async fn main() {
             let config = MuxConfig {
                 initiation: Initiation::Server,
                 heartbeat_interval: Duration::from_secs(5),
+                frame_reassembly: false,
             };
             let (_opener, mut accepter) =
                 spawn_mux_no_reconnection(read, write, config, &mut mux_spawner);

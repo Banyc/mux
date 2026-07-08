@@ -413,6 +413,7 @@ mod tests {
         MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
         }
     }
 
