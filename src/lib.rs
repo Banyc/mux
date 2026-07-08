@@ -41,7 +41,7 @@ pub use stream::{
     writer::StreamWriter,
 };
 pub use migrating::{
-    AcceptedStream, MigratingCapableAccepter, MigratingError, MigratingStreamWriter,
+    AcceptedStream, ClientSplicedReader, MigratingCapableAccepter, MigratingError, MigratingStreamWriter,
     AUTO_BULK_THRESHOLD as MIGRATING_AUTO_BULK_THRESHOLD,
 };
 pub use stream_migration::{

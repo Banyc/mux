@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
@@ -82,6 +83,7 @@ impl StreamClassifier {
 pub enum MigratingError {
     Migration(MigrationError),
     OpenFailed,
+    OpenUnderlying(String),
     WriteFailed,
     LaneDead,
 }
@@ -123,6 +125,11 @@ pub struct MigratingStreamWriter {
     small_streak: usize,
     last_migration: Option<tokio::time::Instant>,
     auto: bool,
+    gen0_reader_tx: Option<tokio::sync::oneshot::Sender<StreamReader>>,
+    /// When set, generation readers (gen 0 and successors) are routed
+    /// into this channel for the client-side splice driver, producing a
+    /// [`SplicedReader`] on the paired `gen0_rx`.
+    cont_tx: Option<mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>>,
 }
 
 impl std::fmt::Debug for MigratingStreamWriter {
@@ -148,6 +155,28 @@ impl MigratingStreamWriter {
             small_streak: 0,
             last_migration: None,
             auto,
+            gen0_reader_tx: None,
+            cont_tx: None,
+        }
+    }
+
+    fn new_with_reader_tx(
+        opener: DualStreamOpener,
+        logical_id: u64,
+        initial_lane: LaneClass,
+        auto: bool,
+        gen0_reader_tx: tokio::sync::oneshot::Sender<StreamReader>,
+    ) -> Self {
+        Self {
+            opener,
+            chain: GenerationChain::new(logical_id),
+            state: WriterState::PendingOpen { lane: initial_lane },
+            classifier: StreamClassifier::new(),
+            small_streak: 0,
+            last_migration: None,
+            auto,
+            gen0_reader_tx: Some(gen0_reader_tx),
+            cont_tx: None,
         }
     }
 
@@ -167,22 +196,33 @@ impl MigratingStreamWriter {
                 Ok(())
             }
             WriterState::PendingOpen { lane } => {
-                let (_, mut writer) = self.opener.open(lane)
-                    .await
-                    .map_err(|_| MigratingError::OpenFailed)?;
-                self.chain
+                let (reader, mut writer) = match self.opener.open(lane).await {
+                    Ok(x) => x,
+                    Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
+                };
+                let oneshot_tx = self.gen0_reader_tx.take();
+                let gen = self
+                    .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
+                if let Some(tx) = oneshot_tx {
+                    let _ = tx.send(reader);
+                } else {
+                    self.route_reader(gen, reader);
+                }
                 self.state = WriterState::Active { writer, lane };
                 Ok(())
             }
             WriterState::Migrating { target_lane } => {
-                let (_, mut writer) = self.opener.open(target_lane)
-                    .await
-                    .map_err(|_| MigratingError::OpenFailed)?;
-                self.chain
+                let (reader, mut writer) = match self.opener.open(target_lane).await {
+                    Ok(x) => x,
+                    Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
+                };
+                let gen = self
+                    .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
+                self.route_reader(gen, reader);
                 self.state = WriterState::Active { writer, lane: target_lane };
                 Ok(())
             }
@@ -216,6 +256,20 @@ impl MigratingStreamWriter {
         use tokio::io::AsyncWriteExt;
         writer.write_all(buf).await.map_err(|_| MigratingError::WriteFailed)?;
         Ok(())
+    }
+
+    /// When `cont_tx` is set, boxes the generation reader and sends it
+    /// with its [`ResumeHeader`] into the client-side splice driver.
+    /// When `cont_tx` is `None`, the reader is silently dropped.
+    fn route_reader(&self, generation: u32, reader: StreamReader) {
+        if let Some(tx) = &self.cont_tx {
+            let header = ResumeHeader {
+                logical_id: self.chain.logical_id(),
+                generation,
+                is_final: false,
+            };
+            let _ = tx.send((header, Box::pin(reader)));
+        }
     }
 
     async fn classify_and_maybe_migrate(&mut self, size: usize) -> Result<(), MigratingError> {
@@ -389,6 +443,28 @@ impl DualStreamOpener {
         MigratingStreamWriter::new(self.clone(), logical_id, initial_lane, true)
     }
 
+    /// Like [`open_migrating`] but also returns a
+    /// [`tokio::sync::oneshot::Receiver`] that resolves to the gen-0
+    /// [`StreamReader`] once the first write opens the underlying stream.
+    /// The receiver yields the reader that the server side can use to
+    /// send responses back to the opener — needed for bidirectional
+    /// protocols (e.g. proxy tunnels) where the opener is also a reader.
+    pub fn open_migrating_with_reader(
+        &self,
+        logical_id: u64,
+        initial_lane: LaneClass,
+    ) -> (MigratingStreamWriter, tokio::sync::oneshot::Receiver<StreamReader>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let writer = MigratingStreamWriter::new_with_reader_tx(
+            self.clone(),
+            logical_id,
+            initial_lane,
+            true,
+            tx,
+        );
+        (writer, rx)
+    }
+
     /// Same as [`open_migrating`] but with auto-classification disabled.
     /// The caller drives lane changes via [`MigratingStreamWriter::force_migrate`].
     pub fn open_migrating_manual(
@@ -397,6 +473,38 @@ impl DualStreamOpener {
         initial_lane: LaneClass,
     ) -> MigratingStreamWriter {
         MigratingStreamWriter::new(self.clone(), logical_id, initial_lane, false)
+    }
+
+    /// Open a bidirectional migrating stream on `initial_lane`. The
+    /// returned [`MigratingStreamWriter`] handles the write side; the
+    /// returned [`ClientSplicedReader`] handles the read side across
+    /// lane migrations.
+    ///
+    /// Internally spawns a client-side splice driver that re-assembles
+    /// generation readers into a single [`SplicedReader`] — the same
+    /// mechanism used by the accepter side.
+    pub fn open_migrating_duplex(
+        &self,
+        logical_id: u64,
+        initial_lane: LaneClass,
+    ) -> (ClientSplicedReader, MigratingStreamWriter) {
+        let (cont_tx, cont_rx) = mpsc::unbounded_channel();
+        let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
+        let registry = SpliceRegistry::new();
+        let driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+
+        let mut writer =
+            MigratingStreamWriter::new(self.clone(), logical_id, initial_lane, true);
+        writer.cont_tx = Some(cont_tx);
+
+        let reader = ClientSplicedReader {
+            logical_id,
+            inner: None,
+            gen0_rx: Some(gen0_rx),
+            driver,
+        };
+
+        (reader, writer)
     }
 }
 
@@ -562,6 +670,74 @@ pub enum AcceptedStream {
         writer: StreamWriter,
         source_lane: LaneClass,
     },
+}
+
+// ---------------------------------------------------------------------------
+// ClientSplicedReader — opener-side spliced reader for duplex migrating
+// ---------------------------------------------------------------------------
+
+/// Opener-side reader that consumes the [`SplicedReader`] for a single
+/// known `logical_id` from the client-side splice driver's `gen0_rx`
+/// channel.  The reader is lazily obtained on the first [`AsyncRead::poll_read`]
+/// invocation — no blocking until the first poll.
+///
+/// The background splice driver is kept alive via the owned
+/// [`tokio::task::JoinHandle`] stored inside this struct; dropping the
+/// `ClientSplicedReader` drops the driver.
+pub struct ClientSplicedReader {
+    logical_id: u64,
+    inner: Option<SplicedReader>,
+    gen0_rx: Option<mpsc::UnboundedReceiver<(u64, SplicedReader)>>,
+    #[allow(dead_code)]
+    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
+}
+
+impl std::fmt::Debug for ClientSplicedReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSplicedReader")
+            .field("logical_id", &self.logical_id)
+            .field("has_inner", &self.inner.is_some())
+            .finish()
+    }
+}
+
+impl AsyncRead for ClientSplicedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.inner.is_none() {
+            let mut rx_opt = self.gen0_rx.take();
+            let result = match rx_opt.as_mut() {
+                Some(rx) => Pin::new(rx).poll_recv(cx),
+                None => Poll::Ready(None),
+            };
+            match result {
+                Poll::Ready(Some((id, spliced))) if id == self.logical_id => {
+                    self.inner = Some(spliced);
+                }
+                Poll::Ready(Some((_other_id, _spliced))) => {
+                    self.gen0_rx = rx_opt;
+                    return Poll::Pending;
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "splice driver dropped before gen0 arrived",
+                    )));
+                }
+                Poll::Pending => {
+                    self.gen0_rx = rx_opt;
+                    return Poll::Pending;
+                }
+            }
+        }
+        match &mut self.inner {
+            Some(spliced) => Pin::new(spliced).poll_read(cx, buf),
+            None => unreachable!(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,5 +1338,179 @@ mod tests {
         assert_eq!(data, "data-on-bulk");
 
         send.await.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Duplex: client reads peer bytes on gen0
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_client_reads_peer_bytes_on_gen0() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let (mut client_reader, client_writer) =
+            opener.open_migrating_duplex(7, LaneClass::Interactive);
+
+        let write = tokio::spawn(async move {
+            let mut writer = client_writer;
+            writer.write_all(b"hello-from-c2s  ").await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let (_accepted_reader, mut accepted_writer) = match accepted {
+            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
+            _ => panic!("expected migrating"),
+        };
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"hello-from-s2c  ").await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+
+        write.await.unwrap();
+
+        let mut resp = [0u8; 16];
+        tokio::io::AsyncReadExt::read_exact(&mut client_reader, &mut resp).await.unwrap();
+        assert_eq!(&resp, b"hello-from-s2c  ");
+
+        let mut buf = [0u8; 1];
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut buf).await.unwrap();
+        assert_eq!(n, 0, "expected clean EOF after server writer shutdown");
+    }
+
+    // -------------------------------------------------------------------
+    // Duplex: client reads across forced migration
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_client_reads_across_forced_migration() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let (mut client_reader, client_writer) =
+            opener.open_migrating_duplex(8, LaneClass::Interactive);
+
+        let write = tokio::spawn(async move {
+            let mut writer = client_writer;
+            writer.write_all(b"c2s-1").await.unwrap();
+            writer.force_migrate(LaneClass::Bulk).await.unwrap();
+            writer.write_all(b"c2s-2").await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let (_accepted_reader, mut accepted_writer) = match accepted {
+            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
+            _ => panic!("expected migrating"),
+        };
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"first-response ").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"second-response").await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+
+        write.await.unwrap();
+
+        let mut resp = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client_reader, &mut resp).await.unwrap();
+        assert_eq!(resp, "first-response second-response");
+    }
+
+    // -------------------------------------------------------------------
+    // Duplex: multi-MB integrity with bidirectional echo
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_multi_mb_integrity_bidirectional() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let (mut client_reader, client_writer) =
+            opener.open_migrating_duplex(9, LaneClass::Interactive);
+
+        const MIGRATIONS: usize = 100;
+
+        let write = tokio::spawn(async move {
+            let mut writer = client_writer;
+            for i in 0..MIGRATIONS {
+                let chunk = format!("chunk-{:03}-{:04X}", i, i);
+                writer.write_all(chunk.as_bytes()).await.unwrap();
+                if i % 2 == 0 {
+                    writer.force_migrate(LaneClass::Bulk).await.unwrap();
+                } else {
+                    writer.force_migrate(LaneClass::Interactive).await.unwrap();
+                }
+            }
+            writer.shutdown().unwrap();
+        });
+
+        // Accept gen0
+        let accepted = mac.accept().await.unwrap();
+        let (mut accepted_reader, mut accepted_writer) = match accepted {
+            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
+            _ => panic!("expected migrating"),
+        };
+
+        // Drain successors while echoing
+        let drain = tokio::spawn(async move {
+            loop { let _ = mac.accept().await; }
+        });
+
+        let echo = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut accepted_reader, &mut buf).await.unwrap();
+                if n == 0 { break; }
+                tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, &buf[..n]).await.unwrap();
+            }
+            tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+        });
+
+        write.await.unwrap();
+        echo.await.unwrap();
+        drain.abort();
+
+        let mut echoed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut echoed).await.unwrap();
+        let mut expected = Vec::new();
+        for i in 0..MIGRATIONS {
+            expected.extend_from_slice(format!("chunk-{:03}-{:04X}", i, i).as_bytes());
+        }
+        assert_eq!(echoed.len(), expected.len(), "total echoed byte count mismatch");
+        assert_eq!(echoed, expected, "echoed content mismatch");
+    }
+
+    // -------------------------------------------------------------------
+    // Write-only open_migrating drops reader, wire behavior unchanged
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_only_open_migrating_drops_reader_unchanged() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let client_writer = opener.open_migrating(10, LaneClass::Interactive);
+
+        let write = tokio::spawn(async move {
+            let mut writer = client_writer;
+            writer.write_all(b"write-only-data").await.unwrap();
+            writer.shutdown().unwrap();
+        });
+
+        let accepted = mac.accept().await.unwrap();
+        let mut accepted_reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            _ => panic!("expected migrating"),
+        };
+
+        // Drain successors (FINAL generation from shutdown) so the
+        // SplicedReader can chain through to clean EOF.
+        let drain = tokio::spawn(async move {
+            loop { let _ = mac.accept().await; }
+        });
+
+        let mut data = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut accepted_reader, &mut data).await.unwrap();
+        assert_eq!(data, "write-only-data");
+
+        write.await.unwrap();
+        drain.abort();
     }
 }

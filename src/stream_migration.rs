@@ -205,6 +205,10 @@ impl GenerationChain {
         }
     }
 
+    pub fn logical_id(&self) -> u64 {
+        self.logical_id
+    }
+
     /// Start a new generation on `writer`. Writes the resume header
     /// **before** returning control, so the peer sees it before any
     /// payload bytes. Returns the generation number that was started.
@@ -234,7 +238,7 @@ impl GenerationChain {
 // SpliceRegistry (receiver side)
 // ---------------------------------------------------------------------------
 
-pub(crate) type GenerationReader = Pin<Box<dyn AsyncRead + Send + 'static>>;
+pub(crate) type GenerationReader = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
 
 struct StreamEntry {
     /// Pending generations sorted by generation number. Each carries a
@@ -301,7 +305,7 @@ impl SpliceRegistry {
     pub fn dispatch(
         &mut self,
         header: ResumeHeader,
-        continuation: impl AsyncRead + Send + 'static,
+        continuation: impl AsyncRead + Send + Sync + 'static,
     ) -> Result<Option<SplicedReader>, MigrationError> {
         let reader: GenerationReader = Box::pin(continuation);
 
