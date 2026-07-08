@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -126,10 +127,10 @@ pub struct MigratingStreamWriter {
     last_migration: Option<tokio::time::Instant>,
     auto: bool,
     gen0_reader_tx: Option<tokio::sync::oneshot::Sender<StreamReader>>,
-    /// When set, generation readers (gen 0 and successors) are routed
-    /// into this channel for the client-side splice driver, producing a
-    /// [`SplicedReader`] on the paired `gen0_rx`.
-    cont_tx: Option<mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>>,
+    /// When set, successor generation readers are held alive here so
+    /// their sub-streams don't close on the peer; gen 0 is delivered via
+    /// [`gen0_reader_tx`]. `None` for write-only mode.
+    held_readers: Option<Vec<StreamReader>>,
 }
 
 impl std::fmt::Debug for MigratingStreamWriter {
@@ -156,7 +157,7 @@ impl MigratingStreamWriter {
             last_migration: None,
             auto,
             gen0_reader_tx: None,
-            cont_tx: None,
+            held_readers: None,
         }
     }
 
@@ -176,7 +177,7 @@ impl MigratingStreamWriter {
             last_migration: None,
             auto,
             gen0_reader_tx: Some(gen0_reader_tx),
-            cont_tx: None,
+            held_readers: Some(Vec::new()),
         }
     }
 
@@ -200,16 +201,11 @@ impl MigratingStreamWriter {
                     Ok(x) => x,
                     Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
                 };
-                let oneshot_tx = self.gen0_reader_tx.take();
                 let gen = self
                     .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
-                if let Some(tx) = oneshot_tx {
-                    let _ = tx.send(reader);
-                } else {
-                    self.route_reader(gen, reader);
-                }
+                self.route_opened_reader(gen, reader);
                 self.state = WriterState::Active { writer, lane };
                 Ok(())
             }
@@ -222,7 +218,7 @@ impl MigratingStreamWriter {
                     .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
-                self.route_reader(gen, reader);
+                self.route_opened_reader(gen, reader);
                 self.state = WriterState::Active { writer, lane: target_lane };
                 Ok(())
             }
@@ -258,17 +254,18 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    /// When `cont_tx` is set, boxes the generation reader and sends it
-    /// with its [`ResumeHeader`] into the client-side splice driver.
-    /// When `cont_tx` is `None`, the reader is silently dropped.
-    fn route_reader(&self, generation: u32, reader: StreamReader) {
-        if let Some(tx) = &self.cont_tx {
-            let header = ResumeHeader {
-                logical_id: self.chain.logical_id(),
-                generation,
-                is_final: false,
-            };
-            let _ = tx.send((header, Box::pin(reader)));
+    fn route_opened_reader(&mut self, generation: u32, reader: StreamReader) {
+        let mut reader = reader;
+        if generation == 0 {
+            if let Some(tx) = self.gen0_reader_tx.take() {
+                match tx.send(reader) {
+                    Ok(()) => return,
+                    Err(r) => reader = r,
+                }
+            }
+        }
+        if let Some(held) = &mut self.held_readers {
+            held.push(reader);
         }
     }
 
@@ -477,33 +474,30 @@ impl DualStreamOpener {
 
     /// Open a bidirectional migrating stream on `initial_lane`. The
     /// returned [`MigratingStreamWriter`] handles the write side; the
-    /// returned [`ClientSplicedReader`] handles the read side across
-    /// lane migrations.
+    /// returned [`ClientSplicedReader`] handles the read side.
     ///
-    /// Internally spawns a client-side splice driver that re-assembles
-    /// generation readers into a single [`SplicedReader`] — the same
-    /// mechanism used by the accepter side.
+    /// RESPONSE-direction traffic stays pinned to the lane where
+    /// generation 0 opened; only the REQUEST direction migrates. True
+    /// bidirectional lane migration needs the accepter API to expose
+    /// successor writers — future work, out of scope.
     pub fn open_migrating_duplex(
         &self,
         logical_id: u64,
         initial_lane: LaneClass,
     ) -> (ClientSplicedReader, MigratingStreamWriter) {
-        let (cont_tx, cont_rx) = mpsc::unbounded_channel();
-        let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
-        let registry = SpliceRegistry::new();
-        let driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
-
-        let mut writer =
-            MigratingStreamWriter::new(self.clone(), logical_id, initial_lane, true);
-        writer.cont_tx = Some(cont_tx);
-
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let writer = MigratingStreamWriter::new_with_reader_tx(
+            self.clone(),
+            logical_id,
+            initial_lane,
+            true,
+            tx,
+        );
         let reader = ClientSplicedReader {
             logical_id,
             inner: None,
-            gen0_rx: Some(gen0_rx),
-            driver,
+            gen0_rx: Some(rx),
         };
-
         (reader, writer)
     }
 }
@@ -673,23 +667,23 @@ pub enum AcceptedStream {
 }
 
 // ---------------------------------------------------------------------------
-// ClientSplicedReader — opener-side spliced reader for duplex migrating
+// ClientSplicedReader — opener-side reader for duplex migrating
 // ---------------------------------------------------------------------------
 
-/// Opener-side reader that consumes the [`SplicedReader`] for a single
-/// known `logical_id` from the client-side splice driver's `gen0_rx`
-/// channel.  The reader is lazily obtained on the first [`AsyncRead::poll_read`]
-/// invocation — no blocking until the first poll.
+/// Client-side reader for a duplex migrating stream. The gen-0
+/// [`StreamReader`] is delivered via a oneshot from the paired
+/// [`MigratingStreamWriter`] when the first write opens the underlying
+/// stream. Once installed, every [`AsyncRead::poll_read`] delegates to
+/// that single reader — response traffic stays pinned to the lane where
+/// generation 0 opened; only the request direction migrates.
 ///
-/// The background splice driver is kept alive via the owned
-/// [`tokio::task::JoinHandle`] stored inside this struct; dropping the
-/// `ClientSplicedReader` drops the driver.
+/// If the writer is dropped before any write, the oneshot sender drops
+/// → the reader gets [`BrokenPipe`](io::ErrorKind::BrokenPipe) (the
+/// stream never materialised).
 pub struct ClientSplicedReader {
     logical_id: u64,
-    inner: Option<SplicedReader>,
-    gen0_rx: Option<mpsc::UnboundedReceiver<(u64, SplicedReader)>>,
-    #[allow(dead_code)]
-    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
+    inner: Option<StreamReader>,
+    gen0_rx: Option<tokio::sync::oneshot::Receiver<StreamReader>>,
 }
 
 impl std::fmt::Debug for ClientSplicedReader {
@@ -709,32 +703,30 @@ impl AsyncRead for ClientSplicedReader {
     ) -> Poll<io::Result<()>> {
         if self.inner.is_none() {
             let mut rx_opt = self.gen0_rx.take();
-            let result = match rx_opt.as_mut() {
-                Some(rx) => Pin::new(rx).poll_recv(cx),
-                None => Poll::Ready(None),
-            };
-            match result {
-                Poll::Ready(Some((id, spliced))) if id == self.logical_id => {
-                    self.inner = Some(spliced);
-                }
-                Poll::Ready(Some((_other_id, _spliced))) => {
-                    self.gen0_rx = rx_opt;
-                    return Poll::Pending;
-                }
-                Poll::Ready(None) => {
+            match rx_opt.as_mut() {
+                Some(rx) => match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(r)) => self.inner = Some(r),
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "duplex writer dropped before gen0 arrived",
+                        )));
+                    }
+                    Poll::Pending => {
+                        self.gen0_rx = rx_opt;
+                        return Poll::Pending;
+                    }
+                },
+                None => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "splice driver dropped before gen0 arrived",
+                        "duplex writer dropped before gen0 arrived",
                     )));
-                }
-                Poll::Pending => {
-                    self.gen0_rx = rx_opt;
-                    return Poll::Pending;
                 }
             }
         }
         match &mut self.inner {
-            Some(spliced) => Pin::new(spliced).poll_read(cx, buf),
+            Some(r) => Pin::new(r).poll_read(cx, buf),
             None => unreachable!(),
         }
     }
