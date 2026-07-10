@@ -358,12 +358,9 @@ impl DualMessageReceiver {
         // cap: jump next_seq to the lowest buffered seq so pop_ordered
         // delivers it next. Do NOT discard the buffered message — that
         // would silently drop data.
-        while self.ordered.len() > self.reorder_cap {
+        if self.ordered.len() > self.reorder_cap {
             let (&first_seq, _) = self.ordered.first_key_value().unwrap();
             self.next_seq = first_seq;
-            // The gap below first_seq is permanent; advance past it but
-            // keep first_seq in the buffer for pop_ordered to deliver.
-            break;
         }
     }
 

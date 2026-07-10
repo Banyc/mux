@@ -189,7 +189,8 @@ impl CloseWriteExtMsg {
 /// to order out-of-order Data frames and to decide whether a Data
 /// frame's offset is ahead of (buffer it) or at/behind (deliver/drop)
 /// the next-expected offset.
-pub fn offset_less(a: Offset, b: Offset) -> bool {
+#[cfg(test)]
+fn offset_less(a: Offset, b: Offset) -> bool {
     // (b.wrapping_sub(a)) as i32 > 0  ⟺  a is strictly before b.
     (b.wrapping_sub(a) as i32) > 0
 }
