@@ -20,6 +20,7 @@ use tokio::{
 };
 
 use crate::{
+    protocol::Header,
     serve::{spawn_mux_no_reconnection, MuxConfig, MuxError},
     stream::{
         opener::{StreamOpenError, StreamOpener},
@@ -99,6 +100,16 @@ impl AsRef<[u8]> for PairingNonce {
 // ---------------------------------------------------------------------------
 // Lane hello I/O
 // ---------------------------------------------------------------------------
+
+/// Write a single heartbeat frame on `writer` to prove the paired lane is
+/// alive before any application data flows. Use with
+/// [`spawn_mux_no_reconnection_with_first_receive_deadline`] so the
+/// receiver switches off its shorter first-receive deadline.
+pub async fn write_birth_heartbeat<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+) -> io::Result<()> {
+    writer.write_all(&Header::Heartbeat.encode()).await
+}
 
 #[derive(Debug, Clone)]
 pub enum LaneHelloError {

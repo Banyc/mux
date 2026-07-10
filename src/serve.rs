@@ -91,7 +91,46 @@ where
     #[allow(unused_assignments)]
     let mut reconnect = Some(nah);
     reconnect = None;
-    spawn_mux(io_reader, io_writer, config, reconnect, spawner)
+    spawn_mux(
+        io_reader,
+        io_writer,
+        config,
+        reconnect,
+        spawner,
+        None,
+    )
+}
+
+/// Like [`spawn_mux_no_reconnection`] but enforces a shorter
+/// `first_receive_deadline` until the first frame arrives, then
+/// switches to the steady receive deadline derived from the
+/// heartbeat interval. Use [`crate::write_birth_heartbeat`] on the
+/// paired transport to prove lane liveness before any app data flows.
+pub fn spawn_mux_no_reconnection_with_first_receive_deadline<R, W>(
+    io_reader: R,
+    io_writer: W,
+    config: MuxConfig,
+    first_receive_deadline: Duration,
+    spawner: &mut JoinSet<MuxError>,
+) -> (StreamOpener, StreamAccepter)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    async fn nah<R, W>() -> Option<(R, W)> {
+        unreachable!()
+    }
+    #[allow(unused_assignments)]
+    let mut reconnect = Some(nah);
+    reconnect = None;
+    spawn_mux(
+        io_reader,
+        io_writer,
+        config,
+        reconnect,
+        spawner,
+        Some(first_receive_deadline),
+    )
 }
 pub fn spawn_mux_with_reconnection<R, W, ReconnectFut>(
     io_reader: R,
@@ -105,7 +144,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     ReconnectFut: Future<Output = Option<(R, W)>> + Send,
 {
-    spawn_mux(io_reader, io_writer, config, Some(reconnect), spawner)
+    spawn_mux(io_reader, io_writer, config, Some(reconnect), spawner, None)
 }
 fn spawn_mux<R, W, ReconnectFut>(
     io_reader: R,
@@ -113,6 +152,7 @@ fn spawn_mux<R, W, ReconnectFut>(
     config: MuxConfig,
     reconnect: Option<impl FnMut() -> ReconnectFut + Send + 'static>,
     spawner: &mut JoinSet<MuxError>,
+    first_receive_deadline: Option<Duration>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -129,7 +169,8 @@ where
     };
     spawner.spawn(async move {
         let (stream_init_handle, err) =
-            run_services(io_reader, io_writer, &config, stream_init_handle).await;
+            run_services(io_reader, io_writer, &config, stream_init_handle, first_receive_deadline)
+                .await;
         let Some(mut reconnect) = reconnect else {
             return err;
         };
@@ -141,7 +182,8 @@ where
                 return err;
             };
             let (stream_init_handle, err) =
-                run_services(io_reader, io_writer, &config, curr_stream_init_handle).await;
+                run_services(io_reader, io_writer, &config, curr_stream_init_handle, first_receive_deadline)
+                    .await;
             let Some(stream_init_handle) = stream_init_handle else {
                 return err;
             };
@@ -156,6 +198,7 @@ async fn run_services<R, W>(
     io_writer: W,
     config: &MuxConfig,
     stream_init_handle: StreamInitHandle,
+    first_receive_deadline: Option<Duration>,
 ) -> (Option<StreamInitHandle>, MuxError)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -184,7 +227,13 @@ where
     let mut central_io_reader_spawner = JoinSet::new();
     central_io_reader_spawner.spawn(async move {
         let central_io_reader = CentralIoReader::new(io_reader, frame_reassembly);
-        run_central_io_reader(central_io_reader, central_io_read_tx, heartbeat_interval).await
+        run_central_io_reader(
+            central_io_reader,
+            central_io_read_tx,
+            heartbeat_interval,
+            first_receive_deadline,
+        )
+        .await
     });
     let mut central_io_writer_spawner = JoinSet::new();
     central_io_writer_spawner.spawn(async move {

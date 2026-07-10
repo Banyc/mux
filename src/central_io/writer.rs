@@ -32,6 +32,11 @@ const DATA_EXTREME_CAP: usize = 1200;
 const DATA_MEDIUM_CAP: usize = 2 * 1024;
 pub(crate) const DATA_BULK_CAP: usize = 32 * 1024;
 
+/// Maximum body length in a single Data frame when `frame_reassembly` is on.
+/// The total on-wire frame is `Header::SIZE (1) + DataHeaderExt::SIZE (10) +
+/// body`, which must fit within a single 64 KiB transport frame.
+const REASSEMBLY_MAX_BODY: usize = 64 * 1024 - Header::SIZE - DataHeaderExt::SIZE;
+
 /// A stream is relegated from `MaybeLatencySensitive` (the default, protected)
 /// to `MustBulk` once at least two thirds of its recent sends were under
 /// [`DATA_QUANTUM`] and it has been idle for this long.
@@ -294,9 +299,14 @@ where
             StreamWriteData::Data(data_buf) => data_buf,
         };
         let hdr = Header::Data;
+        let max_body = if self.frame_reassembly {
+            REASSEMBLY_MAX_BODY
+        } else {
+            usize::from(BodyLen::MAX)
+        };
         let mut body_offset = 0usize;
         while body_offset != data_buf.len() {
-            let body_len = (data_buf.len() - body_offset).min(usize::from(BodyLen::MAX));
+            let body_len = (data_buf.len() - body_offset).min(max_body);
             let body_len_u16 = BodyLen::try_from(body_len).unwrap();
             let fixed_buf: Vec<u8>;
             if self.frame_reassembly {
@@ -703,8 +713,9 @@ mod tests {
         priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
         StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
         DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE,
+        REASSEMBLY_MAX_BODY,
     };
-    use crate::protocol::{BodyLen, DataHeader, Header, StreamId};
+    use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header, StreamId};
     use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
 
     /// A mock writer that records every byte and can simulate partial vectored
@@ -1809,5 +1820,64 @@ mod tests {
         expected2.extend_from_slice(&50u32.to_be_bytes());
         expected2.extend_from_slice(&body);
         assert_eq!(central.io_writer.0, expected2);
+    }
+
+    /// Reassembly frames must never exceed 64 KiB total on-wire size.
+    /// Before the cap, `BodyLen::MAX (65535)` was used as the max body
+    /// in reassembly mode too, yielding 65546-byte frames that overflow
+    /// a single 64 KiB transport datagram.
+    #[tokio::test]
+    async fn reassembly_frame_total_le_64kib() {
+        struct SinkWriter(Vec<u8>);
+        impl AsyncWrite for SinkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+
+        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+
+        // Two chunks: REASSEMBLY_MAX_BODY + 1 forces the writer to split.
+        let payload_len = REASSEMBLY_MAX_BODY + 7890;
+        let payload: Vec<u8> = (0u8..=u8::MAX).cycle().take(payload_len).collect();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 1,
+                data: StreamWriteData::Data(make_data_buf(&payload)),
+            })
+            .await
+            .unwrap();
+
+        let out = &central.io_writer.0;
+        let mut pos = 0usize;
+        let data_code = Header::Data.encode()[0];
+        while pos < out.len() {
+            assert_eq!(out[pos], data_code, "expected Data header");
+            // frame = Header(1) + DataHeaderExt(10) + body
+            let body_len =
+                u16::from_be_bytes(out[pos + 5..pos + 7].try_into().unwrap()) as usize;
+            let frame_total = Header::SIZE + DataHeaderExt::SIZE + body_len;
+            assert!(
+                frame_total <= 64 * 1024,
+                "reassembly frame total {frame_total} exceeds 64 KiB"
+            );
+            pos += frame_total;
+        }
+        assert_eq!(pos, out.len());
     }
 }

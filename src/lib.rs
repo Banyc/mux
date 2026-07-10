@@ -22,16 +22,16 @@ pub use common::Side;
 pub use control::{ControlOpenError, DeadControl, Initiation, TooManyOpenStreams};
 pub use dual_lane::{
     complete_pairing, read_lane_hello, spawn_dual_mux_acceptor, spawn_dual_mux_connector,
-    spawn_dual_mux_paired, spawn_dual_mux_paired_supervised, write_lane_hello, AutoReader,
-    AutoWriteError, AutoWriter, DualAcceptError, DualMuxError, DualStreamAccepter,
-    DualStreamOpenError, DualStreamOpener, LaneClass, LaneHelloError, Liveness, PairingNonce,
-    PendingAcceptor, AUTO_BULK_THRESHOLD,
+    spawn_dual_mux_paired, spawn_dual_mux_paired_supervised, write_birth_heartbeat,
+    write_lane_hello, AutoReader, AutoWriteError, AutoWriter, DualAcceptError, DualMuxError,
+    DualStreamAccepter, DualStreamOpenError, DualStreamOpener, LaneClass, LaneHelloError,
+    Liveness, PairingNonce, PendingAcceptor, AUTO_BULK_THRESHOLD,
 };
 pub use dual_message::{
     DeliveryMode, DualMessageReceiver, DualMessageSender, RecvError, SendError,
     DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP,
 };
-pub use serve::{spawn_mux_no_reconnection, spawn_mux_with_reconnection, MuxConfig, MuxError};
+pub use serve::{spawn_mux_no_reconnection, spawn_mux_no_reconnection_with_first_receive_deadline, spawn_mux_with_reconnection, MuxConfig, MuxError};
 pub use protocol::Offset;
 pub use control::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use stream::{

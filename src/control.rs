@@ -176,7 +176,7 @@ async fn handle_central_read(
                 }
                 if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await
                 {
-                    control.reassembly_error_teardown(stream_id);
+                    control.reassembly_error_teardown(stream_id).await;
                     let _ = write_control_tx
                         .send(WriteControlMsg::Close(stream_id, Side::Read))
                         .await;
@@ -215,7 +215,7 @@ async fn handle_central_read(
                     .await
                     .is_err()
                 {
-                    control.reassembly_error_teardown(stream_id);
+                    control.reassembly_error_teardown(stream_id).await;
                     let _ = write_control_tx
                         .send(WriteControlMsg::Close(stream_id, Side::Read))
                         .await;
@@ -455,16 +455,22 @@ impl MuxControl {
     /// and marks the local read side closed. The caller must also send
     /// `CloseRead` to the peer so the other side knows to stop sending.
     /// Sibling streams keep running — only this one stream is affected.
-    fn reassembly_error_teardown(&mut self, stream_id: StreamId) {
+    async fn reassembly_error_teardown(&mut self, stream_id: StreamId) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return;
         };
-        let _ = stream.read_dispatcher.send(StreamReadDataMsg::Error(
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "reassembly protocol error — stream read side closed",
-            ),
-        ));
+        if stream.is_read_closed {
+            return;
+        }
+        let _ = stream
+            .read_dispatcher
+            .send(StreamReadDataMsg::Error(
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "reassembly protocol error — stream read side closed",
+                ),
+            ))
+            .await;
         stream.reassembly = None;
         stream.is_read_closed = true;
     }
@@ -1362,5 +1368,49 @@ mod reassembly_tests {
         assert_eq!(got, [0xAA; 3], "reader gets data, then EOF after final_offset");
 
         drop(drain);
+    }
+
+    /// Reassembly error teardown is idempotent: after the first error
+    /// closes the stream's read side, subsequent calls must not enqueue
+    /// additional Error messages. A burst of late/bad frames after the
+    /// first error would fill the reader channel (1024 entries) and
+    /// stall sibling streams.
+    #[tokio::test]
+    async fn reassembly_error_teardown_is_idempotent() {
+        let (mut control, _close_tx, _drain) = make_control(true);
+        let mut broken_rx = open_test_stream(&mut control, 1).await;
+        let mut sibling_rx = open_test_stream(&mut control, 2).await;
+
+        // First error: enqueues Error and marks is_read_closed.
+        control.reassembly_error_teardown(1).await;
+
+        // Verify Error arrived (exactly one).
+        let msg = broken_rx
+            .try_recv()
+            .expect("first error should be readable");
+        assert!(
+            matches!(msg, StreamReadDataMsg::Error(_)),
+            "expected Error, got {msg:?}"
+        );
+
+        // Second call on same stream: guard fires, no new message.
+        control.reassembly_error_teardown(1).await;
+        assert!(
+            broken_rx.try_recv().is_err(),
+            "no second Error after teardown is already closed"
+        );
+
+        // Sibling stream still makes progress.
+        control
+            .ingest_reassembly(2, 0, buf(&[0xAA; 4]))
+            .await
+            .unwrap();
+        let msg = sibling_rx
+            .try_recv()
+            .expect("sibling should receive data after sibling teardown");
+        assert!(
+            matches!(msg, StreamReadDataMsg::Data(_)),
+            "sibling stream must progress, got {msg:?}"
+        );
     }
 }

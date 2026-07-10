@@ -22,19 +22,24 @@ pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
     tx: CentralIoReadTx,
     heartbeat_interval: Duration,
+    mut first_receive_deadline: Option<Duration>,
 ) -> Result<(), RunCentralIoReaderError>
 where
     R: AsyncRead + Unpin,
 {
     let deadline = heartbeat_interval * RECEIVE_DEADLINE_INTERVALS;
     loop {
+        let d = first_receive_deadline.unwrap_or(deadline);
         let msg = io_reader
-            .recv(deadline)
+            .recv(d)
             .await
             .map_err(RunCentralIoReaderError::IoReader)?;
         tx.send(msg)
             .await
             .map_err(RunCentralIoReaderError::Control)?;
+        if first_receive_deadline.is_some() {
+            first_receive_deadline = None;
+        }
     }
 }
 #[derive(Debug)]
