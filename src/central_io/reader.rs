@@ -22,24 +22,22 @@ pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
     tx: CentralIoReadTx,
     heartbeat_interval: Duration,
-    mut first_receive_deadline: Option<Duration>,
+    first_receive_deadline: Option<Duration>,
 ) -> Result<(), RunCentralIoReaderError>
 where
     R: AsyncRead + Unpin,
 {
-    let deadline = heartbeat_interval * RECEIVE_DEADLINE_INTERVALS;
+    let steady_deadline = heartbeat_interval * RECEIVE_DEADLINE_INTERVALS;
+    let mut deadline = first_receive_deadline.unwrap_or(steady_deadline);
     loop {
-        let d = first_receive_deadline.unwrap_or(deadline);
         let msg = io_reader
-            .recv(d)
+            .recv_with_steady_deadline(deadline, steady_deadline)
             .await
             .map_err(RunCentralIoReaderError::IoReader)?;
+        deadline = steady_deadline;
         tx.send(msg)
             .await
             .map_err(RunCentralIoReaderError::Control)?;
-        if first_receive_deadline.is_some() {
-            first_receive_deadline = None;
-        }
     }
 }
 #[derive(Debug)]
@@ -88,15 +86,21 @@ impl<R> CentralIoReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub async fn recv(&mut self, deadline: Duration) -> io::Result<CentralIoReadMsg> {
+    pub async fn recv_with_steady_deadline(
+        &mut self,
+        mut deadline: Duration,
+        steady_deadline: Duration,
+    ) -> io::Result<CentralIoReadMsg> {
         loop {
-            let res = tokio::time::timeout(deadline, self.recv_pkt()).await
+            let res = tokio::time::timeout(deadline, self.recv_pkt())
+                .await
                 .map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "receive deadline — session timed out",
+                        "receive deadline - session timed out",
                     )
                 })??;
+            deadline = steady_deadline;
             if let Some(res) = res {
                 return Ok(res);
             }

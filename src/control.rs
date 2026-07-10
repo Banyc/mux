@@ -452,9 +452,12 @@ impl MuxControl {
     /// Tear down the read side of a single stream after a reassembly error.
     /// Surfaces a sticky `BrokenPipe` error to the local reader, drops the
     /// reassembly state (so no more frames are ingested for this stream),
-    /// and marks the local read side closed. The caller must also send
-    /// `CloseRead` to the peer so the other side knows to stop sending.
-    /// Sibling streams keep running — only this one stream is affected.
+    /// marks the local read side closed, and treats the peer's write
+    /// direction as closed so the stream-table entry can be retired once
+    /// the local write side and broken-pipe also close. The caller must
+    /// also send `CloseRead` to the peer so the other side knows to stop
+    /// sending. Sibling streams keep running — only this one stream is
+    /// affected.
     async fn reassembly_error_teardown(&mut self, stream_id: StreamId) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return;
@@ -467,12 +470,13 @@ impl MuxControl {
             .send(StreamReadDataMsg::Error(
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "reassembly protocol error — stream read side closed",
+                    "reassembly protocol error - stream read side closed",
                 ),
             ))
             .await;
         stream.reassembly = None;
         stream.is_read_closed = true;
+        stream.is_peer_write_closed = true;
     }
 }
 #[derive(Debug)]
@@ -734,28 +738,28 @@ impl ReorderBuffer {
     /// Record the stream's final byte offset (from CloseWrite). `final_offset`
     /// is a wire offset; it is mapped to absolute space and must be at or
     /// ahead of the cursor. Returns `Err` if `final_offset` is behind the
-    /// cursor, a pending frame extends past it, or it exceeds the forward
-    /// reassembly window.
+    /// cursor or a pending frame extends past it. A duplicate CloseWrite
+    /// with the same final offset is idempotent; a conflicting final offset
+    /// is an error. The final offset consumes no reassembly buffer, so it
+    /// is not bounded by `REASSEMBLY_MAX_RANGE_BYTES`.
     fn set_final_offset(&mut self, final_offset: Offset) -> Result<(), ReassemblyError> {
-        if self.final_offset_abs.is_some() {
-            return Err(ReassemblyError::FinalOffsetBeforeCursor);
-        }
         let Some(fin_abs) = self.wire_to_abs(final_offset) else {
             return Err(ReassemblyError::AmbiguousOffset);
         };
+        if let Some(existing) = self.final_offset_abs {
+            return if fin_abs == existing {
+                Ok(())
+            } else {
+                Err(ReassemblyError::FinalOffsetBeforeCursor)
+            };
+        }
         if fin_abs < self.cursor {
             return Err(ReassemblyError::FinalOffsetBeforeCursor);
         }
-        // No pending frame may extend past final_offset_abs.
         for (&off, data) in &self.pending {
             if off + data.len() as u64 > fin_abs {
                 return Err(ReassemblyError::FinalOffsetBeforeCursor);
             }
-        }
-        // Reject an unbounded final offset: forward distance must fit
-        // within the reassembly range so a gap doesn't pin the reader.
-        if fin_abs - self.cursor > REASSEMBLY_MAX_RANGE_BYTES as u64 {
-            return Err(ReassemblyError::OutOfWindow);
         }
         self.final_offset_abs = Some(fin_abs);
         Ok(())
@@ -1217,20 +1221,23 @@ mod reassembly_tests {
         );
     }
 
-    /// Final offset too far ahead of the cursor is rejected. An unbounded
-    /// final offset would pin a reader forever waiting for bytes that may
-    /// never arrive.
+    /// A final offset far ahead of the cursor is accepted. The final
+    /// offset is a marker that consumes no reassembly buffer, so capping
+    /// it by `REASSEMBLY_MAX_RANGE_BYTES` is wrong: a valid far
+    /// CloseWrite would tear the reader down (OutOfWindow -> teardown)
+    /// and lose subsequently-arriving in-order data. The range cap
+    /// applies only to buffered DATA frames, not to the CloseWrite
+    /// marker.
     #[tokio::test]
-    async fn final_offset_too_far_ahead_is_rejected() {
+    async fn far_final_offset_is_accepted_not_rejected() {
         let mut rb = ReorderBuffer::new();
         rb.cursor = 100;
         // Final offset far beyond REASSEMBLY_MAX_RANGE_BYTES from cursor.
         let far = 100u32.wrapping_add(REASSEMBLY_MAX_RANGE_BYTES as u32 + 1);
-        let err = rb.set_final_offset(far).unwrap_err();
-        assert!(
-            matches!(err, ReassemblyError::OutOfWindow),
-            "final offset too far ahead must be rejected: got {err:?}"
-        );
+        // The far final offset is accepted (not OutOfWindow).
+        rb.set_final_offset(far).unwrap();
+        assert!(rb.final_offset_abs.is_some());
+        assert!(!rb.is_complete(), "cursor 100 hasn't reached the far final");
     }
 
     /// Final offset that wraps past u32::MAX but stays within the forward
@@ -1411,6 +1418,191 @@ mod reassembly_tests {
         assert!(
             matches!(msg, StreamReadDataMsg::Data(_)),
             "sibling stream must progress, got {msg:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Fix 1 acceptance: a far final offset (beyond
+    // REASSEMBLY_MAX_RANGE_BYTES) is accepted; in-order data up to it
+    // advances the cursor and yields Fin.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn far_final_offset_accepted_and_completes() {
+        use std::future::poll_fn;
+
+        let (mut control, _close_tx, _drain) = make_control(true);
+        let mut rx = open_test_stream(&mut control, 9).await;
+
+        // Cursor is 0; no pending data. CloseWrite with final offset
+        // = REASSEMBLY_MAX_RANGE_BYTES + 1 (far beyond the range cap).
+        // This used to return OutOfWindow -> teardown and lose all data.
+        control
+            .peer_close_write_with_offset(9, REASSEMBLY_MAX_RANGE_BYTES as u32 + 1)
+            .await
+            .unwrap();
+
+        // Deliver in-order data up to the final offset in 1 MiB chunks
+        // (16 messages for ~16 MiB) and drain the receiver concurrently
+        // so the bounded channel doesn't block ingestion.
+        let fin = REASSEMBLY_MAX_RANGE_BYTES as u32 + 1;
+        let chunk = vec![0xABu8; 1024 * 1024];
+        let mut off = 0u32;
+        let mut total = 0u64;
+        let mut saw_fin = false;
+        while off < fin || !saw_fin {
+            // Ingest the next chunk if not all delivered yet.
+            if off < fin {
+                let len = ((fin - off) as usize).min(chunk.len());
+                control
+                    .ingest_reassembly(9, off, buf(&chunk[..len]))
+                    .await
+                    .unwrap();
+                off += len as u32;
+            }
+            // Drain whatever is ready on the receiver without blocking.
+            while !saw_fin {
+                match rx.try_recv() {
+                    Ok(StreamReadDataMsg::Data(d)) => total += d.len() as u64,
+                    Ok(StreamReadDataMsg::Fin) => saw_fin = true,
+                    Ok(StreamReadDataMsg::Error(e)) => {
+                        panic!("expected Data/Fin, got Error: {e}");
+                    }
+                    Err(_) => break,
+                }
+            }
+            // If all data is ingested but Fin hasn't arrived yet, poll
+            // the receiver cooperatively until it does.
+            if off == fin && !saw_fin {
+                match poll_fn(|cx| rx.poll_recv(cx)).await {
+                    Ok(StreamReadDataMsg::Data(d)) => total += d.len() as u64,
+                    Ok(StreamReadDataMsg::Fin) => saw_fin = true,
+                    Ok(StreamReadDataMsg::Error(e)) => {
+                        panic!("expected Data/Fin, got Error: {e}");
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        assert_eq!(total, fin as u64, "all bytes up to the far final delivered");
+        assert!(saw_fin, "Fin must arrive");
+    }
+
+    // -----------------------------------------------------------------
+    // Fix 2 acceptance: a duplicate CloseWrite with the SAME final
+    // offset is idempotent. Delayed data after the duplicate is still
+    // delivered, and Fin still arrives.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn duplicate_close_write_is_idempotent() {
+        let (mut control, _close_tx, _drain) = make_control(true);
+        let mut rx = open_test_stream(&mut control, 11).await;
+
+        // Data[0,4).
+        control
+            .ingest_reassembly(11, 0, buf(&[0xAA; 4]))
+            .await
+            .unwrap();
+        // CloseWrite(final=8).
+        control.peer_close_write_with_offset(11, 8).await.unwrap();
+        // Duplicate CloseWrite(final=8) — must be a no-op, NOT a
+        // destructive teardown. (Old code: FinalOffsetBeforeCursor ->
+        // reassembly_error_teardown -> reader gets BrokenPipe and all
+        // later data/FIN is lost.)
+        control.peer_close_write_with_offset(11, 8).await.unwrap();
+        // Delayed Data[4,8).
+        control
+            .ingest_reassembly(11, 4, buf(&[0xBB; 4]))
+            .await
+            .unwrap();
+
+        // Drain: [0,4), [4,8), Fin — no Error.
+        let mut got = Vec::new();
+        let mut saw_fin = false;
+        loop {
+            match rx.try_recv() {
+                Ok(StreamReadDataMsg::Data(d)) => got.extend_from_slice(&d),
+                Ok(StreamReadDataMsg::Fin) => {
+                    saw_fin = true;
+                    break;
+                }
+                Ok(StreamReadDataMsg::Error(e)) => {
+                    panic!("duplicate CloseWrite must not error: {e}");
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got, [0xAA; 4].iter().chain([0xBB; 4].iter()).copied().collect::<Vec<_>>());
+        assert!(saw_fin, "Fin must arrive after the gap fills");
+    }
+
+    // -----------------------------------------------------------------
+    // Fix 3 acceptance: after a reassembly error tears down a stream's
+    // read side, closing the local write side and delivering the peer's
+    // CloseRead + CloseWrite retires the stream-table entry (is_closed
+    // becomes true). Before the fix, is_peer_write_closed was never set
+    // after teardown, so is_closed() never became true and the entry
+    // leaked forever.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stream_retired_after_reassembly_error() {
+        let (mut control, _close_tx, _drain) = make_control(true);
+        let _rx = open_test_stream(&mut control, 13).await;
+
+        // Buffer a later frame [4,8) (cursor stays at 0, gap at 0).
+        control
+            .ingest_reassembly(13, 4, buf(&[0; 4]))
+            .await
+            .unwrap();
+        // Deliver an overlapping earlier frame [2,6) — it overlaps the
+        // buffered [4,8) (successor-overlap check fires) -> Overlap
+        // error -> reassembly_error_teardown.
+        let overlap_err = control.ingest_reassembly(13, 2, buf(&[1; 4])).await;
+        assert!(overlap_err.is_err(), "overlapping frame must error");
+        // ingest_reassembly returns Err but does not tear down; the
+        // handle_central_read caller does that. Mirror it here.
+        control.reassembly_error_teardown(13).await;
+
+        // After teardown, the stream still exists (local write side is
+        // still open), but its read side is closed and — with the fix —
+        // is_peer_write_closed is set so is_closed() can become true
+        // once the local write side and broken-pipe close too.
+        assert!(control.stream_table.contains_key(&13));
+        {
+            let stream = control.stream_table.get(&13).unwrap();
+            assert!(stream.is_read_closed, "teardown sets is_read_closed");
+            assert!(
+                stream.is_peer_write_closed,
+                "teardown must set is_peer_write_closed (Fix 3) so the \
+                 entry can be retired once the local write side closes"
+            );
+            assert!(!stream.is_write_closed, "local write side still open");
+            assert!(
+                !stream.is_closed(),
+                "is_closed() must be false until the local write side \
+                 and broken-pipe also close"
+            );
+        }
+
+        // Close the local write side (simulates the local end closing
+        // the stream for writing).
+        control.local_close(13, Side::Write);
+        // is_closed() is still false: write_broken_pipe isn't closed yet.
+        if let Some(stream) = control.stream_table.get(&13) {
+            assert!(!stream.is_closed(), "write_broken_pipe still open");
+        }
+        // Deliver the peer's CloseRead — this closes write_broken_pipe,
+        // making is_closed() true and retiring the entry.
+        control.peer_close(13, Side::Read).await;
+
+        // The stream-table entry must now be removed (is_closed() became
+        // true inside peer_close, which called clean_closed_stream).
+        assert!(
+            !control.stream_table.contains_key(&13),
+            "stream-table entry must be removed after is_closed() becomes true"
         );
     }
 }

@@ -880,7 +880,7 @@ where
 /// paired with its partner later via [`complete_pairing`].
 pub async fn spawn_dual_mux_acceptor<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     config: MuxConfig,
     hello_deadline: Duration,
 ) -> Result<(LaneClass, PairingNonce, PendingAcceptor), DualMuxError>
@@ -892,14 +892,8 @@ where
         .await
     {
         Ok(Ok(x)) => x,
-        Ok(Err(e)) => {
-            let _ = writer.shutdown().await;
-            return Err(DualMuxError::LaneHello(e));
-        }
-        Err(_) => {
-            let _ = writer.shutdown().await;
-            return Err(DualMuxError::HelloDeadline);
-        }
+        Ok(Err(e)) => return Err(DualMuxError::LaneHello(e)),
+        Err(_) => return Err(DualMuxError::HelloDeadline),
     };
 
     let mut lane_spawner = JoinSet::new();
@@ -936,6 +930,24 @@ impl std::fmt::Debug for PendingAcceptor {
             .field("class", &self.class)
             .field("nonce", &self.nonce)
             .finish_non_exhaustive()
+    }
+}
+
+impl PendingAcceptor {
+    pub fn new(
+        class: LaneClass,
+        nonce: PairingNonce,
+        opener: StreamOpener,
+        accepter: StreamAccepter,
+        spawner: JoinSet<MuxError>,
+    ) -> Self {
+        Self {
+            class,
+            nonce,
+            opener,
+            accepter,
+            spawner,
+        }
     }
 }
 
@@ -1484,5 +1496,208 @@ mod tests {
             "surviving lane must report LaneDead after pair death, got {result:?}"
         );
         let _ = supervisor;
+    }
+
+    // -------------------------------------------------------------------
+    // Birth heartbeat widens the first-receive deadline to steady.
+    //
+    // Regression: the old reader only dropped `first_receive_deadline`
+    // after `recv()` RETURNED a message, but `recv()` swallows heartbeat
+    // frames (recv_pkt returns Ok(None) for Header::Heartbeat and loops
+    // internally), so a heartbeat-only birth never returned from recv(),
+    // the short deadline was never cleared, and the peer's next periodic
+    // heartbeat (heartbeat_interval away) missed the short window. The
+    // fix moves the "switch to steady" to per-recv_pkt granularity: any
+    // packet (heartbeat or data) widens the deadline to steady
+    // immediately.
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_receive_deadline_widens_after_birth_heartbeat() {
+        use crate::serve::spawn_mux_no_reconnection_with_first_receive_deadline;
+
+        // Server side: short first-receive deadline (100 ms) but a
+        // heartbeat_interval (400 ms) longer than it. The steady
+        // deadline is heartbeat_interval * RECEIVE_DEADLINE_INTERVALS
+        // (4) = 1600 ms.
+        let first_receive_deadline = Duration::from_millis(100);
+        let heartbeat_interval = Duration::from_millis(400);
+
+        // Build a transport where we keep the write half feeding the
+        // server's reader so we can inject raw heartbeat frames.
+        // `duplex` returns (a, b): writing to b is read from a.
+        let (server_side, injector_side) = tokio::io::duplex(8192);
+        // The server owns `server_side` (both read + write). We keep
+        // `injector_side` and split it: write half injects frames to
+        // the server reader; read half drains server output so its
+        // writer doesn't break the pipe (must stay alive).
+        let (server_r, server_w) = tokio::io::split(server_side);
+        let (injector_r, injector_w) = tokio::io::split(injector_side);
+        // Keep the injector read half alive so server writes don't get
+        // a broken pipe. We don't need to actually read from it; the
+        // 8192-byte buffer is plenty for the test duration.
+        let _injector_r = injector_r;
+        let mut injector_w = injector_w;
+
+        // Spawn the server mux with the short first-receive deadline.
+        let mut srv_spawner: JoinSet<MuxError> = JoinSet::new();
+        let (_srv_opener, _srv_accepter) = spawn_mux_no_reconnection_with_first_receive_deadline(
+            server_r,
+            server_w,
+            MuxConfig {
+                initiation: Initiation::Server,
+                heartbeat_interval,
+                frame_reassembly: false,
+            },
+            first_receive_deadline,
+            &mut srv_spawner,
+        );
+
+        // Write the birth heartbeat — the first frame the server sees.
+        // After this, the server must widen to the steady deadline.
+        write_birth_heartbeat(&mut injector_w).await.unwrap();
+
+        // Now send nothing for 250 ms — longer than the 100 ms
+        // first-receive deadline, but less than the 1600 ms steady
+        // deadline. With the bug, the server's reader would still be on
+        // the 100 ms deadline at this point (the heartbeat was
+        // swallowed, recv() never returned) and would time out here.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // At this point the buggy reader would already have produced a
+        // "receive deadline" error (100 ms after the birth heartbeat,
+        // i.e. ~150 ms ago). Drain any completed results without
+        // blocking and assert none of them is a receive-deadline
+        // timeout. A healthy session has no completed tasks yet.
+        //
+        // try_join_next is non-blocking: returns None if nothing has
+        // finished. We use a tight loop with try_join_next so we don't
+        // sleep past the point where the bug would be visible.
+        let mut saw_timeout = false;
+        while let Some(res) = srv_spawner.try_join_next() {
+            if let Ok(MuxError::IoReader(ref e)) = res {
+                if e.to_string().contains("receive deadline") {
+                    saw_timeout = true;
+                }
+            }
+        }
+        assert!(
+            !saw_timeout,
+            "server session timed out with 'receive deadline' during the \
+             250 ms gap — the birth heartbeat did not widen the deadline \
+             (bug present)"
+        );
+
+        // Send a normal-interval heartbeat to prove the session is still
+        // alive on the widened (steady) deadline. This frame is only
+        // delivered if the reader is still running (i.e. it did not time
+        // out during the gap).
+        write_birth_heartbeat(&mut injector_w).await.unwrap();
+
+        // Give the reader a moment to process the second heartbeat, then
+        // assert the session is still alive (no completed tasks). A
+        // receive-deadline timeout here would mean the reader died
+        // before the second heartbeat arrived.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Some(res) = srv_spawner.try_join_next() {
+            if let Ok(MuxError::IoReader(ref e)) = res {
+                if e.to_string().contains("receive deadline") {
+                    saw_timeout = true;
+                }
+            }
+        }
+        assert!(
+            !saw_timeout,
+            "server session timed out with 'receive deadline' — the \
+             birth heartbeat did not widen the deadline (bug present)"
+        );
+
+        // Clean up.
+        srv_spawner.abort_all();
+    }
+
+    // -------------------------------------------------------------------
+    // spawn_dual_mux_acceptor: hello_deadline returns despite a writer
+    // whose poll_shutdown never readies.
+    //
+    // Regression: the old rejection arms ran
+    // `let _ = writer.shutdown().await;` before returning. If the
+    // writer's `AsyncWrite::poll_shutdown` stays `Poll::Pending`
+    // indefinitely (a backpressured or never-ready peer), that await
+    // hangs forever, defeating the hello_deadline and leaking the
+    // accept. The fix drops the writer on rejection instead of awaiting
+    // a graceful shutdown.
+    // -------------------------------------------------------------------
+
+    /// A writer whose `poll_shutdown` always returns `Poll::Pending`,
+    /// simulating a backpressured / never-ready peer. Writes are
+    /// discarded so `write_all` doesn't interfere with the test.
+    struct PendingShutdownWriter;
+
+    impl AsyncWrite for PendingShutdownWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Never readies — this is the condition that used to hang
+            // the rejection path.
+            Poll::Pending
+        }
+    }
+
+    /// A reader that never yields any bytes, so `read_lane_hello`
+    /// blocks until the hello_deadline elapses.
+    struct NeverReader;
+
+    impl AsyncRead for NeverReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hello_deadline_returns_despite_pending_shutdown() {
+        let hello_deadline = Duration::from_millis(50);
+
+        let start = std::time::Instant::now();
+        let result = spawn_dual_mux_acceptor(
+            NeverReader,
+            PendingShutdownWriter,
+            srv_config(),
+            hello_deadline,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(DualMuxError::HelloDeadline)),
+            "expected Err(HelloDeadline), got {result:?}"
+        );
+        // Must NOT hang: it returns within a small multiple of
+        // hello_deadline. With the bug, `writer.shutdown().await` on
+        // `PendingShutdownWriter` would never complete, so this test
+        // would hang past the timeout and fail (or never return).
+        assert!(
+            elapsed < hello_deadline * 3,
+            "returned in {elapsed:?}, expected < 3× hello_deadline \
+             ({:?}); a hang would blow past this bound",
+            hello_deadline * 3
+        );
     }
 }
