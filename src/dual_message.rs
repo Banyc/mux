@@ -599,74 +599,85 @@ mod tests {
     // Sender semaphore backpressure
     // -------------------------------------------------------------------
 
-    /// The semaphore bounds in-flight sends. With a tiny transport buffer
-    /// and concurrent sends, the semaphore limits how many sends are
-    /// truly in-flight at once.
+    /// The semaphore bounds in-flight sends. Both lanes' transport peer
+    /// halves are held alive but NEVER read, so once the 128 B duplex
+    /// buffer plus all in-process buffering (< ~600 KiB) saturates under
+    /// 1 MiB payloads, writes park forever and permits are held.
     ///
-    /// The transport end is an UNREAD duplex half (NOT a live mux peer):
-    /// a live mux peer's central reader drains the wire (heartbeats /
-    /// control) even before `accept()`, silently absorbing megabytes and
-    /// defeating the backpressure assertion. An unread duplex half has no
-    /// draining task, so once its kernel buffer fills, writes block.
+    /// This replaces a timing-based assert that counted completed sends
+    /// inside a fixed sleep window, which was racy because the semaphore
+    /// bounds concurrency (not throughput per unit time).
     #[tokio::test(flavor = "multi_thread")]
     async fn semaphore_backpressure_limits_inflight() {
         use std::sync::atomic::AtomicUsize;
         use tokio::sync::Barrier;
+        use tokio::time::timeout;
 
-        // Tiny duplex — fills fast, so writes don't complete instantly.
-        // Nobody reads the other end, so once full, writes block.
-        let (_cli_r, srv_w) = duplex(128);
-        let (srv_r, _cli_w) = duplex(128);
+        // Both lanes: peer halves held alive but never read — writes park
+        // once transport + in-process buffering saturates.
+        let (_int_peer, int_local) = duplex(128);
+        let (int_r, int_w) = tokio::io::split(int_local);
+        let (_bulk_peer, bulk_local) = duplex(128);
+        let (bulk_r, bulk_w) = tokio::io::split(bulk_local);
 
-        let mut srv_spawner = JoinSet::new();
-        let (srv_opener, _srv_accepter) = spawn_mux_no_reconnection(
-            srv_r,
-            srv_w,
-            config(),
-            &mut srv_spawner,
-        );
-
-        // Bulk lane: an unread duplex half with NO mux peer spawned on
-        // the reader side. The opener is fed by a mux session whose
-        // transport is a fresh duplex with no peer draining it.
-        let (bulk_srv_r, bulk_srv_w) = duplex(128);
-        let (_bulk_peer_r, _bulk_peer_w) = duplex(128); // dropped — nobody reads
+        let cfg = config();
+        let mut int_spawner = JoinSet::new();
+        let (int_opener, _int_acc) =
+            spawn_mux_no_reconnection(int_r, int_w, cfg.clone(), &mut int_spawner);
         let mut bulk_spawner = JoinSet::new();
-        let (bulk_opener, _) =
-            spawn_mux_no_reconnection(bulk_srv_r, bulk_srv_w, config(), &mut bulk_spawner);
+        let (bulk_opener, _bulk_acc) =
+            spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
+        // Keep spawners alive so mux session tasks keep running.
+        tokio::task::spawn(async move { let _ = int_spawner.join_next().await; });
         tokio::task::spawn(async move { let _ = bulk_spawner.join_next().await; });
 
-        let opener = DualStreamOpener::new(srv_opener, bulk_opener, Liveness::new());
+        let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
         let tx = Arc::new(
             DualMessageSender::new(opener, DeliveryMode::Unordered)
                 .with_max_inflight(2),
         );
+        let semaphore = tx.semaphore.clone();
 
-        // Barrier ensures tasks start concurrently.
         let barrier = Arc::new(Barrier::new(10));
         let finished = Arc::new(AtomicUsize::new(0));
+        let payload = vec![0u8; 1 << 20]; // 1 MiB > all in-process buffering
 
         let mut handles = Vec::new();
-        for i in 0..10u8 {
+        for _ in 0..10 {
             let tx = tx.clone();
             let barrier = barrier.clone();
             let finished = finished.clone();
+            let payload = payload.clone();
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let r = tx.send(&[i; 500]).await;
+                let _ = tx.send(&payload).await;
                 finished.fetch_add(1, Ordering::SeqCst);
-                r
             }));
         }
 
-        // Let them run briefly — at most 2 should finish quickly
-        // (filled the tiny transport buffer; permits are held).
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let done = finished.load(Ordering::SeqCst);
-        assert!(done <= 2, "at most 2 permits, but {done} finished at start");
+        // Wait for the semaphore to saturate — exactly 2 permits held.
+        timeout(Duration::from_secs(5), async {
+            while semaphore.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("semaphore never reached 0 — inflight bound not enforced");
 
-        // Wait for all to complete.
+        // After a brief settle, permits must STAY at 0 and no send finished.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "permits must remain at 0 while writes are parked"
+        );
+        let done = finished.load(Ordering::SeqCst);
+        assert_eq!(
+            done, 0,
+            "no sends should have completed while writes are parked, but {done} finished"
+        );
+
         drop(tx);
         for h in handles {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
