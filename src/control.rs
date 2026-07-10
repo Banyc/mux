@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    io,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,7 +16,7 @@ use crate::{
         DeadCentralIo,
     },
     common::Side,
-    protocol::{offset_less, Offset, StreamId},
+    protocol::{Offset, StreamId},
     stream::{
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
@@ -72,6 +73,7 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                     &mut control,
                     &stream_close_tx,
                     &mut stream_init_handle,
+                    &write_control_tx,
                     msg
                 ).await {
                     Ok(()) => (),
@@ -124,6 +126,7 @@ async fn handle_central_read(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
     stream_init_handle: &mut StreamInitHandle,
+    write_control_tx: &WriteControlTx,
     msg: CentralIoReadMsg,
 ) -> Result<(), HandleCentralReadError> {
     match msg {
@@ -148,9 +151,35 @@ async fn handle_central_read(
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
+                // CloseWrite-before-Open: implicitly create the stream and
+                // route the accept message exactly once.
+                if !control.stream_table.contains_key(&stream_id) {
+                    let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
+                    match res {
+                        Ok((_, stream)) => {
+                            if stream_init_handle
+                                .stream_accept_tx
+                                .send(stream)
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        Err(ControlOpenError::TooManyOpenStreams(_)) => {
+                            return Ok(());
+                        }
+                        Err(ControlOpenError::DeadCentralIo(e)) => {
+                            return Err(HandleCentralReadError::DeadCentralIo(e));
+                        }
+                    }
+                }
                 if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await
                 {
-                    control.local_close(stream_id, Side::Read);
+                    control.reassembly_error_teardown(stream_id);
+                    let _ = write_control_tx
+                        .send(WriteControlMsg::Close(stream_id, Side::Read))
+                        .await;
                 }
             } else {
                 control.peer_close(stream_id, side).await;
@@ -158,12 +187,38 @@ async fn handle_central_read(
         }
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
             if control.frame_reassembly {
+                // Data-before-Open: implicitly create the stream and route
+                // the accept message exactly once.
+                if !control.stream_table.contains_key(&stream_id) {
+                    let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
+                    match res {
+                        Ok((_, stream)) => {
+                            if stream_init_handle
+                                .stream_accept_tx
+                                .send(stream)
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        Err(ControlOpenError::TooManyOpenStreams(_)) => {
+                            return Ok(());
+                        }
+                        Err(ControlOpenError::DeadCentralIo(e)) => {
+                            return Err(HandleCentralReadError::DeadCentralIo(e));
+                        }
+                    }
+                }
                 if control
-                    .ingest_reassembly(stream_id, offset, data_buf, stream_close_tx)
+                    .ingest_reassembly(stream_id, offset, data_buf)
                     .await
                     .is_err()
                 {
-                    control.local_close(stream_id, Side::Read);
+                    control.reassembly_error_teardown(stream_id);
+                    let _ = write_control_tx
+                        .send(WriteControlMsg::Close(stream_id, Side::Read))
+                        .await;
                 }
             } else {
                 let Some(dispatcher) = control.dispatcher(stream_id) else {
@@ -176,6 +231,7 @@ async fn handle_central_read(
     }
     Ok(())
 }
+#[derive(Debug)]
 enum HandleCentralReadError {
     DeadCentralIo(DeadCentralIo),
     DeadStreamInit(DeadStreamInit),
@@ -321,25 +377,17 @@ impl MuxControl {
     /// reorder buffer, releasing any newly-contiguous bytes to the reader.
     /// Returns `Err(())` if the frame is a protocol error on this stream
     /// (out-of-window offset, or a duplicate/overlapping range that the
-    /// buffer cannot accept); the caller closes the stream's read side but
-    /// leaves the session alive.
+    /// buffer cannot accept); the caller tears down the stream's read side
+    /// but leaves the session alive.
     ///
-    /// If the stream is unknown (Data arrived before Open), it is created
-    /// implicitly via the normal open path so the peer's Open (when it
-    /// arrives) is a no-op.
+    /// The stream MUST already exist in the stream table; the caller handles
+    /// the Data-before-Open implicit create + route-accept flow.
     async fn ingest_reassembly(
         &mut self,
         stream_id: StreamId,
         offset: Offset,
         data: crate::central_io::DataBuf,
-        stream_close_tx: &StreamCloseTxPrototype,
     ) -> Result<(), ()> {
-        if !self.stream_table.contains_key(&stream_id) {
-            let res = open_stream(self, stream_close_tx, Some(stream_id)).await;
-            if res.is_err() {
-                return Err(());
-            }
-        }
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return Err(());
         };
@@ -399,6 +447,26 @@ impl MuxControl {
                 .await;
         }
         Ok(())
+    }
+
+    /// Tear down the read side of a single stream after a reassembly error.
+    /// Surfaces a sticky `BrokenPipe` error to the local reader, drops the
+    /// reassembly state (so no more frames are ingested for this stream),
+    /// and marks the local read side closed. The caller must also send
+    /// `CloseRead` to the peer so the other side knows to stop sending.
+    /// Sibling streams keep running — only this one stream is affected.
+    fn reassembly_error_teardown(&mut self, stream_id: StreamId) {
+        let Some(stream) = self.stream_table.get_mut(&stream_id) else {
+            return;
+        };
+        let _ = stream.read_dispatcher.send(StreamReadDataMsg::Error(
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "reassembly protocol error — stream read side closed",
+            ),
+        ));
+        stream.reassembly = None;
+        stream.is_read_closed = true;
     }
 }
 #[derive(Debug)]
@@ -491,28 +559,33 @@ pub const REASSEMBLY_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 pub const REASSEMBLY_MAX_RANGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Per-stream reorder buffer for frame-reassembly mode. Holds
-/// out-of-order Data frames keyed by their byte offset and releases
-/// contiguous bytes to the reader strictly in offset order.
+/// out-of-order Data frames keyed by their absolute byte offset (u64)
+/// and releases contiguous bytes to the reader strictly in offset order.
 ///
-/// Frames are stored in a `BTreeMap<Offset, DataBuf>` so the
-/// lowest-offset pending frame is always at the front. `ingest`
-/// rejects duplicates, overlaps, out-of-window offsets, and
-/// overflow of the buffered-bytes / range bounds. `drain_contiguous`
-/// pops every frame whose offset equals `next_offset` and advances.
+/// A monotonic absolute u64 cursor avoids numeric-u32 wrap bugs: wire
+/// offsets are mapped to absolute positions by signed serial distance
+/// from the cursor, so a frame that wraps past u32::MAX while a near-0
+/// frame is buffered still orders correctly. Pending frames are stored
+/// in a `BTreeMap<u64, DataBuf>` so the lowest-offset pending frame is
+/// always at the front. `ingest` rejects duplicates, overlaps, out-of-
+/// window offsets, and overflow of the buffered-bytes / range bounds.
+/// `drain_contiguous` pops every frame whose absolute offset equals
+/// `cursor` and advances.
 #[derive(Debug)]
 struct ReorderBuffer {
-    /// Next byte offset to deliver (the reader's contiguous cursor).
-    next_offset: Offset,
-    /// Pending frames keyed by their start offset. Always contains
-    /// only frames strictly ahead of `next_offset` (drain removes
-    /// contiguous ones immediately).
-    pending: BTreeMap<Offset, crate::central_io::DataBuf>,
+    /// Next byte to deliver (the reader's contiguous cursor) in absolute
+    /// u64 space. Starts at 0 and grows monotonically; never wraps.
+    cursor: u64,
+    /// Pending frames keyed by their absolute start offset. Always contains
+    /// only frames strictly ahead of `cursor` (drain removes contiguous
+    /// ones immediately).
+    pending: BTreeMap<u64, crate::central_io::DataBuf>,
     /// Total bytes currently buffered across all pending frames.
     buffered_bytes: usize,
-    /// Highest byte offset the stream will ever receive, set by
-    /// CloseWrite. The stream is complete once `next_offset` reaches
-    /// this value. `None` until CloseWrite arrives.
-    final_offset: Option<Offset>,
+    /// Highest absolute byte offset the stream will ever receive, set by
+    /// CloseWrite. The stream is complete once `cursor` reaches this
+    /// value. `None` until CloseWrite arrives.
+    final_offset_abs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -522,94 +595,101 @@ enum ReassemblyError {
     BufferOverflow,
     RangeOverflow,
     FinalOffsetBeforeCursor,
+    AmbiguousOffset,
 }
 
 impl ReorderBuffer {
     fn new() -> Self {
         Self {
-            next_offset: 0,
+            cursor: 0,
             pending: BTreeMap::new(),
             buffered_bytes: 0,
-            final_offset: None,
+            final_offset_abs: None,
         }
     }
 
+    /// Map a wire `Offset` to its absolute u64 position relative to the
+    /// current `cursor`. Returns `None` when the distance is the exact
+    /// 2³¹ ambiguity (both "2³¹ ahead" and "2³¹ behind" are equally
+    /// valid interpretations — reject the frame as ambiguous).
+    fn wire_to_abs(&self, wire: Offset) -> Option<u64> {
+        let cursor_wire = self.cursor as u32;
+        let dist = wire.wrapping_sub(cursor_wire) as i32;
+        if dist == i32::MIN {
+            return None;
+        }
+        Some((self.cursor as i64 + dist as i64) as u64)
+    }
+
     /// Ingest one complete frame at `offset`. Duplicates (offset+len ≤
-    /// next_offset) are silently dropped (idempotent). Overlaps and
+    /// cursor) are silently dropped (idempotent). Overlaps and
     /// out-of-window offsets are errors.
     fn ingest(
         &mut self,
         offset: Offset,
-        data: crate::central_io::DataBuf,
+        mut data: crate::central_io::DataBuf,
     ) -> Result<(), ReassemblyError> {
-        // Zero-length frames are no-ops (a writer may emit them e.g. when
-        // a write is split at exactly BodyLen::MAX and the final chunk is
-        // empty). Drop silently.
         if data.is_empty() {
             return Ok(());
         }
-        let len = data.len() as u32;
-        let end = offset.wrapping_add(len);
-        // If final_offset is set, the frame must lie entirely within
-        // [.. final_offset). A frame starting at or past it, or ending
-        // past it, is a protocol error.
-        if let Some(fin) = self.final_offset {
-            if !offset_less(offset, fin) {
-                return Err(ReassemblyError::FinalOffsetBeforeCursor);
-            }
-            if offset_less(fin, end) && fin != end {
-                return Err(ReassemblyError::FinalOffsetBeforeCursor);
-            }
-        }
-        // Already fully delivered (end ≤ next_offset in wrap-aware
-        // terms): idempotent drop. `end == next_offset` is also fully
-        // delivered.
-        if !offset_less(self.next_offset, end) {
+        let Some(mut abs) = self.wire_to_abs(offset) else {
+            return Err(ReassemblyError::AmbiguousOffset);
+        };
+        let len = data.len() as u64;
+        let mut end_abs = abs + len;
+        // Already fully delivered: idempotent drop.
+        if end_abs <= self.cursor {
             return Ok(());
         }
-        // Out-of-window: offset too far ahead of next_offset (gap >
-        // REASSEMBLY_MAX_RANGE_BYTES). Implies a gap larger than 2 GiB
-        // or a corrupt/malicious sender.
-        if offset_less(self.next_offset, offset) {
-            let gap = offset.wrapping_sub(self.next_offset) as usize;
-            if gap > REASSEMBLY_MAX_RANGE_BYTES {
-                return Err(ReassemblyError::OutOfWindow);
+        // If final_offset_abs is set, the frame must lie entirely within
+        // [.. final_offset_abs).
+        if let Some(fin) = self.final_offset_abs {
+            if abs >= fin {
+                return Err(ReassemblyError::FinalOffsetBeforeCursor);
+            }
+            if end_abs > fin {
+                return Err(ReassemblyError::FinalOffsetBeforeCursor);
             }
         }
-        // Overlap with next_offset: trim the already-delivered prefix so
-        // the frame starts exactly at next_offset. If the frame is
-        // entirely behind next_offset it was caught by the early
-        // already-delivered check.
-        let (mut offset, mut data) = (offset, data);
-        if offset_less(offset, self.next_offset) {
-            let trim = self.next_offset.wrapping_sub(offset) as usize;
+        // Out-of-window: offset too far ahead of cursor.
+        if abs > self.cursor && abs - self.cursor > REASSEMBLY_MAX_RANGE_BYTES as u64 {
+            return Err(ReassemblyError::OutOfWindow);
+        }
+        // Trim already-delivered prefix.
+        if abs < self.cursor {
+            let trim = (self.cursor - abs) as usize;
             if trim >= data.len() {
                 return Ok(());
             }
-            // Keep the suffix starting at `trim`; drop the already-
-            // delivered prefix.
             data.drain(..trim);
-            offset = self.next_offset;
+            abs = self.cursor;
+            end_abs = abs + data.len() as u64;
         }
-        let len = data.len() as u32;
-        let end = offset.wrapping_add(len);
-        // Exact duplicate of a buffered frame (same offset, same len):
-        // idempotent drop.
-        if let Some(existing) = self.pending.get(&offset) {
-            if existing.len() as u32 == len {
+        let len = data.len() as u64;
+        // Exact duplicate of a buffered frame (same offset, same len).
+        if let Some(existing) = self.pending.get(&abs) {
+            if existing.len() as u64 == len {
                 return Ok(());
             }
             return Err(ReassemblyError::Overlap);
         }
-        // Overlap with a preceding buffered frame whose range extends
-        // into ours: error (partial overlaps aren't trim-able without
-        // splitting the existing frame, which we reject for simplicity).
-        if let Some((&prev_off, prev_data)) = self.pending.range(..offset).next_back() {
-            let prev_end = prev_off.wrapping_add(prev_data.len() as u32);
-            if offset_less(offset, prev_end) {
-                if prev_end == end && prev_data.len() as u32 == len {
-                    return Ok(()); // exact dup of a buffered frame
+        // Predecessor overlap: does the immediately-preceding buffered
+        // frame extend into our range?
+        if let Some((&prev_abs, prev_data)) = self.pending.range(..abs).next_back() {
+            let prev_end = prev_abs + prev_data.len() as u64;
+            if abs < prev_end {
+                if prev_end == end_abs && prev_data.len() as u64 == len {
+                    return Ok(());
                 }
+                return Err(ReassemblyError::Overlap);
+            }
+        }
+        // Successor overlap: does our frame extend into the immediately-
+        // following buffered frame? (Missing in the old u32-keyed BTreeMap
+        // — a predecessor-only check falsely rejects a valid frame that
+        // wraps past u32::MAX while a near-0 frame is buffered.)
+        if let Some((&succ_abs, _succ_data)) = self.pending.range(abs + 1..).next() {
+            if end_abs > succ_abs {
                 return Err(ReassemblyError::Overlap);
             }
         }
@@ -621,59 +701,63 @@ impl ReorderBuffer {
         if new_buffered > REASSEMBLY_MAX_BUFFERED_BYTES {
             return Err(ReassemblyError::BufferOverflow);
         }
-        if offset_less(self.next_offset, offset) {
-            let gap = offset.wrapping_sub(self.next_offset) as usize;
-            if gap + data.len() > REASSEMBLY_MAX_RANGE_BYTES {
-                return Err(ReassemblyError::RangeOverflow);
-            }
+        if abs > self.cursor && (abs - self.cursor) as usize + data.len() > REASSEMBLY_MAX_RANGE_BYTES {
+            return Err(ReassemblyError::RangeOverflow);
         }
         self.buffered_bytes = new_buffered;
-        self.pending.insert(offset, data);
+        self.pending.insert(abs, data);
         Ok(())
     }
 
-    /// Pop every contiguous frame starting at `next_offset` and advance
-    /// the cursor. Returns the released frames in offset order.
+    /// Pop every contiguous frame starting at `cursor` and advance the
+    /// cursor. Returns the released frames in offset order.
     fn drain_contiguous(&mut self) -> Vec<crate::central_io::DataBuf> {
         let mut out = Vec::new();
         loop {
-            let off = self.next_offset;
-            let Some(entry) = self.pending.remove_entry(&off) else {
+            let Some(entry) = self.pending.remove_entry(&self.cursor) else {
                 break;
             };
-            let len = entry.1.len() as u32;
+            let len = entry.1.len() as u64;
             self.buffered_bytes = self.buffered_bytes.saturating_sub(entry.1.len());
-            self.next_offset = off.wrapping_add(len);
+            self.cursor += len;
             out.push(entry.1);
         }
         out
     }
 
-    /// Record the stream's final byte offset (from CloseWrite). Returns
-    /// `Err` if `final_offset` is behind the delivered cursor or a
-    /// pending frame extends past it.
+    /// Record the stream's final byte offset (from CloseWrite). `final_offset`
+    /// is a wire offset; it is mapped to absolute space and must be at or
+    /// ahead of the cursor. Returns `Err` if `final_offset` is behind the
+    /// cursor, a pending frame extends past it, or it exceeds the forward
+    /// reassembly window.
     fn set_final_offset(&mut self, final_offset: Offset) -> Result<(), ReassemblyError> {
-        if self.final_offset.is_some() {
+        if self.final_offset_abs.is_some() {
             return Err(ReassemblyError::FinalOffsetBeforeCursor);
         }
-        // final_offset must be >= next_offset (in wrap-aware terms).
-        if offset_less(final_offset, self.next_offset) {
+        let Some(fin_abs) = self.wire_to_abs(final_offset) else {
+            return Err(ReassemblyError::AmbiguousOffset);
+        };
+        if fin_abs < self.cursor {
             return Err(ReassemblyError::FinalOffsetBeforeCursor);
         }
-        // No pending frame may extend past final_offset.
+        // No pending frame may extend past final_offset_abs.
         for (&off, data) in &self.pending {
-            let end = off.wrapping_add(data.len() as u32);
-            if offset_less(final_offset, end) {
+            if off + data.len() as u64 > fin_abs {
                 return Err(ReassemblyError::FinalOffsetBeforeCursor);
             }
         }
-        self.final_offset = Some(final_offset);
+        // Reject an unbounded final offset: forward distance must fit
+        // within the reassembly range so a gap doesn't pin the reader.
+        if fin_abs - self.cursor > REASSEMBLY_MAX_RANGE_BYTES as u64 {
+            return Err(ReassemblyError::OutOfWindow);
+        }
+        self.final_offset_abs = Some(fin_abs);
         Ok(())
     }
 
     /// True once the delivered cursor has reached the final offset.
     fn is_complete(&self) -> bool {
-        self.final_offset == Some(self.next_offset)
+        self.final_offset_abs == Some(self.cursor)
     }
 }
 
@@ -747,7 +831,7 @@ mod reassembly_tests {
         rb.ingest(0, buf(&[0xAA; 4])).unwrap();
         let out = collect(rb.drain_contiguous());
         assert_eq!(out, [0xAA, 0xAA, 0xAA, 0xAA, 0xDD, 0xDD, 0xDD, 0xDD]);
-        assert_eq!(rb.next_offset, 8);
+        assert_eq!(rb.cursor, 8);
     }
 
     /// Duplicate and overlapping ranges are dropped idempotently (exact
@@ -758,7 +842,7 @@ mod reassembly_tests {
         rb.ingest(0, buf(&[1, 2, 3, 4])).unwrap();
         let out = collect(rb.drain_contiguous());
         assert_eq!(out, [1, 2, 3, 4]);
-        assert_eq!(rb.next_offset, 4);
+        assert_eq!(rb.cursor, 4);
 
         // Exact duplicate (already delivered): idempotent.
         rb.ingest(0, buf(&[1, 2, 3, 4])).unwrap();
@@ -776,19 +860,28 @@ mod reassembly_tests {
         let err = rb.ingest(10, buf(&[9, 10])).unwrap_err();
         assert!(matches!(err, ReassemblyError::Overlap));
 
-        // Overlap with next_offset (partially delivered): trimmed.
-        rb.ingest(6, buf(&[11, 12, 13, 14])).unwrap();
-        // offset 6 < next_offset 4? No, 6 > 4. This is a normal frame at 6,
-        // filling the gap. Let's test actual overlap with next_offset:
+        // A frame at offset 6 overlaps with the buffered frame at 8
+        // (6..10 vs 8..12). This is now detected by the successor check.
+        let err = rb.ingest(6, buf(&[11, 12, 13, 14])).unwrap_err();
+        assert!(matches!(err, ReassemblyError::Overlap));
+
+        // To fill the gap properly, use offset 4 with length 4.
+        rb.ingest(4, buf(&[21, 22, 23, 24])).unwrap();
+        let out = collect(rb.drain_contiguous());
+        assert_eq!(out, [21, 22, 23, 24, 5, 6, 7, 8]);
+        assert_eq!(rb.cursor, 12);
+
+        // Overlap with cursor (partially delivered): trimmed.
+        // Let's test actual overlap with cursor:
         let mut rb2 = ReorderBuffer::new();
         rb2.ingest(0, buf(&[1, 2, 3, 4])).unwrap();
         let _ = collect(rb2.drain_contiguous());
-        // next_offset is now 4. A frame at offset 2 with 6 bytes overlaps
+        // cursor is now 4. A frame at offset 2 with 6 bytes overlaps
         // the delivered prefix [2,4); the suffix [4,8) should be kept.
         rb2.ingest(2, buf(&[10, 20, 30, 40, 50, 60])).unwrap();
         let out = collect(rb2.drain_contiguous());
         assert_eq!(out, [30, 40, 50, 60]);
-        assert_eq!(rb2.next_offset, 8);
+        assert_eq!(rb2.cursor, 8);
     }
 
     /// Overflow of REASSEMBLY_MAX_BUFFERED_BYTES kills the stream (returns
@@ -799,7 +892,7 @@ mod reassembly_tests {
         // A frame far ahead creates a large gap. Fill it with a big frame
         // at offset 0 (so next_offset advances), then test the buffered-
         // bytes bound by exceeding it.
-        // First, advance next_offset to 4.
+        // First, advance cursor to 4.
         rb.ingest(0, buf(&[0; 4])).unwrap();
         let _ = collect(rb.drain_contiguous());
 
@@ -835,25 +928,23 @@ mod reassembly_tests {
         // Deliver a frame ending exactly at u32::MAX - 3.
         rb.ingest(0, buf(&[0xAB; 4])).unwrap();
         let _ = collect(rb.drain_contiguous());
-        assert_eq!(rb.next_offset, 4);
+        assert_eq!(rb.cursor, 4);
 
-        // Advance to near the wrap point.
-        rb.next_offset = 0xFFFF_FFFC;
+        // Advance to near the wrap point in absolute space.
+        rb.cursor = 0xFFFF_FFFC;
         rb.ingest(0xFFFF_FFFC, buf(&[1, 2, 3, 4])).unwrap();
         let out = collect(rb.drain_contiguous());
         assert_eq!(out, [1, 2, 3, 4]);
-        assert_eq!(rb.next_offset, 0, "wrapped to 0");
+        assert_eq!(rb.cursor, 0x1_0000_0000, "cursor advanced past u32::MAX");
 
-        // A frame at offset 0 is now the next expected; a frame at
-        // 0xFFFF_FFF8 is "before" next_offset (already delivered in
-        // wrap-aware terms).
+        // A frame at offset 0 maps to absolute 0x1_0000_0000 (via signed serial
+        // distance from cursor 0x1_0000_0000 → 0), which is the next expected.
         rb.ingest(0, buf(&[5, 6, 7, 8])).unwrap();
         let out = collect(rb.drain_contiguous());
         assert_eq!(out, [5, 6, 7, 8]);
-        assert_eq!(rb.next_offset, 4);
 
-        // An "old" frame (offset behind next_offset in wrap space) is
-        // idempotently dropped.
+        // An "old" frame at wire offset 0xFFFF_FFF8 maps far behind the
+        // absolute cursor and is idempotently dropped.
         rb.ingest(0xFFFF_FFF8, buf(&[0; 4])).unwrap();
         assert!(rb.drain_contiguous().is_empty());
     }
@@ -898,18 +989,18 @@ mod reassembly_tests {
     /// reassembles independently.
     #[tokio::test]
     async fn streams_pass_each_other() {
-        let (mut control, close_tx, _drain) = make_control(true);
+        let (mut control, _close_tx, _drain) = make_control(true);
         let mut rx_a = open_test_stream(&mut control, 100).await;
         let mut rx_b = open_test_stream(&mut control, 200).await;
 
         // Stream A: deliver offset 4 first (gap at 0).
         control
-            .ingest_reassembly(100, 4, buf(&[0xAA; 4]), &close_tx)
+            .ingest_reassembly(100, 4, buf(&[0xAA; 4]))
             .await
             .unwrap();
         // Stream B: deliver offset 0 (complete).
         control
-            .ingest_reassembly(200, 0, buf(&[0xBB; 4]), &close_tx)
+            .ingest_reassembly(200, 0, buf(&[0xBB; 4]))
             .await
             .unwrap();
 
@@ -927,7 +1018,7 @@ mod reassembly_tests {
 
         // Fill A's gap.
         control
-            .ingest_reassembly(100, 0, buf(&[0xAA; 4]), &close_tx)
+            .ingest_reassembly(100, 0, buf(&[0xAA; 4]))
             .await
             .unwrap();
         // Two frames now deliver: [0..4] and [4..8].
@@ -942,28 +1033,30 @@ mod reassembly_tests {
         assert_eq!(got, [0xAA; 8]);
     }
 
-    /// Data for an unknown stream_id implicitly creates the stream; a
-    /// later Open is a no-op.
+    /// Data for an unknown stream_id is rejected by ingest_reassembly
+    /// (the implicit-open responsibility moved to handle_central_read).
+    /// Pre-open the stream to exercise ingestion.
     #[tokio::test]
     async fn data_before_open_implicitly_creates_stream() {
-        let (mut control, close_tx, _drain) = make_control(true);
+        let (mut control, _close_tx, _drain) = make_control(true);
 
-        // Data for stream 42 arrives before Open.
+        // Pre-open stream 42 (the control loop handles Data-before-Open
+        // implicit creation and routes the accept message; we test the
+        // ingestion path here).
+        open_test_stream(&mut control, 42).await;
+
+        // Data for stream 42: ingestion works because the stream exists.
         control
-            .ingest_reassembly(42, 0, buf(&[1, 2, 3]), &close_tx)
+            .ingest_reassembly(42, 0, buf(&[1, 2, 3]))
             .await
             .unwrap();
 
-        // Stream 42 now exists (implicitly created).
-        assert!(control.stream_table.contains_key(&42));
-
-        // Open for stream 42 is a no-op (stream already exists).
-        // handle_central_read checks stream_table and short-circuits.
+        // Stream 42 exists.
         assert!(control.stream_table.contains_key(&42));
 
         // Ingest another frame; it delivers.
         control
-            .ingest_reassembly(42, 3, buf(&[4, 5]), &close_tx)
+            .ingest_reassembly(42, 3, buf(&[4, 5]))
             .await
             .unwrap();
     }
@@ -972,16 +1065,16 @@ mod reassembly_tests {
     /// frames arrive after the CloseWrite frame (reordering).
     #[tokio::test]
     async fn closewrite_final_offset_completes_stream_despite_reordering() {
-        let (mut control, close_tx, _drain) = make_control(true);
+        let (mut control, _close_tx, _drain) = make_control(true);
         let mut rx = open_test_stream(&mut control, 7).await;
 
         // Deliver offset 0 and offset 4 (total 8 bytes).
         control
-            .ingest_reassembly(7, 0, buf(&[0; 4]), &close_tx)
+            .ingest_reassembly(7, 0, buf(&[0; 4]))
             .await
             .unwrap();
         control
-            .ingest_reassembly(7, 4, buf(&[1; 4]), &close_tx)
+            .ingest_reassembly(7, 4, buf(&[1; 4]))
             .await
             .unwrap();
 
@@ -996,12 +1089,12 @@ mod reassembly_tests {
         assert!(matches!(msg, StreamReadDataMsg::Fin));
 
         // Reordered case: CloseWrite arrives BEFORE the last Data frame.
-        let (mut control2, close_tx2, _drain2) = make_control(true);
+        let (mut control2, _close_tx2, _drain2) = make_control(true);
         let mut rx2 = open_test_stream(&mut control2, 8).await;
 
         // Deliver offset 0, then CloseWrite(final=8) — gap at 4.
         control2
-            .ingest_reassembly(8, 0, buf(&[0; 4]), &close_tx2)
+            .ingest_reassembly(8, 0, buf(&[0; 4]))
             .await
             .unwrap();
         control2.peer_close_write_with_offset(8, 8).await.unwrap();
@@ -1016,7 +1109,7 @@ mod reassembly_tests {
 
         // Now fill the gap (CloseWrite arrived before this Data frame).
         control2
-            .ingest_reassembly(8, 4, buf(&[1; 4]), &close_tx2)
+            .ingest_reassembly(8, 4, buf(&[1; 4]))
             .await
             .unwrap();
         let msg = rx2.try_recv().expect("second frame delivered");
@@ -1029,7 +1122,7 @@ mod reassembly_tests {
     /// reassembles correctly by offset (guards the u16 body_len split).
     #[tokio::test]
     async fn multi_frame_write_reassembles_by_offset() {
-        let (mut control, close_tx, _drain) = make_control(true);
+        let (mut control, _close_tx, _drain) = make_control(true);
         let mut rx = open_test_stream(&mut control, 5).await;
 
         // Simulate the writer splitting a 200_000-byte write into
@@ -1044,7 +1137,6 @@ mod reassembly_tests {
                     5,
                     offset,
                     buf(&payload[offset as usize..offset as usize + len]),
-                    &close_tx,
                 )
                 .await
                 .unwrap();
@@ -1061,5 +1153,214 @@ mod reassembly_tests {
             }
         }
         assert_eq!(got, payload);
+    }
+
+    // ---- Named acceptance tests ----
+
+    /// Wraparound ordering: when the absolute cursor is near u32::MAX
+    /// (0xFFFF_FFFC), frames at wire offsets that wrap correctly sort by
+    /// absolute u64 key, not by numeric u32. A frame at wire offset 0
+    /// (mapping to absolute 0x1_0000_0000) must sort AFTER a frame at
+    /// 0xFFFF_FFFC (absolute 0xFFFF_FFFC) — the numeric-u32 BTreeMap
+    /// would put 0 before 0xFFFF_FFFC, falsely ordering the wrap case.
+    #[tokio::test]
+    async fn wraparound_pending_order_uses_absolute_epoch() {
+        let mut rb = ReorderBuffer::new();
+        // Plant the cursor near the wrap boundary.
+        rb.cursor = 0xFFFF_FFFC;
+
+        // Frame at 0xFFFF_FFFC (abs 0xFFFF_FFFC): contiguous, delivers.
+        rb.ingest(0xFFFF_FFFC, buf(&[1, 2, 3, 4])).unwrap();
+        let out = collect(rb.drain_contiguous());
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert_eq!(rb.cursor, 0x1_0000_0000);
+
+        // Frame at wire offset 4 (abs 0x1_0000_0004): held in buffer.
+        rb.ingest(4, buf(&[0xAA; 4])).unwrap();
+        assert!(rb.drain_contiguous().is_empty());
+
+        // Frame at wire offset 0 (abs = 0x1_0000_0000, BEFORE the held
+        // frame at abs 0x1_0000_0004). With u64 keys this sorts correctly
+        // as the predecessor; with a numeric-u32 BTreeMap (key 0 vs key 4)
+        // it would be the successor and break contiguous delivery.
+        rb.ingest(0, buf(&[5, 6, 7, 8])).unwrap();
+
+        // Drain: the contiguous range [0..8] in absolute space delivers.
+        let out = collect(rb.drain_contiguous());
+        assert_eq!(out, [5, 6, 7, 8, 0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(rb.cursor, 0x1_0000_0008);
+    }
+
+    /// Successor overlap: a frame whose range extends into a later
+    /// (higher absolute offset) buffered frame is rejected. The old
+    /// u32-keyed BTreeMap only checked predecessor overlap, so a frame
+    /// that overlapped from BELOW went undetected.
+    #[tokio::test]
+    async fn successor_overlap_is_rejected() {
+        let mut rb = ReorderBuffer::new();
+        // Buffer a frame at abs 8 (wire 8, len 4, for 8..12).
+        rb.cursor = 4; // simulate already-delivered bytes 0..4
+        rb.ingest(8, buf(&[0xCC; 4])).unwrap();
+
+        // A frame at wire offset 6 (abs 6, len 4, for 6..10) overlaps
+        // with the buffered frame (8..12). Successor check catches this.
+        let err = rb.ingest(6, buf(&[0xDD; 4])).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::Overlap),
+            "successor overlap must be rejected: got {err:?}"
+        );
+    }
+
+    /// Final offset too far ahead of the cursor is rejected. An unbounded
+    /// final offset would pin a reader forever waiting for bytes that may
+    /// never arrive.
+    #[tokio::test]
+    async fn final_offset_too_far_ahead_is_rejected() {
+        let mut rb = ReorderBuffer::new();
+        rb.cursor = 100;
+        // Final offset far beyond REASSEMBLY_MAX_RANGE_BYTES from cursor.
+        let far = 100u32.wrapping_add(REASSEMBLY_MAX_RANGE_BYTES as u32 + 1);
+        let err = rb.set_final_offset(far).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::OutOfWindow),
+            "final offset too far ahead must be rejected: got {err:?}"
+        );
+    }
+
+    /// Final offset that wraps past u32::MAX but stays within the forward
+    /// reassembly window is accepted. This guards the common case where a
+    /// stream carries >4 GiB and the final offset wraps.
+    #[tokio::test]
+    async fn final_offset_may_cross_wire_wrap_within_window() {
+        let mut rb = ReorderBuffer::new();
+        // Cursor is near u32::MAX; final offset wraps to a small value.
+        rb.cursor = 0xFFFF_FFF0;
+        let fin = 0x10; // wraps, but forward distance from cursor is 32 < window
+        rb.set_final_offset(fin).unwrap();
+        assert!(rb.final_offset_abs.is_some());
+        // Not yet complete — cursor 0xFFFF_FFF0 hasn't reached the final.
+        assert!(!rb.is_complete());
+    }
+
+    /// Data-before-Open routes the accept message to the accepter exactly
+    /// once. When a Data frame arrives for a stream that hasn't been
+    /// opened yet, the control loop implicitly creates the stream AND
+    /// sends an `AcceptMsg` down the accept channel so the application
+    /// gets a reader/writer pair. The subsequent Open is a no-op.
+    #[tokio::test]
+    async fn data_before_open_surfaces_accept_msg_once() {
+        use crate::stream::accepter::stream_accept_channel;
+        use crate::stream::opener::stream_open_channel;
+        use crate::central_io::writer::write_control_channel;
+
+        let (tx, mut rx) = crate::central_io::writer::write_data_channel();
+        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let mut control = MuxControl::new(Initiation::Server, tx, true);
+        let (close_tx, _close_rx) = stream_close_channel();
+        let (_open_tx, open_rx) = stream_open_channel();
+        let (accept_tx, mut accept_rx) = stream_accept_channel();
+        let mut stream_init_handle = StreamInitHandle {
+            stream_open_rx: open_rx,
+            stream_accept_tx: accept_tx,
+        };
+        let (write_control_tx, _write_control_rx) = write_control_channel();
+
+        // Data arrives before Open for stream 42.
+        let msg = CentralIoReadMsg::Data(42, 0, buf(&[1, 2, 3]));
+        handle_central_read(
+            &mut control,
+            &close_tx,
+            &mut stream_init_handle,
+            &write_control_tx,
+            msg,
+        )
+        .await
+        .unwrap();
+
+        // The stream exists in the table.
+        assert!(control.stream_table.contains_key(&42));
+
+        // The accept channel has exactly one message.
+        let accepted = accept_rx.try_recv().expect("accept msg must be available");
+        let _ = accepted; // reader + writer created
+
+        // A second accept should NOT have a message (exactly once).
+        assert!(accept_rx.try_recv().is_err());
+
+        // A subsequent Open is a no-op.
+        let open_msg = CentralIoReadMsg::Open(42);
+        handle_central_read(
+            &mut control,
+            &close_tx,
+            &mut stream_init_handle,
+            &write_control_tx,
+            open_msg,
+        )
+        .await
+        .unwrap();
+
+        // Still only one accept message was sent (Open was no-op).
+        assert!(accept_rx.try_recv().is_err());
+
+        drop(drain);
+    }
+
+    /// CloseWrite-before-Open routes accept msg and preserves EOF. When
+    /// a CloseWrite frame arrives for an unknown stream (reassembly on),
+    /// it implicitly creates the stream, sends AcceptMsg, and records the
+    /// final offset. The reader then sees Fin once all bytes up to the
+    /// final offset are delivered.
+    #[tokio::test]
+    async fn close_before_open_surfaces_accept_msg_and_preserves_eof() {
+        use crate::stream::accepter::stream_accept_channel;
+        use crate::stream::opener::stream_open_channel;
+        use crate::central_io::writer::write_control_channel;
+
+        let (tx, mut rx) = crate::central_io::writer::write_data_channel();
+        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let mut control = MuxControl::new(Initiation::Server, tx, true);
+        let (close_tx, _close_rx) = stream_close_channel();
+        let (_open_tx, open_rx) = stream_open_channel();
+        let (accept_tx, mut accept_rx) = stream_accept_channel();
+        let mut stream_init_handle = StreamInitHandle {
+            stream_open_rx: open_rx,
+            stream_accept_tx: accept_tx,
+        };
+        let (write_control_tx, _write_control_rx) = write_control_channel();
+
+        // CloseWrite arrives before Open for stream 7 with final_offset=3.
+        let msg = CentralIoReadMsg::Close(7, Side::Write, 3);
+        handle_central_read(
+            &mut control,
+            &close_tx,
+            &mut stream_init_handle,
+            &write_control_tx,
+            msg,
+        )
+        .await
+        .unwrap();
+
+        // Stream exists.
+        assert!(control.stream_table.contains_key(&7));
+
+        // Exactly one accept msg was sent.
+        let accepted = accept_rx.try_recv().expect("accept msg must be available");
+        let (reader, _writer) = (accepted.reader, accepted.writer);
+        assert!(accept_rx.try_recv().is_err());
+
+        // Now deliver data to the stream.
+        control
+            .ingest_reassembly(7, 0, buf(&[0xAA; 3]))
+            .await
+            .unwrap();
+
+        // The reader should see the data bytes, then Fin (EOF).
+        let mut got = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut reader = std::pin::pin!(reader);
+        reader.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, [0xAA; 3], "reader gets data, then EOF after final_offset");
+
+        drop(drain);
     }
 }

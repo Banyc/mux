@@ -16,11 +16,10 @@ const CHANNEL_SIZE: usize = 1024;
 #[derive(Debug)]
 struct StreamReaderState {
     leftover: Option<(DataBuf, usize)>,
-    /// Bytes consumed by a peek (e.g. resume-header probe) that must be
-    /// yielded again before any channel data.  Read front-to-back.
     prepend: Vec<u8>,
     prepend_pos: usize,
     is_eof: bool,
+    read_error: Option<io::ErrorKind>,
     _close: StreamCloseTx,
 }
 impl StreamReaderState {
@@ -30,12 +29,11 @@ impl StreamReaderState {
             prepend: Vec::new(),
             prepend_pos: 0,
             is_eof: false,
+            read_error: None,
             _close: close,
         }
     }
     pub fn prepend(&mut self, bytes: &[u8]) {
-        // If there are already prepended bytes, splice the new ones in
-        // front of the unconsumed portion.
         if self.prepend_pos < self.prepend.len() {
             let mut combined = bytes.to_vec();
             combined.extend_from_slice(&self.prepend[self.prepend_pos..]);
@@ -50,11 +48,13 @@ impl StreamReaderState {
         data: &mut StreamReadDataRx,
         buf: &mut [u8],
         cx: &mut Context<'_>,
-    ) -> Poll<Result<usize, DeadControl>> {
-        if self.is_eof {
-            return Ok(0).into();
+    ) -> Poll<io::Result<usize>> {
+        if let Some(kind) = self.read_error {
+            return Poll::Ready(Err(io::Error::from(kind)));
         }
-        // Drain prepend buffer first.
+        if self.is_eof {
+            return Poll::Ready(Ok(0));
+        }
         if self.prepend_pos < self.prepend.len() {
             let src = &self.prepend[self.prepend_pos..];
             let n = buf.len().min(src.len());
@@ -64,18 +64,29 @@ impl StreamReaderState {
                 self.prepend.clear();
                 self.prepend_pos = 0;
             }
-            return Ok(n).into();
+            return Poll::Ready(Ok(n));
         }
         let (data_buf, pos) = match self.leftover.take() {
             Some(x) => x,
             None => {
-                let msg = ready!(data.poll_recv(cx))?;
+                let msg = match ready!(data.poll_recv(cx)) {
+                    Ok(m) => m,
+                    Err(DeadControl {}) => {
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                };
                 let data_buf = match msg {
                     StreamReadDataMsg::Fin => {
                         self.is_eof = true;
-                        return Ok(0).into();
+                        return Poll::Ready(Ok(0));
                     }
                     StreamReadDataMsg::Data(data_buf) => data_buf,
+                    StreamReadDataMsg::Error(e) => {
+                        let kind = e.kind();
+                        self.read_error = Some(kind);
+                        self.is_eof = true;
+                        return Poll::Ready(Err(e));
+                    }
                 };
                 (data_buf, 0)
             }
@@ -87,7 +98,7 @@ impl StreamReaderState {
         if pos < data_buf.len() {
             self.leftover = Some((data_buf, pos));
         }
-        Ok(data_len).into()
+        Poll::Ready(Ok(data_len))
     }
 }
 
@@ -116,17 +127,11 @@ impl AsyncRead for StreamReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.deref_mut();
-        let n = match ready!(this
+        let n = ready!(this
             .state
-            .poll_recv(&mut this.data, buf.initialize_unfilled(), cx))
-        {
-            Ok(n) => n,
-            Err(DeadControl {}) => {
-                return Err(io::ErrorKind::BrokenPipe.into()).into();
-            }
-        };
+            .poll_recv(&mut this.data, buf.initialize_unfilled(), cx))?;
         buf.advance(n);
-        Ok(()).into()
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -134,6 +139,7 @@ impl AsyncRead for StreamReader {
 pub enum StreamReadDataMsg {
     Fin,
     Data(DataBuf),
+    Error(io::Error),
 }
 pub fn stream_read_data_channel() -> (StreamReadDataTx, StreamReadDataRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);

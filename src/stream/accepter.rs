@@ -46,4 +46,8 @@ impl StreamAcceptRx {
     pub async fn recv(&mut self) -> Result<StreamAcceptMsg, DeadControl> {
         self.rx.recv().await.ok_or(DeadControl {})
     }
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Result<StreamAcceptMsg, ()> {
+        self.rx.try_recv().map_err(|_| ())
+    }
 }

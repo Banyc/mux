@@ -14,7 +14,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::oneshot,
     task::JoinSet,
 };
@@ -869,7 +869,7 @@ where
 /// paired with its partner later via [`complete_pairing`].
 pub async fn spawn_dual_mux_acceptor<R, W>(
     mut reader: R,
-    writer: W,
+    mut writer: W,
     config: MuxConfig,
     hello_deadline: Duration,
 ) -> Result<(LaneClass, PairingNonce, PendingAcceptor), DualMuxError>
@@ -877,11 +877,19 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (class, nonce) =
-        tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader))
-            .await
-            .map_err(|_| DualMuxError::HelloDeadline)?
-            .map_err(DualMuxError::LaneHello)?;
+    let (class, nonce) = match tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader))
+        .await
+    {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            let _ = writer.shutdown().await;
+            return Err(DualMuxError::LaneHello(e));
+        }
+        Err(_) => {
+            let _ = writer.shutdown().await;
+            return Err(DualMuxError::HelloDeadline);
+        }
+    };
 
     let mut lane_spawner = JoinSet::new();
     let (opener, accepter) =
@@ -898,12 +906,17 @@ where
 }
 
 /// A half-accepted lane connection waiting for its nonce-matching partner.
+///
+/// Fields are public so callers that read the lane hello externally can
+/// construct a pending acceptor by spawning the mux session themselves
+/// (e.g. to send a kill packet on the raw transport before the mux is
+/// started when the hello is rejected).
 pub struct PendingAcceptor {
     pub class: LaneClass,
     pub nonce: PairingNonce,
-    opener: StreamOpener,
-    accepter: StreamAccepter,
-    spawner: JoinSet<MuxError>,
+    pub opener: StreamOpener,
+    pub accepter: StreamAccepter,
+    pub spawner: JoinSet<MuxError>,
 }
 
 impl std::fmt::Debug for PendingAcceptor {
