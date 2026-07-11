@@ -241,7 +241,6 @@ where
     }
     pub async fn send_control(&mut self, msg: WriteControlMsg) -> io::Result<()> {
         match msg {
-            WriteControlMsg::Open(stream_id) => self.send_control_(Header::Open, stream_id).await,
             WriteControlMsg::Close(stream_id, side) => match side {
                 Side::Read => self.send_control_(Header::CloseRead, stream_id).await,
                 Side::Write => {
@@ -285,7 +284,10 @@ where
     }
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
         let data_buf = match msg.data {
-            StreamWriteData::Open => return Ok(()),
+            StreamWriteData::Open { wire: false } => return Ok(()),
+            StreamWriteData::Open { wire: true } => {
+                return self.send_control_(Header::Open, msg.stream_id).await;
+            }
             StreamWriteData::Fin => {
                 if self.frame_reassembly {
                     let final_offset = self.next_offset.remove(&msg.stream_id).unwrap_or(0);
@@ -395,7 +397,7 @@ pub struct WriteDataMsg {
 }
 #[derive(Debug)]
 pub enum StreamWriteData {
-    Open,
+    Open { wire: bool },
     Fin,
     Data(DataBuf),
 }
@@ -580,7 +582,7 @@ impl WriteDataRx {
 
 fn priority_size(entry: &HeadEntry) -> usize {
     match entry.msg.data {
-        StreamWriteData::Open => 0,
+        StreamWriteData::Open { .. } => 0,
         StreamWriteData::Fin => 0,
         StreamWriteData::Data(ref data) => data.len() - entry.offset,
     }
@@ -599,13 +601,17 @@ pub struct WriteDataTxPrototype {
     opener: fair_queue::Opener<WriteDataMsg>,
 }
 impl WriteDataTxPrototype {
-    pub async fn derive(&self, stream: StreamId) -> Result<StreamWriteDataTx, DeadCentralIo> {
+    pub async fn derive(
+        &self,
+        stream: StreamId,
+        wire_open: bool,
+    ) -> Result<StreamWriteDataTx, DeadCentralIo> {
         Ok(StreamWriteDataTx {
             tx: self
                 .opener
                 .open(WriteDataMsg {
                     stream_id: stream,
-                    data: StreamWriteData::Open,
+                    data: StreamWriteData::Open { wire: wire_open },
                 })
                 .await
                 .ok_or(DeadCentralIo { side: Side::Write })?,
@@ -662,7 +668,6 @@ impl PollStreamWriteDataTx {
 
 #[derive(Debug, Clone)]
 pub enum WriteControlMsg {
-    Open(StreamId),
     Close(StreamId, Side),
 }
 pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
@@ -987,13 +992,13 @@ mod tests {
         let mut got_open = false;
         tokio::join!(
             async {
-                stream = Some(tx.derive(stream_id).await.unwrap());
+                stream = Some(tx.derive(stream_id, false).await.unwrap());
             },
             async {
                 while !got_open {
                     let msg = rx.recv().await.unwrap();
                     assert_eq!(msg.stream_id, stream_id);
-                    assert!(matches!(msg.data, StreamWriteData::Open));
+                    assert!(matches!(msg.data, StreamWriteData::Open { .. }));
                     got_open = true;
                 }
             },
@@ -1016,7 +1021,7 @@ mod tests {
 
     fn data_len(data: &StreamWriteData) -> usize {
         match data {
-            StreamWriteData::Open | StreamWriteData::Fin => 0,
+            StreamWriteData::Open { .. } | StreamWriteData::Fin => 0,
             StreamWriteData::Data(d) => d.len(),
         }
     }
@@ -1115,7 +1120,7 @@ mod tests {
         let open = HeadEntry {
             msg: WriteDataMsg {
                 stream_id: 1,
-                data: StreamWriteData::Open,
+                data: StreamWriteData::Open { wire: false },
             },
             offset: 0,
         };
@@ -1176,7 +1181,7 @@ mod tests {
                     reassembled.extend_from_slice(&data);
                 }
                 StreamWriteData::Fin => break,
-                StreamWriteData::Open => {}
+                StreamWriteData::Open { .. } => {}
             }
             if reassembled.len() >= big_len {
                 break;

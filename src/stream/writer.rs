@@ -220,11 +220,11 @@ mod tests {
         // `derive` sends an Open request that only completes while the receiver
         // is being polled, so drive `rx` concurrently until the Open is
         // consumed.
-        let derive_fut = prototype.derive(1u32);
+        let derive_fut = prototype.derive(1u32, false);
         let drive_open = async {
             loop {
                 let msg = rx.recv().await.unwrap();
-                if msg.stream_id == 1u32 && matches!(msg.data, StreamWriteData::Open) {
+                if msg.stream_id == 1u32 && matches!(msg.data, StreamWriteData::Open { .. }) {
                     break;
                 }
             }

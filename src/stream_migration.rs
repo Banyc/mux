@@ -307,21 +307,43 @@ impl SpliceRegistry {
         header: ResumeHeader,
         continuation: impl AsyncRead + Send + Sync + 'static,
     ) -> Result<Option<SplicedReader>, MigrationError> {
+        self.dispatch_inner(header, continuation, true)
+    }
+
+    /// Like [`dispatch`](Self::dispatch), but never drops generations
+    /// for exceeding the diagnostic holdback bound
+    /// (`TooManyPendingGenerations` / `TooManyOrphans`).
+    /// Intended for the splice driver so that a late-arriving reader
+    /// never causes a generation to be silently discarded.
+    pub fn dispatch_preserving(
+        &mut self,
+        header: ResumeHeader,
+        continuation: impl AsyncRead + Send + Sync + 'static,
+    ) -> Result<Option<SplicedReader>, MigrationError> {
+        self.dispatch_inner(header, continuation, false)
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        header: ResumeHeader,
+        continuation: impl AsyncRead + Send + Sync + 'static,
+        enforce_holdback_limits: bool,
+    ) -> Result<Option<SplicedReader>, MigrationError> {
         let reader: GenerationReader = Box::pin(continuation);
 
         match self.streams.get_mut(&header.logical_id) {
             Some(entry) => {
-                // Generation-0 re-claims are dropped.
                 if header.generation == 0 {
                     return Ok(None);
                 }
-                // Duplicate generation numbers are dropped.
                 if entry.pending.contains_key(&header.generation) {
                     return Err(MigrationError::DuplicateGeneration);
                 }
                 if header.is_final {
                     entry.final_seen = true;
-                } else if entry.pending.len() >= MAX_PENDING_GENERATIONS {
+                } else if enforce_holdback_limits
+                    && entry.pending.len() >= MAX_PENDING_GENERATIONS
+                {
                     return Err(MigrationError::TooManyPendingGenerations);
                 }
                 entry.pending.insert(header.generation, (header.is_final, reader));
@@ -331,15 +353,10 @@ impl SpliceRegistry {
                 if header.generation == 0 {
                     let mut entry = StreamEntry::new();
                     entry.final_seen = header.is_final;
-                    // For gen 0 we do not buffer; the reader becomes the
-                    // current generation of the SplicedReader.
                     let is_closed = header.is_final;
-                    // Adopt any orphans that arrived before gen0.
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
                         self.orphan_count -= orphans.len();
                         for o in orphans {
-                            // The orphan carries the FINAL flag and
-                            // generation from its original header.
                             entry.pending.insert(
                                 o.header.generation,
                                 (o.header.is_final, o.reader),
@@ -353,8 +370,7 @@ impl SpliceRegistry {
                     let spliced = SplicedReader::new(header.logical_id, Some(reader), is_closed);
                     Ok(Some(spliced))
                 } else {
-                    // Orphan generation. Buffer it with a TTL deadline.
-                    self.insert_orphan(header, reader)?;
+                    self.insert_orphan(header, reader, enforce_holdback_limits)?;
                     Ok(None)
                 }
             }
@@ -365,11 +381,12 @@ impl SpliceRegistry {
         &mut self,
         header: ResumeHeader,
         reader: GenerationReader,
+        enforce_holdback_limits: bool,
     ) -> Result<(), MigrationError> {
-        // Reap expired orphans first.
-        self.reap_orphans();
-
-        if self.orphan_count >= MAX_ORPHANS {
+        if enforce_holdback_limits {
+            self.reap_orphans();
+        }
+        if enforce_holdback_limits && self.orphan_count >= MAX_ORPHANS {
             return Err(MigrationError::TooManyOrphans);
         }
         let deadline = Instant::now() + ORPHAN_TTL;
@@ -688,31 +705,9 @@ pub fn spawn_splice_driver(
             let logical_id = header.logical_id;
             let is_gen0 = header.generation == 0;
             let is_final = header.is_final;
-            // Dispatch. A TooManyPendingGenerations or orphan overflow is
-            // a backpressure signal, NOT a fatal error that should kill the
-            // driver and truncate every later generation — so we drop the
-            // offending generation rather than `?`-propagating. Genuine
-            // unrecoverable errors (corrupt header) still bail out.
-            let spliced_opt = match registry.dispatch(header, reader) {
+            let spliced_opt = match registry.dispatch_preserving(header, reader) {
                 Ok(opt) => opt,
-                Err(MigrationError::TooManyPendingGenerations)
-                | Err(MigrationError::TooManyOrphans)
-                | Err(MigrationError::DuplicateGeneration) => {
-                    // The pending queue is full because the reader is
-                    // behind. After dropping this generation we re-flush
-                    // whatever is contiguous so the reader can catch up;
-                    // the writer's next generation will re-enter. This
-                    // preserves the bounded holdback invariant without
-                    // truncating the stream.
-                    if let Some(queue_tx) = queues.get(&logical_id) {
-                        flush_contiguous(
-                            &mut registry,
-                            logical_id,
-                            queue_tx,
-                            &mut next_to_flush,
-                        );
-                    }
-                    let _ = is_final;
+                Err(MigrationError::DuplicateGeneration) => {
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1443,4 +1438,34 @@ mod tests {
     // MUTATION 3: breaking the holdback bound. With the bound, the 9th
     // pending generation is rejected. Without it, it would be accepted.
     // Verified by `too_many_pending_generations_rejected`.
+
+    // -------------------------------------------------------------------
+    // dispatch_preserving regression: the splice driver must never
+    // silently drop a generation.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn driver_dispatch_preserves_generations_beyond_diagnostic_holdback() {
+        let mut registry = SpliceRegistry::new();
+        let (c0, _s0) = duplex(1);
+        let h0 = ResumeHeader {
+            logical_id: 7,
+            generation: 0,
+            is_final: false,
+        };
+        registry.dispatch_preserving(h0, c0).unwrap();
+        for generation in 2..=MAX_PENDING_GENERATIONS as u32 + 2 {
+            let (reader, _writer) = duplex(1);
+            let header = ResumeHeader {
+                logical_id: 7,
+                generation,
+                is_final: false,
+            };
+            registry.dispatch_preserving(header, reader).unwrap();
+        }
+        assert_eq!(
+            registry.streams.get(&7).unwrap().pending.len(),
+            MAX_PENDING_GENERATIONS as usize + 1,
+        );
+    }
 }
