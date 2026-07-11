@@ -465,15 +465,12 @@ impl MuxControl {
         if stream.is_read_closed {
             return;
         }
-        let _ = stream
-            .read_dispatcher
-            .send(StreamReadDataMsg::Error(
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "reassembly protocol error - stream read side closed",
-                ),
-            ))
-            .await;
+        let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Error(
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "reassembly protocol error - stream read side closed",
+            ),
+        ));
         stream.reassembly = None;
         stream.is_read_closed = true;
         stream.is_peer_write_closed = true;

@@ -155,6 +155,12 @@ impl StreamReadDataTx {
     pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadStream> {
         self.tx.send(msg).await.map_err(|_| DeadStream {})
     }
+    pub fn try_send(
+        &self,
+        msg: StreamReadDataMsg,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<StreamReadDataMsg>> {
+        self.tx.try_send(msg)
+    }
 }
 #[derive(Debug)]
 pub struct StreamReadDataRx {
