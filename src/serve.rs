@@ -56,20 +56,18 @@ impl MuxConfig {
 pub enum MuxError {
     IoReader(io::Error),
     IoWriter(io::Error),
-    /// A spawned supervision task was cancelled (e.g. via `abort_all` during
-    /// a normal shutdown/reset). Cancellation is a normal lifecycle event,
-    /// not a panic-worthy condition.
+    DualLane {
+        lane: crate::dual_lane::LaneClass,
+        peer_lane_aborted: bool,
+        source: Box<MuxError>,
+    },
     TaskJoin {
         task: &'static str,
         source: JoinError,
     },
-    /// A spawned supervision task produced no result (JoinSet empty / task
-    /// never ran to completion).
     TaskStopped {
         task: &'static str,
     },
-    /// A supervision task ended because one of its control channels closed,
-    /// before producing a concrete IO error.
     ControlChannelClosed {
         task: &'static str,
     },

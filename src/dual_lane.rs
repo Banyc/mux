@@ -753,6 +753,26 @@ pub fn spawn_dual_mux_paired(
 /// the heartbeat interval (`RECEIVE_DEADLINE_INTERVALS` in
 /// `central_io::reader`), so a dead peer is detected on quiet lanes
 /// too — the supervisor propagates that detection across the pair.
+pub fn aggregate_dual_lane_result(
+    lane: LaneClass,
+    result: Option<Result<MuxError, tokio::task::JoinError>>,
+) -> MuxError {
+    let task = match lane {
+        LaneClass::Interactive => "interactive_lane",
+        LaneClass::Bulk => "bulk_lane",
+    };
+    let source = match result {
+        Some(Ok(error)) => error,
+        Some(Err(source)) => MuxError::TaskJoin { task, source },
+        None => MuxError::TaskStopped { task },
+    };
+    MuxError::DualLane {
+        lane,
+        peer_lane_aborted: true,
+        source: Box::new(source),
+    }
+}
+
 pub fn spawn_dual_mux_paired_supervised(
     interactive_opener: StreamOpener,
     interactive_accepter: StreamAccepter,
@@ -769,26 +789,18 @@ pub fn spawn_dual_mux_paired_supervised(
     let mut bulk_s = bulk_spawner;
 
     supervisor.spawn(async move {
-        let (died, err) = tokio::select! {
+        tokio::select! {
             res = int_s.join_next() => {
                 bulk_s.abort_all();
                 alive.store(false, Ordering::SeqCst);
-                ("interactive", match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "interactive_lane" },
-                })
+                aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_s.join_next() => {
                 int_s.abort_all();
                 alive.store(false, Ordering::SeqCst);
-                ("bulk", match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "bulk_lane" },
-                })
+                aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
-        };
-        let _ = died;
-        err
+        }
     });
 
     let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
@@ -849,25 +861,18 @@ where
     let alive = liveness.alive.clone();
 
     spawner.spawn(async move {
-        let err = tokio::select! {
+        tokio::select! {
             res = int_spawner.join_next() => {
-                alive.store(false, Ordering::SeqCst);
                 bulk_spawner.abort_all();
-                match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "dual_lane" },
-                }
+                alive.store(false, Ordering::SeqCst);
+                aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_spawner.join_next() => {
-                alive.store(false, Ordering::SeqCst);
                 int_spawner.abort_all();
-                match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "dual_lane" },
-                }
+                alive.store(false, Ordering::SeqCst);
+                aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
-        };
-        err
+        }
     });
 
     let opener = DualStreamOpener::new(int_opener, bulk_opener, liveness.clone());
@@ -980,26 +985,18 @@ pub fn complete_pairing(
     spawner.spawn(async move {
         let mut int_s = int_pending.spawner;
         let mut bulk_s = bulk_pending.spawner;
-        let (died, err) = tokio::select! {
+        tokio::select! {
             res = int_s.join_next() => {
                 bulk_s.abort_all();
                 alive.store(false, Ordering::SeqCst);
-                ("interactive", match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "interactive_lane" },
-                })
+                aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_s.join_next() => {
                 int_s.abort_all();
                 alive.store(false, Ordering::SeqCst);
-                ("bulk", match res {
-                    Some(Ok(err)) => err,
-                    _ => MuxError::TaskStopped { task: "bulk_lane" },
-                })
+                aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
-        };
-        let _ = died;
-        err
+        }
     });
 
     let opener = DualStreamOpener::new(
@@ -1699,5 +1696,21 @@ mod tests {
              ({:?}); a hang would blow past this bound",
             hello_deadline * 3
         );
+    }
+
+    #[test]
+    fn aggregate_dual_lane_result_preserves_trigger_context() {
+        let result = aggregate_dual_lane_result(
+            LaneClass::Bulk,
+            Some(Ok(MuxError::TaskStopped { task: "central_io_reader" })),
+        );
+        match result {
+            MuxError::DualLane { lane, peer_lane_aborted, source } => {
+                assert_eq!(lane, LaneClass::Bulk);
+                assert!(peer_lane_aborted);
+                assert!(matches!(*source, MuxError::TaskStopped { task: "central_io_reader" }));
+            }
+            other => panic!("expected aggregate dual-lane error, got {other:?}"),
+        }
     }
 }
