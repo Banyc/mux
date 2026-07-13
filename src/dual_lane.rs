@@ -735,7 +735,7 @@ pub fn spawn_dual_mux_paired(
 /// the heartbeat interval (`RECEIVE_DEADLINE_INTERVALS` in
 /// `central_io::reader`), so a dead peer is detected on quiet lanes
 /// too — the supervisor propagates that detection across the pair.
-pub fn aggregate_dual_lane_result(
+fn aggregate_dual_lane_result(
     lane: LaneClass,
     result: Option<Result<MuxError, tokio::task::JoinError>>,
 ) -> MuxError {
