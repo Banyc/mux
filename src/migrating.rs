@@ -13,8 +13,10 @@ use tokio::sync::mpsc;
 use crate::{
     dual_lane::{DualStreamAccepter, DualStreamOpener, LaneClass},
     stream::writer::StreamWriter,
-    stream_migration::{GenerationChain, GenerationReader, MigrationError, ResumeHeader,
-        SpliceRegistry, SplicedReader, spawn_splice_driver},
+    stream_migration::{
+        spawn_splice_driver, GenerationChain, GenerationReader, MigrationError, ResumeHeader,
+        SpliceRegistry, SplicedReader,
+    },
     StreamReader,
 };
 
@@ -48,7 +50,10 @@ struct StreamClassifier {
 
 impl StreamClassifier {
     fn new() -> Self {
-        Self { small_count: 0, bulk_count: 0 }
+        Self {
+            small_count: 0,
+            bulk_count: 0,
+        }
     }
 
     fn record(&mut self, size: usize) {
@@ -219,7 +224,10 @@ impl MigratingStreamWriter {
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
                 self.route_opened_reader(gen, reader);
-                self.state = WriterState::Active { writer, lane: target_lane };
+                self.state = WriterState::Active {
+                    writer,
+                    lane: target_lane,
+                };
                 Ok(())
             }
             WriterState::Closed => Err(MigratingError::LaneDead),
@@ -231,7 +239,9 @@ impl MigratingStreamWriter {
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
-        self.state = WriterState::Migrating { target_lane: target };
+        self.state = WriterState::Migrating {
+            target_lane: target,
+        };
         self.last_migration = Some(tokio::time::Instant::now());
         self.small_streak = 0;
         Ok(())
@@ -250,7 +260,10 @@ impl MigratingStreamWriter {
         };
 
         use tokio::io::AsyncWriteExt;
-        writer.write_all(buf).await.map_err(|_| MigratingError::WriteFailed)?;
+        writer
+            .write_all(buf)
+            .await
+            .map_err(|_| MigratingError::WriteFailed)?;
         Ok(())
     }
 
@@ -289,9 +302,7 @@ impl MigratingStreamWriter {
                         self.small_streak = 0;
                     }
 
-                    if self.small_streak >= DEMOTE_STREAK
-                        && !self.classifier.is_bulk()
-                    {
+                    if self.small_streak >= DEMOTE_STREAK && !self.classifier.is_bulk() {
                         if let Some(last) = self.last_migration {
                             if last.elapsed() >= DEMOTE_COOLDOWN {
                                 return self.migrate_to(LaneClass::Interactive).await;
@@ -331,17 +342,11 @@ impl MigratingStreamWriter {
         // that opens a fresh substream, writes the FINAL resume header,
         // and closes — giving the peer a positive end-of-stream signal.
         let opener = self.opener.clone();
-        let mut chain = std::mem::replace(
-            &mut self.chain,
-            GenerationChain::new(0),
-        );
+        let mut chain = std::mem::replace(&mut self.chain, GenerationChain::new(0));
         tokio::spawn(async move {
             if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
                 let _ = chain
-                    .start_generation(
-                        &mut tokio_util_writer(&mut final_writer),
-                        true,
-                    )
+                    .start_generation(&mut tokio_util_writer(&mut final_writer), true)
                     .await;
                 let _ = final_writer.shutdown();
             }
@@ -450,7 +455,10 @@ impl DualStreamOpener {
         &self,
         logical_id: u64,
         initial_lane: LaneClass,
-    ) -> (MigratingStreamWriter, tokio::sync::oneshot::Receiver<StreamReader>) {
+    ) -> (
+        MigratingStreamWriter,
+        tokio::sync::oneshot::Receiver<StreamReader>,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let writer = MigratingStreamWriter::new_with_reader_tx(
             self.clone(),
@@ -528,10 +536,7 @@ impl MigratingCapableAccepter {
         Self::new_with_plain_streams(inner, true)
     }
 
-    fn new_with_plain_streams(
-        inner: DualStreamAccepter,
-        pass_plain_streams: bool,
-    ) -> Self {
+    fn new_with_plain_streams(inner: DualStreamAccepter, pass_plain_streams: bool) -> Self {
         let (cont_tx, cont_rx) = mpsc::unbounded_channel();
         let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
         let registry = SpliceRegistry::new();
@@ -553,20 +558,19 @@ impl MigratingCapableAccepter {
     ///
     /// Gen-0 readers arriving out of logical-id order are stashed in
     /// a [`VecDeque`] and re-tried on subsequent accepts.
-    pub async fn accept(
-        &mut self,
-    ) -> Result<AcceptedStream, MigratingError> {
+    pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingError> {
         // Check stash first for previously-mismatched gen-0 readers.
         loop {
             // We need a full accept cycle (inner.accept → peek → maybe
             // check stash). Drain the stash when there's no pending
             // accept in progress.
-            let (reader, writer, lane) = self.inner.accept()
+            let (reader, writer, lane) = self
+                .inner
+                .accept()
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
 
-            let (is_migrating, header_opt, reader) =
-                Self::peek_resume_header(reader).await?;
+            let (is_migrating, header_opt, reader) = Self::peek_resume_header(reader).await?;
 
             if is_migrating {
                 if let Some(header) = header_opt {
@@ -582,10 +586,8 @@ impl MigratingCapableAccepter {
                         // Drain gen-0 rx, checking stash first.
                         loop {
                             // Check stash.
-                            if let Some(pos) = self
-                                .stash
-                                .iter()
-                                .position(|(id, _)| *id == logical_id)
+                            if let Some(pos) =
+                                self.stash.iter().position(|(id, _)| *id == logical_id)
                             {
                                 let (_, spliced) = self.stash.remove(pos).unwrap();
                                 return Ok(AcceptedStream::Migrating {
@@ -649,7 +651,6 @@ impl MigratingCapableAccepter {
             Ok((false, None, reader))
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1073,11 @@ mod tests {
                     *b = ((i as usize).wrapping_mul(chunk_size).wrapping_add(j)) as u8;
                 }
                 writer.write_all(&chunk).await.unwrap();
-                let target = if i % 2 == 0 { LaneClass::Bulk } else { LaneClass::Interactive };
+                let target = if i % 2 == 0 {
+                    LaneClass::Bulk
+                } else {
+                    LaneClass::Interactive
+                };
                 writer.force_migrate(target).await.unwrap();
             }
             writer.shutdown().unwrap();
@@ -1084,10 +1089,16 @@ mod tests {
             _ => panic!("expected migrating stream"),
         };
 
-        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         let mut data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
+            .await
+            .unwrap();
         assert_eq!(data.len(), chunk_size * migrations, "byte count mismatch");
 
         send.await.unwrap();
@@ -1123,10 +1134,16 @@ mod tests {
             _ => panic!("expected migrating stream"),
         };
 
-        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         let mut data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
+            .await
+            .unwrap();
         let expected: Vec<u8> = first.iter().chain(second).chain(third).copied().collect();
         assert_eq!(data, expected, "data mismatch");
 
@@ -1203,11 +1220,15 @@ mod tests {
         };
 
         let drain = tokio::spawn(async move {
-            loop { let _ = mac.accept().await; }
+            loop {
+                let _ = mac.accept().await;
+            }
         });
 
         let mut buf = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf)
+            .await
+            .unwrap();
         assert!(buf.starts_with("Prologue "), "got: {buf:?}");
         assert!(buf.contains("Epilogue."), "got: {buf:?}");
 
@@ -1257,29 +1278,40 @@ mod tests {
         };
 
         // Drain successors while readers consume data
-        let drain = tokio::spawn(async move { loop { let _ = mac.accept().await; } });
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         let (ra, rb) = tokio::join!(
             async {
                 let mut reader = reader_a;
                 let mut s = String::new();
-                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s).await.unwrap();
+                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s)
+                    .await
+                    .unwrap();
                 s
             },
             async {
                 let mut reader = reader_b;
                 let mut s = String::new();
-                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s).await.unwrap();
+                tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut s)
+                    .await
+                    .unwrap();
                 s
             }
         );
 
         let mut results = vec![ra, rb];
         results.sort();
-        assert_eq!(results, vec![
-            "stream-A-chunk-1stream-A-chunk-2".to_string(),
-            "stream-B-chunk-1stream-B-chunk-2".to_string(),
-        ]);
+        assert_eq!(
+            results,
+            vec![
+                "stream-A-chunk-1stream-A-chunk-2".to_string(),
+                "stream-B-chunk-1stream-B-chunk-2".to_string(),
+            ]
+        );
 
         send_a.await.unwrap();
         send_b.await.unwrap();
@@ -1302,7 +1334,10 @@ mod tests {
             let mut writer = opener.open_migrating(1, LaneClass::Interactive);
             writer.write_all(&vec![0xABu8; sync_size]).await.unwrap();
             for i in 0..deltas {
-                writer.write_all(format!("delta-{:02}-", i).as_bytes()).await.unwrap();
+                writer
+                    .write_all(format!("delta-{:02}-", i).as_bytes())
+                    .await
+                    .unwrap();
             }
             writer.shutdown().unwrap();
         });
@@ -1316,7 +1351,9 @@ mod tests {
         drop(mac);
 
         let mut data = Vec::with_capacity(sync_size + 200);
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
+            .await
+            .unwrap();
 
         assert_eq!(data.len(), sync_size + 9 * deltas, "total size mismatch");
         for b in &data[..sync_size] {
@@ -1324,7 +1361,10 @@ mod tests {
         }
         let deltas_str = std::str::from_utf8(&data[sync_size..]).unwrap();
         for i in 0..deltas {
-            assert!(deltas_str.contains(&format!("delta-{:02}-", i)), "missing delta {i}");
+            assert!(
+                deltas_str.contains(&format!("delta-{:02}-", i)),
+                "missing delta {i}"
+            );
         }
 
         send.await.unwrap();
@@ -1338,10 +1378,16 @@ mod tests {
     async fn demotion_respects_cooldown() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut writer = opener.open_migrating(1, LaneClass::Bulk);
-        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        for _ in 0..20 {
+            writer.write_all(&[0u8; 100]).await.unwrap();
+        }
         writer.write_all(&[0u8; 3000]).await.unwrap();
-        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
-        for _ in 0..4 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        for _ in 0..20 {
+            writer.write_all(&[0u8; 100]).await.unwrap();
+        }
+        for _ in 0..4 {
+            writer.write_all(&[0u8; 100]).await.unwrap();
+        }
         writer.shutdown().unwrap();
     }
 
@@ -1353,10 +1399,14 @@ mod tests {
     async fn demotion_after_cooldown_expires() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut writer = opener.open_migrating(1, LaneClass::Bulk);
-        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        for _ in 0..20 {
+            writer.write_all(&[0u8; 100]).await.unwrap();
+        }
         writer.write_all(&[0u8; 3000]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        for _ in 0..20 { writer.write_all(&[0u8; 100]).await.unwrap(); }
+        for _ in 0..20 {
+            writer.write_all(&[0u8; 100]).await.unwrap();
+        }
         writer.shutdown().unwrap();
     }
 
@@ -1397,7 +1447,9 @@ mod tests {
         drop(mac);
 
         let mut data = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data)
+            .await
+            .unwrap();
         assert_eq!(data, "data-on-bulk");
 
         send.await.unwrap();
@@ -1426,17 +1478,25 @@ mod tests {
             AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
             _ => panic!("expected migrating"),
         };
-        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"hello-from-s2c  ").await.unwrap();
-        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"hello-from-s2c  ")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer)
+            .await
+            .unwrap();
 
         write.await.unwrap();
 
         let mut resp = [0u8; 16];
-        tokio::io::AsyncReadExt::read_exact(&mut client_reader, &mut resp).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut client_reader, &mut resp)
+            .await
+            .unwrap();
         assert_eq!(&resp, b"hello-from-s2c  ");
 
         let mut buf = [0u8; 1];
-        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_reader, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(n, 0, "expected clean EOF after server writer shutdown");
     }
 
@@ -1465,14 +1525,22 @@ mod tests {
             AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
             _ => panic!("expected migrating"),
         };
-        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"first-response ").await.unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"second-response").await.unwrap();
-        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"first-response ")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"second-response")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer)
+            .await
+            .unwrap();
 
         write.await.unwrap();
 
         let mut resp = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut client_reader, &mut resp).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_string(&mut client_reader, &mut resp)
+            .await
+            .unwrap();
         assert_eq!(resp, "first-response second-response");
     }
 
@@ -1513,17 +1581,27 @@ mod tests {
 
         // Drain successors while echoing
         let drain = tokio::spawn(async move {
-            loop { let _ = mac.accept().await; }
+            loop {
+                let _ = mac.accept().await;
+            }
         });
 
         let echo = tokio::spawn(async move {
             let mut buf = vec![0u8; 256];
             loop {
-                let n = tokio::io::AsyncReadExt::read(&mut accepted_reader, &mut buf).await.unwrap();
-                if n == 0 { break; }
-                tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, &buf[..n]).await.unwrap();
+                let n = tokio::io::AsyncReadExt::read(&mut accepted_reader, &mut buf)
+                    .await
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, &buf[..n])
+                    .await
+                    .unwrap();
             }
-            tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer).await.unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut accepted_writer)
+                .await
+                .unwrap();
         });
 
         write.await.unwrap();
@@ -1531,12 +1609,18 @@ mod tests {
         drain.abort();
 
         let mut echoed = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut echoed).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut echoed)
+            .await
+            .unwrap();
         let mut expected = Vec::new();
         for i in 0..MIGRATIONS {
             expected.extend_from_slice(format!("chunk-{:03}-{:04X}", i, i).as_bytes());
         }
-        assert_eq!(echoed.len(), expected.len(), "total echoed byte count mismatch");
+        assert_eq!(
+            echoed.len(),
+            expected.len(),
+            "total echoed byte count mismatch"
+        );
         assert_eq!(echoed, expected, "echoed content mismatch");
     }
 
@@ -1566,11 +1650,15 @@ mod tests {
         // Drain successors (FINAL generation from shutdown) so the
         // SplicedReader can chain through to clean EOF.
         let drain = tokio::spawn(async move {
-            loop { let _ = mac.accept().await; }
+            loop {
+                let _ = mac.accept().await;
+            }
         });
 
         let mut data = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut accepted_reader, &mut data).await.unwrap();
+        tokio::io::AsyncReadExt::read_to_string(&mut accepted_reader, &mut data)
+            .await
+            .unwrap();
         assert_eq!(data, "write-only-data");
 
         write.await.unwrap();

@@ -18,8 +18,7 @@ use crate::{
     control::DeadControl,
     fair_queue,
     protocol::{
-        BodyLen, CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId,
-        StreamIdMsg,
+        BodyLen, CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId, StreamIdMsg,
     },
 };
 
@@ -246,7 +245,8 @@ where
                 Side::Write => {
                     if self.frame_reassembly {
                         let final_offset = self.next_offset.remove(&stream_id).unwrap_or(0);
-                        self.send_close_write_ext(stream_id, final_offset as Offset).await
+                        self.send_close_write_ext(stream_id, final_offset as Offset)
+                            .await
                     } else {
                         self.send_control_(Header::CloseWrite, stream_id).await
                     }
@@ -717,8 +717,7 @@ mod tests {
     use super::{
         priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
         StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
-        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE,
-        REASSEMBLY_MAX_BODY,
+        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE, REASSEMBLY_MAX_BODY,
     };
     use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header, StreamId};
     use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
@@ -1874,8 +1873,7 @@ mod tests {
         while pos < out.len() {
             assert_eq!(out[pos], data_code, "expected Data header");
             // frame = Header(1) + DataHeaderExt(10) + body
-            let body_len =
-                u16::from_be_bytes(out[pos + 5..pos + 7].try_into().unwrap()) as usize;
+            let body_len = u16::from_be_bytes(out[pos + 5..pos + 7].try_into().unwrap()) as usize;
             let frame_total = Header::SIZE + DataHeaderExt::SIZE + body_len;
             assert!(
                 frame_total <= 64 * 1024,

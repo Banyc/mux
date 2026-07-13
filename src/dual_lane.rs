@@ -105,9 +105,7 @@ impl AsRef<[u8]> for PairingNonce {
 /// alive before any application data flows. Use with
 /// [`spawn_mux_no_reconnection_with_first_receive_deadline`] so the
 /// receiver switches off its shorter first-receive deadline.
-pub async fn write_birth_heartbeat<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-) -> io::Result<()> {
+pub async fn write_birth_heartbeat<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.write_all(&Header::Heartbeat.encode()).await
 }
 
@@ -157,8 +155,7 @@ pub async fn read_lane_hello<R: AsyncRead + Unpin>(
         .read_exact(&mut buf)
         .await
         .map_err(|e| LaneHelloError::Io(e.kind()))?;
-    let class = LaneClass::from_hello_byte(buf[0])
-        .ok_or(LaneHelloError::BadLaneClass(buf[0]))?;
+    let class = LaneClass::from_hello_byte(buf[0]).ok_or(LaneHelloError::BadLaneClass(buf[0]))?;
     let mut nonce_bytes = [0u8; PAIRING_NONCE_LEN];
     nonce_bytes.copy_from_slice(&buf[1..]);
     Ok((class, PairingNonce(nonce_bytes)))
@@ -244,11 +241,7 @@ pub struct DualStreamOpener {
 }
 
 impl DualStreamOpener {
-    pub(crate) fn new(
-        interactive: StreamOpener,
-        bulk: StreamOpener,
-        liveness: Liveness,
-    ) -> Self {
+    pub(crate) fn new(interactive: StreamOpener, bulk: StreamOpener, liveness: Liveness) -> Self {
         Self {
             interactive,
             bulk,
@@ -312,7 +305,8 @@ pub struct AutoWriter {
     liveness: Liveness,
 }
 
-type OpenFuture = Pin<Box<dyn Future<Output = Result<(StreamReader, StreamWriter), StreamOpenError>> + Send>>;
+type OpenFuture =
+    Pin<Box<dyn Future<Output = Result<(StreamReader, StreamWriter), StreamOpenError>> + Send>>;
 
 enum AutoWriterState {
     Pending {
@@ -407,15 +401,13 @@ impl AutoWriter {
         }
     }
 
-    fn poll_open(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), AutoWriteError>> {
+    fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), AutoWriteError>> {
         let state = std::mem::replace(&mut self.state, AutoWriterState::Failed);
         let (mut open_fut, reader_tx) = match state {
-            AutoWriterState::Opening { open_fut, reader_tx } => {
-                (open_fut, reader_tx)
-            }
+            AutoWriterState::Opening {
+                open_fut,
+                reader_tx,
+            } => (open_fut, reader_tx),
             other => {
                 self.state = other;
                 return Poll::Ready(Ok(()));
@@ -434,10 +426,15 @@ impl AutoWriter {
                     let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e)));
                 }
                 self.state = AutoWriterState::Failed;
-                Poll::Ready(Err(AutoWriteError::OpenFailed(DualStreamOpenError::LaneDead)))
+                Poll::Ready(Err(AutoWriteError::OpenFailed(
+                    DualStreamOpenError::LaneDead,
+                )))
             }
             Poll::Pending => {
-                self.state = AutoWriterState::Opening { open_fut, reader_tx };
+                self.state = AutoWriterState::Opening {
+                    open_fut,
+                    reader_tx,
+                };
                 Poll::Pending
             }
         }
@@ -513,9 +510,9 @@ impl AutoWriter {
 
     pub fn shutdown(&mut self) -> Result<(), AutoWriteError> {
         match &mut self.state {
-            AutoWriterState::Active { writer } => writer
-                .shutdown()
-                .map_err(AutoWriteError::SendFailed),
+            AutoWriterState::Active { writer } => {
+                writer.shutdown().map_err(AutoWriteError::SendFailed)
+            }
             AutoWriterState::Pending { reader_tx, .. } => {
                 if let Some(tx) = reader_tx.take() {
                     let _ = tx.send(Err(DualStreamOpenError::CleanClose));
@@ -551,8 +548,7 @@ impl AsyncWrite for AutoWriter {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.deref_mut();
-        this.poll_write_vectored(bufs, cx)
-            .map_err(auto_write_to_io)
+        this.poll_write_vectored(bufs, cx).map_err(auto_write_to_io)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -582,15 +578,15 @@ fn auto_write_to_io(e: AutoWriteError) -> io::Error {
     match e {
         AutoWriteError::LaneDead => io::ErrorKind::BrokenPipe.into(),
         AutoWriteError::OpenFailed(_) => io::ErrorKind::BrokenPipe.into(),
-        AutoWriteError::SendFailed(
-            crate::stream::writer::SendError::LocalClosedStream,
-        ) => io::ErrorKind::NotConnected.into(),
-        AutoWriteError::SendFailed(
-            crate::stream::writer::SendError::PeerClosedStream,
-        ) => io::ErrorKind::BrokenPipe.into(),
-        AutoWriteError::SendFailed(
-            crate::stream::writer::SendError::DeadCentralIo(_),
-        ) => io::ErrorKind::BrokenPipe.into(),
+        AutoWriteError::SendFailed(crate::stream::writer::SendError::LocalClosedStream) => {
+            io::ErrorKind::NotConnected.into()
+        }
+        AutoWriteError::SendFailed(crate::stream::writer::SendError::PeerClosedStream) => {
+            io::ErrorKind::BrokenPipe.into()
+        }
+        AutoWriteError::SendFailed(crate::stream::writer::SendError::DeadCentralIo(_)) => {
+            io::ErrorKind::BrokenPipe.into()
+        }
     }
 }
 
@@ -635,31 +631,25 @@ impl AsyncRead for AutoReader {
         loop {
             let this = self.deref_mut();
             match &mut this.state {
-                AutoReaderState::Pending { rx } => {
-                    match ready!(Pin::new(rx).poll(cx)) {
-                        Ok(Ok(reader)) => {
-                            this.state = AutoReaderState::Ready { reader };
-                            continue;
-                        }
-                        Ok(Err(DualStreamOpenError::CleanClose)) => {
-                            this.state = AutoReaderState::Failed;
-                            return Poll::Ready(Ok(()));
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            this.state = AutoReaderState::Failed;
-                            return Poll::Ready(Err(io::Error::from(
-                                io::ErrorKind::BrokenPipe,
-                            )));
-                        }
+                AutoReaderState::Pending { rx } => match ready!(Pin::new(rx).poll(cx)) {
+                    Ok(Ok(reader)) => {
+                        this.state = AutoReaderState::Ready { reader };
+                        continue;
                     }
-                }
+                    Ok(Err(DualStreamOpenError::CleanClose)) => {
+                        this.state = AutoReaderState::Failed;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        this.state = AutoReaderState::Failed;
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+                    }
+                },
                 AutoReaderState::Ready { reader } => {
                     return Pin::new(reader).poll_read(cx, buf);
                 }
                 AutoReaderState::Failed => {
-                    return Poll::Ready(Err(io::Error::from(
-                        io::ErrorKind::BrokenPipe,
-                    )));
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
                 }
             }
         }
@@ -729,16 +719,8 @@ pub fn spawn_dual_mux_paired(
     bulk_accepter: StreamAccepter,
 ) -> (DualStreamOpener, DualStreamAccepter) {
     let liveness = Liveness::new();
-    let opener = DualStreamOpener::new(
-        interactive_opener,
-        bulk_opener,
-        liveness.clone(),
-    );
-    let accepter = DualStreamAccepter::new(
-        interactive_accepter,
-        bulk_accepter,
-        liveness,
-    );
+    let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
+    let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
     (opener, accepter)
 }
 
@@ -843,19 +825,11 @@ where
         .map_err(DualMuxError::LaneHello)?;
 
     let mut int_spawner = JoinSet::new();
-    let (int_opener, int_accepter) = spawn_mux_no_reconnection(
-        int_reader,
-        int_writer,
-        config.clone(),
-        &mut int_spawner,
-    );
+    let (int_opener, int_accepter) =
+        spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
     let mut bulk_spawner = JoinSet::new();
-    let (bulk_opener, bulk_accepter) = spawn_mux_no_reconnection(
-        bulk_reader,
-        bulk_writer,
-        config.clone(),
-        &mut bulk_spawner,
-    );
+    let (bulk_opener, bulk_accepter) =
+        spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
 
     let liveness = Liveness::new();
     let alive = liveness.alive.clone();
@@ -893,17 +867,15 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (class, nonce) = match tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader))
-        .await
-    {
-        Ok(Ok(x)) => x,
-        Ok(Err(e)) => return Err(DualMuxError::LaneHello(e)),
-        Err(_) => return Err(DualMuxError::HelloDeadline),
-    };
+    let (class, nonce) =
+        match tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader)).await {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => return Err(DualMuxError::LaneHello(e)),
+            Err(_) => return Err(DualMuxError::HelloDeadline),
+        };
 
     let mut lane_spawner = JoinSet::new();
-    let (opener, accepter) =
-        spawn_mux_no_reconnection(reader, writer, config, &mut lane_spawner);
+    let (opener, accepter) = spawn_mux_no_reconnection(reader, writer, config, &mut lane_spawner);
 
     let pending = PendingAcceptor {
         class,
@@ -999,16 +971,8 @@ pub fn complete_pairing(
         }
     });
 
-    let opener = DualStreamOpener::new(
-        int_pending.opener,
-        bulk_pending.opener,
-        liveness.clone(),
-    );
-    let accepter = DualStreamAccepter::new(
-        int_pending.accepter,
-        bulk_pending.accepter,
-        liveness,
-    );
+    let opener = DualStreamOpener::new(int_pending.opener, bulk_pending.opener, liveness.clone());
+    let accepter = DualStreamAccepter::new(int_pending.accepter, bulk_pending.accepter, liveness);
     Ok((opener, accepter))
 }
 
@@ -1194,10 +1158,7 @@ mod tests {
         // Should arrive on bulk lane
         let bulk_res =
             tokio::time::timeout(Duration::from_millis(500), cli_bulk.accepter.accept()).await;
-        assert!(
-            bulk_res.is_ok(),
-            "large write should arrive on bulk lane"
-        );
+        assert!(bulk_res.is_ok(), "large write should arrive on bulk lane");
 
         // Interactive lane should be empty
         let int_res =
@@ -1212,8 +1173,7 @@ mod tests {
     async fn open_auto_at_threshold_is_interactive() {
         let (srv_int, mut cli_int) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
-        let (srv_bulk, _cli_bulk) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
 
         let liveness = Liveness::new();
         let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
@@ -1261,7 +1221,10 @@ mod tests {
         // Bulk lane should have nothing
         let bulk_res =
             tokio::time::timeout(Duration::from_millis(200), cli_bulk.accepter.accept()).await;
-        assert!(bulk_res.is_err(), "bulk lane must be empty for sticky stream");
+        assert!(
+            bulk_res.is_err(),
+            "bulk lane must be empty for sticky stream"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1270,14 +1233,11 @@ mod tests {
 
     #[tokio::test]
     async fn killed_liveness_propagates_to_open() {
-        let (srv_int, _cli_int) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
-        let (srv_bulk, _cli_bulk) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
 
         let liveness = Liveness::new();
-        let opener =
-            DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
+        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
         liveness.kill();
 
         let result = opener.open(LaneClass::Interactive).await;
@@ -1290,17 +1250,11 @@ mod tests {
 
     #[tokio::test]
     async fn dual_accept_is_cancel_safe() {
-        let (srv_int, cli_int) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
-        let (srv_bulk, cli_bulk) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_int, cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
 
         let liveness = Liveness::new();
-        let mut accepter = DualStreamAccepter::new(
-            cli_int.accepter,
-            cli_bulk.accepter,
-            liveness,
-        );
+        let mut accepter = DualStreamAccepter::new(cli_int.accepter, cli_bulk.accepter, liveness);
 
         // Open one stream on each lane (server-side)
         srv_int.opener.open().await.unwrap();
@@ -1319,8 +1273,7 @@ mod tests {
     async fn open_auto_vectored_small_total_interactive() {
         let (srv_int, mut cli_int) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
-        let (srv_bulk, _cli_bulk) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
 
         let liveness = Liveness::new();
         let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
@@ -1351,13 +1304,8 @@ mod tests {
         let (c2s, _s2c) = duplex(64);
         let (srv_r, srv_w) = tokio::io::split(c2s);
 
-        let result = spawn_dual_mux_acceptor(
-            srv_r,
-            srv_w,
-            srv_config(),
-            Duration::from_millis(10),
-        )
-        .await;
+        let result =
+            spawn_dual_mux_acceptor(srv_r, srv_w, srv_config(), Duration::from_millis(10)).await;
         assert!(matches!(result, Err(DualMuxError::HelloDeadline)));
     }
 
@@ -1382,22 +1330,14 @@ mod tests {
             .unwrap();
 
         let mut set = JoinSet::new();
-        let (_, _, pending_int) = spawn_dual_mux_acceptor(
-            int_r,
-            duplex(1).1,
-            srv_config(),
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
-        let (_, _, pending_bulk) = spawn_dual_mux_acceptor(
-            bulk_r,
-            duplex(1).1,
-            srv_config(),
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
+        let (_, _, pending_int) =
+            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
+        let (_, _, pending_bulk) =
+            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
 
         let result = complete_pairing(pending_int, pending_bulk, &mut set);
         assert!(matches!(result, Err(DualMuxError::NonceMismatch)));
@@ -1409,10 +1349,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_open_on_dead_lane() {
-        let (srv_int, _cli_int) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
-        let (srv_bulk, _cli_bulk) =
-            make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
 
         let liveness = Liveness::new();
         liveness.kill();
@@ -1483,11 +1421,8 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         // Opens on either lane must now fail (LaneDead), not hang.
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            opener.open(LaneClass::Bulk),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), opener.open(LaneClass::Bulk)).await;
         assert!(
             matches!(result, Ok(Err(DualStreamOpenError::LaneDead))),
             "surviving lane must report LaneDead after pair death, got {result:?}"
@@ -1644,10 +1579,7 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             // Never readies — this is the condition that used to hang
             // the rejection path.
             Poll::Pending
@@ -1702,13 +1634,24 @@ mod tests {
     fn aggregate_dual_lane_result_preserves_trigger_context() {
         let result = aggregate_dual_lane_result(
             LaneClass::Bulk,
-            Some(Ok(MuxError::TaskStopped { task: "central_io_reader" })),
+            Some(Ok(MuxError::TaskStopped {
+                task: "central_io_reader",
+            })),
         );
         match result {
-            MuxError::DualLane { lane, peer_lane_aborted, source } => {
+            MuxError::DualLane {
+                lane,
+                peer_lane_aborted,
+                source,
+            } => {
                 assert_eq!(lane, LaneClass::Bulk);
                 assert!(peer_lane_aborted);
-                assert!(matches!(*source, MuxError::TaskStopped { task: "central_io_reader" }));
+                assert!(matches!(
+                    *source,
+                    MuxError::TaskStopped {
+                        task: "central_io_reader"
+                    }
+                ));
             }
             other => panic!("expected aggregate dual-lane error, got {other:?}"),
         }

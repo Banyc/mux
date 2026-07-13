@@ -89,14 +89,7 @@ where
     #[allow(unused_assignments)]
     let mut reconnect = Some(nah);
     reconnect = None;
-    spawn_mux(
-        io_reader,
-        io_writer,
-        config,
-        reconnect,
-        spawner,
-        None,
-    )
+    spawn_mux(io_reader, io_writer, config, reconnect, spawner, None)
 }
 
 /// Like [`spawn_mux_no_reconnection`] but enforces a shorter
@@ -166,9 +159,14 @@ where
         stream_accept_tx,
     };
     spawner.spawn(async move {
-        let (stream_init_handle, err) =
-            run_services(io_reader, io_writer, &config, stream_init_handle, first_receive_deadline)
-                .await;
+        let (stream_init_handle, err) = run_services(
+            io_reader,
+            io_writer,
+            &config,
+            stream_init_handle,
+            first_receive_deadline,
+        )
+        .await;
         let Some(mut reconnect) = reconnect else {
             return err;
         };
@@ -179,9 +177,14 @@ where
             let Some((io_reader, io_writer)) = reconnect().await else {
                 return err;
             };
-            let (stream_init_handle, err) =
-                run_services(io_reader, io_writer, &config, curr_stream_init_handle, first_receive_deadline)
-                    .await;
+            let (stream_init_handle, err) = run_services(
+                io_reader,
+                io_writer,
+                &config,
+                curr_stream_init_handle,
+                first_receive_deadline,
+            )
+            .await;
             let Some(stream_init_handle) = stream_init_handle else {
                 return err;
             };

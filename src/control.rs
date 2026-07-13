@@ -152,7 +152,9 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await
+                if let Err(()) = control
+                    .peer_close_write_with_offset(stream_id, final_offset)
+                    .await
                 {
                     control.reassembly_error_teardown(stream_id).await;
                     let _ = write_control_tx
@@ -420,10 +422,7 @@ impl MuxControl {
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            let _ = stream
-                .read_dispatcher
-                .send(StreamReadDataMsg::Fin)
-                .await;
+            let _ = stream.read_dispatcher.send(StreamReadDataMsg::Fin).await;
         }
         Ok(())
     }
@@ -444,12 +443,12 @@ impl MuxControl {
         if stream.is_read_closed {
             return;
         }
-        let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Error(
-            io::Error::new(
+        let _ = stream
+            .read_dispatcher
+            .try_send(StreamReadDataMsg::Error(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "reassembly protocol error - stream read side closed",
-            ),
-        ));
+            )));
         stream.reassembly = None;
         stream.is_read_closed = true;
         stream.is_peer_write_closed = true;
@@ -687,7 +686,9 @@ impl ReorderBuffer {
         if new_buffered > REASSEMBLY_MAX_BUFFERED_BYTES {
             return Err(ReassemblyError::BufferOverflow);
         }
-        if abs > self.cursor && (abs - self.cursor) as usize + data.len() > REASSEMBLY_MAX_RANGE_BYTES {
+        if abs > self.cursor
+            && (abs - self.cursor) as usize + data.len() > REASSEMBLY_MAX_RANGE_BYTES
+        {
             return Err(ReassemblyError::RangeOverflow);
         }
         self.buffered_bytes = new_buffered;
@@ -748,9 +749,7 @@ impl ReorderBuffer {
 }
 
 fn tracing_reassembly_error(stream_id: StreamId, offset: Offset, e: &ReassemblyError) {
-    eprintln!(
-        "mux: reassembly protocol error on stream {stream_id} at offset {offset:#x}: {e:?}"
-    );
+    eprintln!("mux: reassembly protocol error on stream {stream_id} at offset {offset:#x}: {e:?}");
 }
 
 #[derive(Debug, Clone)]
@@ -897,11 +896,12 @@ mod reassembly_tests {
 
         // Range overflow.
         let far_offset = 4 + 4 + (REASSEMBLY_MAX_RANGE_BYTES as u32) + 1;
-        let err = rb
-            .ingest(far_offset, buf(&[0; 4]))
-            .unwrap_err();
+        let err = rb.ingest(far_offset, buf(&[0; 4])).unwrap_err();
         assert!(
-            matches!(err, ReassemblyError::RangeOverflow | ReassemblyError::OutOfWindow),
+            matches!(
+                err,
+                ReassemblyError::RangeOverflow | ReassemblyError::OutOfWindow
+            ),
             "expected range/out-of-window error, got {err:?}"
         );
     }
@@ -937,9 +937,9 @@ mod reassembly_tests {
 
     // ---- End-to-end reassembly tests via MuxControl ----
 
-    use crate::stream::stream_close_channel;
-    use crate::stream::reader::{stream_read_data_channel, StreamReadDataRx, StreamReadDataMsg};
     use crate::control::WriteBrokenPipe;
+    use crate::stream::reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataRx};
+    use crate::stream::stream_close_channel;
 
     fn make_control(
         frame_reassembly: bool,
@@ -953,17 +953,12 @@ mod reassembly_tests {
         let (close_tx, _close_rx) = stream_close_channel();
         // Drain the write-data receiver so `derive` (which sends an Open
         // through the fair queue) never blocks.
-        let drain = tokio::spawn(async move {
-            while rx.recv().await.is_ok() {}
-        });
+        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
         (control, close_tx, drain)
     }
 
     /// Open a stream with a fresh (dispatcher, receiver) pair we control.
-    async fn open_test_stream(
-        control: &mut MuxControl,
-        stream_id: StreamId,
-    ) -> StreamReadDataRx {
+    async fn open_test_stream(control: &mut MuxControl, stream_id: StreamId) -> StreamReadDataRx {
         let (tx, rx) = stream_read_data_channel();
         let bp = WriteBrokenPipe::new();
         control.open(tx, bp, Some(stream_id)).await.unwrap();
@@ -1055,14 +1050,8 @@ mod reassembly_tests {
         let mut rx = open_test_stream(&mut control, 7).await;
 
         // Deliver offset 0 and offset 4 (total 8 bytes).
-        control
-            .ingest_reassembly(7, 0, buf(&[0; 4]))
-            .await
-            .unwrap();
-        control
-            .ingest_reassembly(7, 4, buf(&[1; 4]))
-            .await
-            .unwrap();
+        control.ingest_reassembly(7, 0, buf(&[0; 4])).await.unwrap();
+        control.ingest_reassembly(7, 4, buf(&[1; 4])).await.unwrap();
 
         // CloseWrite with final_offset=8. All bytes delivered, so the
         // stream completes and the reader sees Fin.
@@ -1088,10 +1077,7 @@ mod reassembly_tests {
         // Offset 0 frame delivered, but stream NOT complete (gap at 4).
         let msg = rx2.try_recv().expect("first frame delivered");
         assert!(matches!(msg, StreamReadDataMsg::Data(_)));
-        assert!(
-            rx2.try_recv().is_err(),
-            "no Fin yet — gap at 4"
-        );
+        assert!(rx2.try_recv().is_err(), "no Fin yet — gap at 4");
 
         // Now fill the gap (CloseWrite arrived before this Data frame).
         control2
@@ -1238,9 +1224,9 @@ mod reassembly_tests {
     /// gets a reader/writer pair. The subsequent Open is a no-op.
     #[tokio::test]
     async fn data_before_open_surfaces_accept_msg_once() {
+        use crate::central_io::writer::write_control_channel;
         use crate::stream::accepter::stream_accept_channel;
         use crate::stream::opener::stream_open_channel;
-        use crate::central_io::writer::write_control_channel;
 
         let (tx, mut rx) = crate::central_io::writer::write_data_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
@@ -1301,9 +1287,9 @@ mod reassembly_tests {
     /// final offset are delivered.
     #[tokio::test]
     async fn close_before_open_surfaces_accept_msg_and_preserves_eof() {
+        use crate::central_io::writer::write_control_channel;
         use crate::stream::accepter::stream_accept_channel;
         use crate::stream::opener::stream_open_channel;
-        use crate::central_io::writer::write_control_channel;
 
         let (tx, mut rx) = crate::central_io::writer::write_data_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
@@ -1348,7 +1334,10 @@ mod reassembly_tests {
         use tokio::io::AsyncReadExt;
         let mut reader = std::pin::pin!(reader);
         reader.read_to_end(&mut got).await.unwrap();
-        assert_eq!(got, [0xAA; 3], "reader gets data, then EOF after final_offset");
+        assert_eq!(
+            got, [0xAA; 3],
+            "reader gets data, then EOF after final_offset"
+        );
 
         drop(drain);
     }
@@ -1510,7 +1499,14 @@ mod reassembly_tests {
                 Err(_) => break,
             }
         }
-        assert_eq!(got, [0xAA; 4].iter().chain([0xBB; 4].iter()).copied().collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            [0xAA; 4]
+                .iter()
+                .chain([0xBB; 4].iter())
+                .copied()
+                .collect::<Vec<_>>()
+        );
         assert!(saw_fin, "Fin must arrive after the gap fills");
     }
 

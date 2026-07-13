@@ -21,8 +21,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    fmt,
-    io,
+    fmt, io,
     pin::Pin,
     task::{ready, Context, Poll},
     time::Duration,
@@ -155,10 +154,7 @@ impl ResumeHeader {
         })
     }
 
-    pub async fn write<W: AsyncWrite + Unpin>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), MigrationError> {
+    pub async fn write<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<(), MigrationError> {
         let buf = self.encode();
         writer
             .write_all(&buf)
@@ -167,9 +163,7 @@ impl ResumeHeader {
         Ok(())
     }
 
-    pub async fn read<R: AsyncRead + Unpin>(
-        reader: &mut R,
-    ) -> Result<Self, MigrationError> {
+    pub async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self, MigrationError> {
         let mut buf = [0u8; RESUME_HEADER_LEN];
         tokio::io::AsyncReadExt::read_exact(reader, &mut buf)
             .await
@@ -341,12 +335,13 @@ impl SpliceRegistry {
                 }
                 if header.is_final {
                     entry.final_seen = true;
-                } else if enforce_holdback_limits
-                    && entry.pending.len() >= MAX_PENDING_GENERATIONS
+                } else if enforce_holdback_limits && entry.pending.len() >= MAX_PENDING_GENERATIONS
                 {
                     return Err(MigrationError::TooManyPendingGenerations);
                 }
-                entry.pending.insert(header.generation, (header.is_final, reader));
+                entry
+                    .pending
+                    .insert(header.generation, (header.is_final, reader));
                 Ok(None)
             }
             None => {
@@ -357,10 +352,9 @@ impl SpliceRegistry {
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
                         self.orphan_count -= orphans.len();
                         for o in orphans {
-                            entry.pending.insert(
-                                o.header.generation,
-                                (o.header.is_final, o.reader),
-                            );
+                            entry
+                                .pending
+                                .insert(o.header.generation, (o.header.is_final, o.reader));
                             if o.header.is_final {
                                 entry.final_seen = true;
                             }
@@ -393,7 +387,11 @@ impl SpliceRegistry {
         self.orphans
             .entry(header.logical_id)
             .or_default()
-            .push_back(OrphanEntry { header, reader, deadline });
+            .push_back(OrphanEntry {
+                header,
+                reader,
+                deadline,
+            });
         self.orphan_count += 1;
         Ok(())
     }
@@ -415,10 +413,7 @@ impl SpliceRegistry {
 
     /// Pop the next pending generation for a logical stream, in
     /// generation-number order (NOT arrival order).
-    pub(crate) fn pop_pending(
-        &mut self,
-        logical_id: u64,
-    ) -> Option<(u32, bool, GenerationReader)> {
+    pub(crate) fn pop_pending(&mut self, logical_id: u64) -> Option<(u32, bool, GenerationReader)> {
         let entry = self.streams.get_mut(&logical_id)?;
         let (gen, (is_final, reader)) = entry.pending.pop_first()?;
         Some((gen, is_final, reader))
@@ -510,11 +505,9 @@ impl SplicedReader {
     /// Arm the successor-deadline timer.
     fn arm_timer(&mut self) {
         if self.successor_timer.is_none() && !self.is_closed {
-            self.successor_timer =
-                Some(Box::pin(tokio::time::sleep(self.successor_deadline)));
+            self.successor_timer = Some(Box::pin(tokio::time::sleep(self.successor_deadline)));
         }
     }
-
 }
 
 impl AsyncRead for SplicedReader {
@@ -634,9 +627,7 @@ impl AsyncRead for SplicedReader {
                     if timer_poll.is_ready() {
                         self.successor_timer = None;
                         self.finished = true;
-                        return Poll::Ready(Err(io::Error::from(
-                            MigrationError::TimedOut,
-                        )));
+                        return Poll::Ready(Err(io::Error::from(MigrationError::TimedOut)));
                     }
                     return Poll::Pending;
                 }
@@ -717,8 +708,7 @@ pub fn spawn_splice_driver(
                     if is_gen0 {
                         let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
                         let successor_deadline = registry.successor_deadline;
-                        let spliced =
-                            spliced.with_queue(queue_rx, successor_deadline);
+                        let spliced = spliced.with_queue(queue_rx, successor_deadline);
                         queues.insert(logical_id, queue_tx.clone());
                         // Gen0 is the SplicedReader's current slot, so the
                         // next generation to flush is 1.
@@ -727,12 +717,7 @@ pub fn spawn_splice_driver(
                         // any orphans into `pending`. Flush them now so
                         // the SplicedReader sees successors in contiguous
                         // order as soon as gen0 EOFs.
-                        flush_contiguous(
-                            &mut registry,
-                            logical_id,
-                            &queue_tx,
-                            &mut next_to_flush,
-                        );
+                        flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
                         let _ = gen0_tx.send((logical_id, spliced));
                     }
                 }
@@ -742,12 +727,7 @@ pub fn spawn_splice_driver(
                     // A gap (missing generation) stops the flush; the
                     // next arrival re-enters this arm and resumes.
                     if let Some(queue_tx) = queues.get(&logical_id) {
-                        flush_contiguous(
-                            &mut registry,
-                            logical_id,
-                            queue_tx,
-                            &mut next_to_flush,
-                        );
+                        flush_contiguous(&mut registry, logical_id, queue_tx, &mut next_to_flush);
                     }
                     let _ = is_final;
                 }
@@ -881,11 +861,19 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         // Dispatch gen0 — yields SplicedReader.
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
         // Dispatch gen1 BEFORE writing gen0 payload — it must pend.
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         registry.dispatch(h1, gen1_server).unwrap();
 
         // Write gen1 payload NOW (before gen0 is read). It must not surface.
@@ -935,11 +923,19 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         // gen0 -> SplicedReader.
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
         // gen1 dispatched and popped into the queue BEFORE any reads.
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         registry.dispatch(h1, gen1_server).unwrap();
 
         // Make gen1 fully ready first: write its payload AND drop the
@@ -992,7 +988,11 @@ mod tests {
         // and pends. Send an empty FINAL gen2 to reach clean EOF
         // (invariant d: clean EOF only via empty FINAL marker).
         let (gen2_client, gen2_server) = duplex(64);
-        let h2 = ResumeHeader { logical_id: 1, generation: 2, is_final: true };
+        let h2 = ResumeHeader {
+            logical_id: 1,
+            generation: 2,
+            is_final: true,
+        };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         // gen2 is FINAL and empty (writer dropped, no payload).
@@ -1020,7 +1020,11 @@ mod tests {
         let (gen1_client, gen1_server) = duplex(64);
 
         let mut registry = SpliceRegistry::new();
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
         // EMPTY queue attached — gen1 not yet enqueued.
@@ -1049,7 +1053,11 @@ mod tests {
         }
 
         // NOW enqueue gen1. The recv-waker must re-arm poll_read.
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
         queue_tx.send((false, gen1_r)).unwrap();
@@ -1068,7 +1076,11 @@ mod tests {
         let mut tail = [0u8; 1];
         // gen1 EOFs -> None branch -> need FINAL.
         let (gen2_client, gen2_server) = duplex(64);
-        let h2 = ResumeHeader { logical_id: 1, generation: 2, is_final: true };
+        let h2 = ResumeHeader {
+            logical_id: 1,
+            generation: 2,
+            is_final: true,
+        };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         drop(gen2_client);
@@ -1089,7 +1101,11 @@ mod tests {
         let (gen1_client, gen1_server) = duplex(64);
 
         let mut registry = SpliceRegistry::new();
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
         let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1098,7 +1114,11 @@ mod tests {
         // Enqueue gen1 IMMEDIATELY (before gen0 EOF) but with a LIVE
         // writer that has pushed NOTHING. gen1 is in the queue, ready to
         // be picked up, but has zero buffered bytes.
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
         queue_tx.send((false, gen1_r)).unwrap();
@@ -1126,7 +1146,11 @@ mod tests {
 
         drop(gen1_client);
         let (gen2_client, gen2_server) = duplex(64);
-        let h2 = ResumeHeader { logical_id: 1, generation: 2, is_final: true };
+        let h2 = ResumeHeader {
+            logical_id: 1,
+            generation: 2,
+            is_final: true,
+        };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         drop(gen2_client);
@@ -1148,13 +1172,21 @@ mod tests {
 
         // Insert gen 0 (creates stream entry).
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let _spliced = registry.dispatch(h0, c0).unwrap();
 
         // Enqueue MAX_PENDING_GENERATIONS successors.
         for i in 1..=MAX_PENDING_GENERATIONS as u32 {
             let (c, _s) = duplex(1);
-            let h = ResumeHeader { logical_id: 1, generation: i, is_final: false };
+            let h = ResumeHeader {
+                logical_id: 1,
+                generation: i,
+                is_final: false,
+            };
             assert!(registry.dispatch(h, c).is_ok(), "gen {i} should be ok");
         }
 
@@ -1166,7 +1198,10 @@ mod tests {
             is_final: false,
         };
         let result = registry.dispatch(h_over, c_over);
-        assert!(matches!(result, Err(MigrationError::TooManyPendingGenerations)));
+        assert!(matches!(
+            result,
+            Err(MigrationError::TooManyPendingGenerations)
+        ));
     }
 
     // -------------------------------------------------------------------
@@ -1185,11 +1220,18 @@ mod tests {
                 generation: 1,
                 is_final: false,
             };
-            assert!(registry.dispatch(h, c).is_ok(), "orphan {i} should be accepted");
+            assert!(
+                registry.dispatch(h, c).is_ok(),
+                "orphan {i} should be accepted"
+            );
         }
 
         let (c_over, _s_over) = duplex(1);
-        let h_over = ResumeHeader { logical_id: 200, generation: 1, is_final: false };
+        let h_over = ResumeHeader {
+            logical_id: 200,
+            generation: 1,
+            is_final: false,
+        };
         let result = registry.dispatch(h_over, c_over);
         assert!(matches!(result, Err(MigrationError::TooManyOrphans)));
     }
@@ -1220,7 +1262,10 @@ mod tests {
                 generation: 1,
                 is_final: false,
             };
-            assert!(registry.dispatch(h, c).is_ok(), "after TTL expiry orphan {i} should be accepted");
+            assert!(
+                registry.dispatch(h, c).is_ok(),
+                "after TTL expiry orphan {i} should be accepted"
+            );
         }
     }
 
@@ -1238,12 +1283,20 @@ mod tests {
 
         // gen0 carries no data; gen1 is FINAL with payload.
         let (_c0, s0) = duplex(64);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, s0).unwrap().unwrap();
         drop(_c0); // gen0 EOF immediately
 
         let (c1, mut s1) = duplex(64);
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: true };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: true,
+        };
         registry.dispatch(h1, c1).unwrap();
         s1.write_all(b"x").await.unwrap();
         drop(s1);
@@ -1268,7 +1321,11 @@ mod tests {
         // gen0 empty FINAL yields clean EOF immediately.
         let mut registry = SpliceRegistry::new();
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: true };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: true,
+        };
         let spliced = registry.dispatch(h0, c0).unwrap().unwrap();
         assert!(spliced.is_closed, "gen0 FINAL => is_closed true");
     }
@@ -1287,7 +1344,11 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         let (c0, mut s0) = duplex(64);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let mut spliced = registry.dispatch(h0, c0).unwrap().unwrap();
 
         // Provide a queue but never send a successor.
@@ -1323,11 +1384,19 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let _spliced = registry.dispatch(h0, c0).unwrap();
 
         let (c1, _s1) = duplex(1);
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         assert!(registry.dispatch(h1, c1).is_ok());
 
         let (c1b, _s1b) = duplex(1);
@@ -1340,7 +1409,11 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
 
         let (c0b, _s0b) = duplex(1);
@@ -1375,16 +1448,28 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 1, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 1,
+            generation: 0,
+            is_final: false,
+        };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
 
         // Dispatch gen2 BEFORE gen1.
         let (c2, _s2) = duplex(1);
-        let h2 = ResumeHeader { logical_id: 1, generation: 2, is_final: false };
+        let h2 = ResumeHeader {
+            logical_id: 1,
+            generation: 2,
+            is_final: false,
+        };
         assert!(registry.dispatch(h2, c2).is_ok());
 
         let (c1, _s1) = duplex(1);
-        let h1 = ResumeHeader { logical_id: 1, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 1,
+            generation: 1,
+            is_final: false,
+        };
         assert!(registry.dispatch(h1, c1).is_ok());
 
         // pop_pending must return gen1 then gen2.
@@ -1405,12 +1490,20 @@ mod tests {
         let mut registry = SpliceRegistry::new();
 
         let (c1, _s1) = duplex(1);
-        let h1 = ResumeHeader { logical_id: 42, generation: 1, is_final: false };
+        let h1 = ResumeHeader {
+            logical_id: 42,
+            generation: 1,
+            is_final: false,
+        };
         assert!(registry.dispatch(h1, c1).is_ok());
         assert_eq!(registry.orphan_count, 1);
 
         let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader { logical_id: 42, generation: 0, is_final: false };
+        let h0 = ResumeHeader {
+            logical_id: 42,
+            generation: 0,
+            is_final: false,
+        };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
         // The stream entry now exists; orphans for this logical id should
         // have been migrated into the pending queue.

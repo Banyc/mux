@@ -244,7 +244,10 @@ mod tests {
             Poll::Ready(Ok(n)) => n,
             other => panic!("poll_write should return Ready(Ok(...)): {other:?}"),
         };
-        assert_eq!(n, DATA_STAGING_CAP, "first poll_write must return DATA_STAGING_CAP");
+        assert_eq!(
+            n, DATA_STAGING_CAP,
+            "first poll_write must return DATA_STAGING_CAP"
+        );
 
         // The staged chunk is DATA_STAGING_CAP bytes. The downstream dispatcher
         // may split it into smaller caps, so drain every Data dispatch for
@@ -259,6 +262,9 @@ mod tests {
                 panic!("expected Data, got {:?}", msg.data);
             }
         }
-        assert_eq!(seen, DATA_STAGING_CAP, "total drained bytes must equal staged chunk");
+        assert_eq!(
+            seen, DATA_STAGING_CAP,
+            "total drained bytes must equal staged chunk"
+        );
     }
 }

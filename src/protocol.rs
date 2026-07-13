@@ -115,8 +115,9 @@ pub struct DataHeaderExt {
     pub offset: Offset,
 }
 impl DataHeaderExt {
-    pub const SIZE: usize =
-        core::mem::size_of::<StreamId>() + core::mem::size_of::<BodyLen>() + core::mem::size_of::<Offset>();
+    pub const SIZE: usize = core::mem::size_of::<StreamId>()
+        + core::mem::size_of::<BodyLen>()
+        + core::mem::size_of::<Offset>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
         let mut stream = [0; 4];
@@ -157,8 +158,7 @@ pub struct CloseWriteExtMsg {
     pub final_offset: Offset,
 }
 impl CloseWriteExtMsg {
-    pub const SIZE: usize =
-        core::mem::size_of::<StreamId>() + core::mem::size_of::<Offset>();
+    pub const SIZE: usize = core::mem::size_of::<StreamId>() + core::mem::size_of::<Offset>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
         let mut stream = [0; 4];

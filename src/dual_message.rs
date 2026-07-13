@@ -443,10 +443,8 @@ mod tests {
             spawn_mux_no_reconnection(bulk_cli_r, bulk_cli_w, config(), &mut cli_bulk);
 
         let _liveness = Liveness::new();
-        let srv_opener =
-            DualStreamOpener::new(int_srv_op, bulk_srv_op, Liveness::new());
-        let cli_accepter =
-            DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
+        let srv_opener = DualStreamOpener::new(int_srv_op, bulk_srv_op, Liveness::new());
+        let cli_accepter = DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
 
         let mut srv_spawner = JoinSet::new();
         srv_spawner.spawn(async move {
@@ -584,8 +582,7 @@ mod tests {
     async fn oversized_payload_rejected() {
         let (opener, _accepter, _srv, _cli) = paired_sessions().await;
 
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered)
-            .with_max_message_len(1024);
+        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_message_len(1024);
 
         let too_big = vec![0u8; 2048];
         let result = tx.send(&too_big).await;
@@ -625,15 +622,17 @@ mod tests {
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
         // Keep spawners alive so mux session tasks keep running.
-        tokio::task::spawn(async move { let _ = int_spawner.join_next().await; });
-        tokio::task::spawn(async move { let _ = bulk_spawner.join_next().await; });
+        tokio::task::spawn(async move {
+            let _ = int_spawner.join_next().await;
+        });
+        tokio::task::spawn(async move {
+            let _ = bulk_spawner.join_next().await;
+        });
 
         let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
-        let tx = Arc::new(
-            DualMessageSender::new(opener, DeliveryMode::Unordered)
-                .with_max_inflight(2),
-        );
+        let tx =
+            Arc::new(DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_inflight(2));
         let semaphore = tx.semaphore.clone();
 
         let barrier = Arc::new(Barrier::new(10));
@@ -772,6 +771,9 @@ mod tests {
             .collect();
         expected.sort();
         got.sort();
-        assert_eq!(got, expected, "force-advance must not drop buffered messages");
+        assert_eq!(
+            got, expected,
+            "force-advance must not drop buffered messages"
+        );
     }
 }
