@@ -515,27 +515,30 @@ impl DualStreamOpener {
 /// logical streams arriving out of order.
 pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
-    /// Feeds all migrating generations (gen 0 and successors) into the
-    /// background splice driver.
+    pass_plain_streams: bool,
     cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
-    /// Receives gen‑0 [`SplicedReader`]s created by the driver.
     gen0_rx: mpsc::UnboundedReceiver<(u64, SplicedReader)>,
-    /// Background driver that owns the [`SpliceRegistry`] and routes
-    /// successor generations into the matching [`SplicedReader`] queues.
     #[allow(dead_code)]
     driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
-    /// Stash for gen-0 readers that arrive out of logical-id order.
     stash: std::collections::VecDeque<(u64, SplicedReader)>,
 }
 
 impl MigratingCapableAccepter {
     pub fn new(inner: DualStreamAccepter) -> Self {
+        Self::new_with_plain_streams(inner, true)
+    }
+
+    fn new_with_plain_streams(
+        inner: DualStreamAccepter,
+        pass_plain_streams: bool,
+    ) -> Self {
         let (cont_tx, cont_rx) = mpsc::unbounded_channel();
         let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
         let registry = SpliceRegistry::new();
         let driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
         Self {
             inner,
+            pass_plain_streams,
             cont_tx,
             gen0_rx,
             driver,
@@ -611,6 +614,9 @@ impl MigratingCapableAccepter {
                 }
             }
 
+            if !self.pass_plain_streams {
+                continue;
+            }
             return Ok(AcceptedStream::Plain {
                 reader,
                 writer,
@@ -622,24 +628,25 @@ impl MigratingCapableAccepter {
     async fn peek_resume_header(
         mut reader: StreamReader,
     ) -> Result<(bool, Option<ResumeHeader>, StreamReader), MigratingError> {
-        use tokio::io::AsyncReadExt;
         use crate::stream_migration::RESUME_HEADER_LEN;
+        use tokio::io::AsyncReadExt;
 
         let mut buf = [0u8; RESUME_HEADER_LEN];
-        match reader.read_exact(&mut buf).await {
-            Ok(_n) => {
-                if let Some(header) = ResumeHeader::parse(&buf) {
-                    Ok((true, Some(header), reader))
-                } else {
-                    // Not a resume header: restore the 21 consumed bytes
-                    // so the caller sees the full original byte stream.
-                    reader.prepend(&buf);
-                    Ok((false, None, reader))
+        let mut filled = 0;
+        while filled < buf.len() {
+            match reader.read(&mut buf[filled..]).await {
+                Ok(0) | Err(_) => {
+                    reader.prepend(&buf[..filled]);
+                    return Ok((false, None, reader));
                 }
+                Ok(n) => filled += n,
             }
-            Err(_) => {
-                Ok((false, None, reader))
-            }
+        }
+        if let Some(header) = ResumeHeader::parse(&buf) {
+            Ok((true, Some(header), reader))
+        } else {
+            reader.prepend(&buf);
+            Ok((false, None, reader))
         }
     }
 
@@ -741,6 +748,10 @@ impl DualStreamAccepter {
     /// transparently handles migration streams.
     pub fn into_migrating_capable(self) -> MigratingCapableAccepter {
         MigratingCapableAccepter::new(self)
+    }
+
+    pub fn into_migrating_only(self) -> MigratingCapableAccepter {
+        MigratingCapableAccepter::new_with_plain_streams(self, false)
     }
 }
 
@@ -931,18 +942,78 @@ mod tests {
         let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut mac = accepter.into_migrating_capable();
 
-        // Open a plain (non-migrating) stream with enough data to
-        // survive the resume-header peek (21 bytes minimum).
         let (_reader, mut writer) = opener.open(LaneClass::Interactive).await.unwrap();
         let data = vec![0x00u8; 30];
         writer.write_all(&data).await.unwrap();
         writer.shutdown().unwrap();
 
-        // Accept should return a Plain stream
         let accepted = mac.accept().await.unwrap();
         match accepted {
-            AcceptedStream::Plain { .. } => {} // expected
+            AcceptedStream::Plain { mut reader, .. } => {
+                let mut received = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut received)
+                    .await
+                    .unwrap();
+                assert_eq!(received, data);
+            }
             _ => panic!("expected Plain stream"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrating_capable_accepter_preserves_short_plain_stream() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        let (_reader, mut writer) = opener.open(LaneClass::Interactive).await.unwrap();
+        let data = b"short";
+        writer.write_all(data).await.unwrap();
+        writer.shutdown().unwrap();
+
+        let accepted = mac.accept().await.unwrap();
+        match accepted {
+            AcceptedStream::Plain { mut reader, .. } => {
+                let mut received = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut received)
+                    .await
+                    .unwrap();
+                assert_eq!(received, data);
+            }
+            _ => panic!("expected Plain stream"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrating_only_accepter_discards_empty_and_truncated_streams() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_only();
+        let (_reader, mut empty_writer) = opener.open(LaneClass::Interactive).await.unwrap();
+        empty_writer.shutdown().unwrap();
+        let (_reader, mut short_writer) = opener.open(LaneClass::Interactive).await.unwrap();
+        short_writer.write_all(b"short").await.unwrap();
+        short_writer.shutdown().unwrap();
+        let accept = tokio::spawn(async move { mac.accept().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !accept.is_finished(),
+            "empty or truncated stream escaped as an application stream"
+        );
+        let mut writer = opener.open_migrating(42, LaneClass::Interactive);
+        writer.write_all(b"hello").await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(1), accept)
+            .await
+            .expect("strict accepter did not reach the valid migrating stream")
+            .unwrap()
+            .unwrap();
+        match accepted {
+            AcceptedStream::Migrating { mut reader, .. } => {
+                let mut received = [0; 5];
+                tokio::io::AsyncReadExt::read_exact(&mut reader, &mut received)
+                    .await
+                    .unwrap();
+                assert_eq!(&received, b"hello");
+            }
+            other => panic!("expected Migrating, got: {other:?}"),
         }
     }
 

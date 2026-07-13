@@ -49,12 +49,6 @@ impl StreamReaderState {
         buf: &mut [u8],
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<usize>> {
-        if let Some(kind) = self.read_error {
-            return Poll::Ready(Err(io::Error::from(kind)));
-        }
-        if self.is_eof {
-            return Poll::Ready(Ok(0));
-        }
         if self.prepend_pos < self.prepend.len() {
             let src = &self.prepend[self.prepend_pos..];
             let n = buf.len().min(src.len());
@@ -65,6 +59,12 @@ impl StreamReaderState {
                 self.prepend_pos = 0;
             }
             return Poll::Ready(Ok(n));
+        }
+        if let Some(kind) = self.read_error {
+            return Poll::Ready(Err(io::Error::from(kind)));
+        }
+        if self.is_eof {
+            return Poll::Ready(Ok(0));
         }
         let (data_buf, pos) = match self.leftover.take() {
             Some(x) => x,
