@@ -272,6 +272,16 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
+    pub async fn flush(&mut self) -> Result<(), MigratingError> {
+        use tokio::io::AsyncWriteExt;
+        match &mut self.state {
+            WriterState::Active { writer, .. } => writer.flush().await.map_err(|_| MigratingError::WriteFailed),
+            WriterState::Migrating { .. } => { self.ensure_open().await?; Ok(()) }
+            WriterState::PendingOpen { .. } => Ok(()),
+            WriterState::Closed => Err(MigratingError::LaneDead),
+        }
+    }
+
     fn route_opened_reader(&mut self, generation: u32, reader: StreamReader) {
         let mut reader = reader;
         if generation == 0 {
@@ -650,6 +660,9 @@ impl MigratingCapableAccepter {
                 Err(_) => return Ok(None),
                 Ok(result) => match result {
                     Ok(0) | Err(_) => {
+                        if filled > 0 {
+                            reader.prepend(&buf[..filled]);
+                        }
                         return Ok(Some((false, None, reader)));
                     }
                     Ok(n) => filled += n,
@@ -659,6 +672,7 @@ impl MigratingCapableAccepter {
         if let Some(header) = ResumeHeader::parse(&buf) {
             Ok(Some((true, Some(header), reader)))
         } else {
+            reader.prepend(&buf);
             Ok(Some((false, None, reader)))
         }
     }
@@ -1051,17 +1065,24 @@ mod tests {
             other => panic!("expected Migrating, got: {other:?}"),
         };
 
-        // Drop mac to close the splice-driver queue, unblocking SplicedReader
-        drop(mac);
+        // Drain successor generations so the FINAL gen reaches the
+        // SplicedReader's queue before we read.
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         send.await.unwrap();
 
-        // Read from SplicedReader — gets EOF after payload (no FINAL)
+        // Read from SplicedReader — gets clean EOF after payload + FINAL
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut Box::pin(reader), &mut data)
             .await
             .unwrap();
         assert_eq!(data, b"hello-world");
+
+        drain.abort();
     }
 
     // -------------------------------------------------------------------
@@ -1359,7 +1380,11 @@ mod tests {
             _ => panic!("expected migrating stream"),
         };
 
-        drop(mac);
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         let mut data = Vec::with_capacity(sync_size + 200);
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1379,6 +1404,7 @@ mod tests {
         }
 
         send.await.unwrap();
+        drain.abort();
     }
 
     // -------------------------------------------------------------------
@@ -1455,7 +1481,11 @@ mod tests {
             _ => panic!("expected migrating stream"),
         };
 
-        drop(mac);
+        let drain = tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        });
 
         let mut data = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data)
@@ -1464,6 +1494,7 @@ mod tests {
         assert_eq!(data, "data-on-bulk");
 
         send.await.unwrap();
+        drain.abort();
     }
 
     // -------------------------------------------------------------------

@@ -347,6 +347,7 @@ dependencies = [
  "async_smux",
  "clap",
  "file_transfer",
+ "getrandom",
  "primitive",
  "tokio",
  "tokio-util",

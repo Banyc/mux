@@ -667,115 +667,137 @@ pub fn spawn_splice_driver(
     tokio::spawn(async move {
         let mut queues: HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>> =
             HashMap::new();
-        // Next generation number to flush to each stream's queue. Gen0 is
-        // handed to the SplicedReader directly as its `current` slot, so
-        // flushing begins at 1. This guarantees strictly contiguous
-        // handoff: a gap (missing generation N) stops the flush, and the
-        // next arrival re-enters the flush arm and resumes from N.
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
         let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
-        let mut cleanup_rxs: HashMap<u64, tokio::sync::mpsc::UnboundedReceiver<(u64, u64)>> =
-            HashMap::new();
+        let (cleanup_tx, mut cleanup_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let mut next_incarnation: u64 = 1;
 
-        /// Flush contiguous pending generations for `logical_id` starting
-        /// at `next_to_flush[logical_id]` into `queue_tx`. Stops at the
-        /// first gap so a missing generation never lets a later one jump
-        /// ahead.
         fn flush_contiguous(
             registry: &mut SpliceRegistry,
             logical_id: u64,
             queue_tx: &tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>,
             next_to_flush: &mut HashMap<u64, u32>,
-        ) {
+        ) -> bool {
             let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
-            // Peek-and-pop loop: pop_pending returns the lowest-keyed
-            // entry. If it matches `next`, send it and advance; if it
-            // doesn't, put it back (we can't put it back, so we only pop
-            // when we know it matches — use a peek first).
-            // SpliceRegistry doesn't expose a peek, so we pop and
-            // re-insert on mismatch.
+            let mut saw_final = false;
             while let Some((gen, is_final, reader)) = registry.pop_pending(logical_id) {
                 if gen == next {
+                    saw_final = saw_final || is_final;
                     let _ = queue_tx.send((is_final, reader));
                     next = next.checked_add(1).expect("generation overflow");
                 } else {
-                    // Gap: re-insert and stop.
                     registry.reinsert_pending(logical_id, gen, is_final, reader);
                     break;
                 }
             }
             next_to_flush.insert(logical_id, next);
+            saw_final
         }
 
-        while let Some((header, reader)) = cont_rx.recv().await {
-            // Drain cleanup tokens from dropped readers
-            let mut cleaned_up: Vec<u64> = Vec::new();
-            for (id, rx) in cleanup_rxs.iter_mut() {
-                while let Ok((_, token)) = rx.try_recv() {
-                    if cleanup_tokens.get(id) == Some(&token) {
-                        cleaned_up.push(*id);
+        fn cleanup_all(
+            logical_id: u64,
+            queues: &mut HashMap<
+                u64,
+                tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>,
+            >,
+            cleanup_tokens: &mut HashMap<u64, u64>,
+            next_to_flush: &mut HashMap<u64, u32>,
+            registry: &mut SpliceRegistry,
+        ) {
+            queues.remove(&logical_id);
+            cleanup_tokens.remove(&logical_id);
+            next_to_flush.remove(&logical_id);
+            registry.remove_stream(logical_id);
+        }
+
+        loop {
+            tokio::select! {
+                cont = cont_rx.recv() => {
+                    let Some((header, reader)) = cont else {
+                        break;
+                    };
+
+                    let logical_id = header.logical_id;
+                    let is_gen0 = header.generation == 0;
+
+                    let spliced_opt = match registry.dispatch(header, reader) {
+                        Ok(opt) => opt,
+                        Err(MigrationError::DuplicateGeneration) => {
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    match spliced_opt {
+                        Some(spliced) => {
+                            if is_gen0 {
+                                let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+                                let successor_deadline = registry.successor_deadline;
+                                let token = next_incarnation;
+                                next_incarnation = next_incarnation
+                                    .checked_add(1)
+                                    .expect("incarnation overflow");
+                                let spliced = spliced.with_queue_and_cleanup(
+                                    queue_rx,
+                                    successor_deadline,
+                                    cleanup_tx.clone(),
+                                    token,
+                                );
+                                queues.insert(logical_id, queue_tx.clone());
+                                cleanup_tokens.insert(logical_id, token);
+                                next_to_flush.insert(logical_id, 1);
+                                flush_contiguous(
+                                    &mut registry,
+                                    logical_id,
+                                    &queue_tx,
+                                    &mut next_to_flush,
+                                );
+                                if gen0_tx.send((logical_id, spliced)).is_err() {
+                                    cleanup_all(
+                                        logical_id,
+                                        &mut queues,
+                                        &mut cleanup_tokens,
+                                        &mut next_to_flush,
+                                        &mut registry,
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(queue_tx) = queues.get(&logical_id).cloned() {
+                                let saw_final = flush_contiguous(
+                                    &mut registry,
+                                    logical_id,
+                                    &queue_tx,
+                                    &mut next_to_flush,
+                                );
+                                if saw_final {
+                                    cleanup_all(
+                                        logical_id,
+                                        &mut queues,
+                                        &mut cleanup_tokens,
+                                        &mut next_to_flush,
+                                        &mut registry,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            for id in &cleaned_up {
-                queues.remove(id);
-                cleanup_tokens.remove(id);
-                cleanup_rxs.remove(id);
-                next_to_flush.remove(id);
-                registry.remove_stream(*id);
-            }
-            let logical_id = header.logical_id;
-            let is_gen0 = header.generation == 0;
-            let is_final = header.is_final;
-            let spliced_opt = match registry.dispatch(header, reader) {
-                Ok(opt) => opt,
-                Err(MigrationError::DuplicateGeneration) => {
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            match spliced_opt {
-                Some(spliced) => {
-                    if is_gen0 {
-                        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
-                        let (cleanup_tx, cleanup_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
-                        let successor_deadline = registry.successor_deadline;
-                        let token = 0u64;
-                        let spliced = spliced.with_queue_and_cleanup(
-                            queue_rx,
-                            successor_deadline,
-                            cleanup_tx,
-                            token,
-                        );
-                        queues.insert(logical_id, queue_tx.clone());
-                        cleanup_tokens.insert(logical_id, token);
-                        cleanup_rxs.insert(logical_id, cleanup_rx);
-                        next_to_flush.insert(logical_id, 1);
-                        flush_contiguous(
-                            &mut registry,
-                            logical_id,
-                            &queue_tx,
-                            &mut next_to_flush,
-                        );
-                        let _ = gen0_tx.send((logical_id, spliced));
-                    }
-                }
-                None => {
-                    if let Some(queue_tx) = queues.get(&logical_id) {
-                        flush_contiguous(
-                            &mut registry,
-                            logical_id,
-                            queue_tx,
-                            &mut next_to_flush,
-                        );
-                    }
-                    if is_final {
-                        queues.remove(&logical_id);
-                        cleanup_tokens.remove(&logical_id);
-                        cleanup_rxs.remove(&logical_id);
-                        next_to_flush.remove(&logical_id);
-                        registry.remove_stream(logical_id);
+                cleanup = cleanup_rx.recv() => {
+                    if let Some((logical_id, token)) = cleanup {
+                        if let Some(&current_token) = cleanup_tokens.get(&logical_id) {
+                            if current_token == token {
+                                cleanup_all(
+                                    logical_id,
+                                    &mut queues,
+                                    &mut cleanup_tokens,
+                                    &mut next_to_flush,
+                                    &mut registry,
+                                );
+                            }
+                        }
                     }
                 }
             }

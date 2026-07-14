@@ -54,21 +54,10 @@ impl From<io::Error> for RunCentralIoReaderError {
 
 #[derive(Debug)]
 pub struct CentralIoReader<R> {
-    /// The transport reader wrapped in a buffer.
-    ///
-    /// Each frame is read in several small `read_exact` calls (a `Header::SIZE`
-    /// header, then either a `DataHeader::SIZE` + body or a
-    /// `StreamIdMsg::SIZE`). Buffering coalesces those small reads so they hit
-    /// an in-process buffer instead of each paying for a transport receive.
-    ///
-    /// This is safe because the reader half is owned by `CentralIoReader` until
-    /// the underlying connection dies; the buffered reader is never handed back,
-    /// so no buffered byte can be stranded or lost.
     io_reader: BufReader<R>,
     buf_pool: ArcObjPool<Vec<u8>>,
-    /// When true, Data frames carry a per-stream u32 offset and CloseWrite
-    /// carries a final offset, parsed via `DataHeaderExt` / `CloseWriteExtMsg`.
     frame_reassembly: bool,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl<R> CentralIoReader<R>
 where
@@ -79,7 +68,13 @@ where
             io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, io_reader),
             buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
             frame_reassembly,
+            ready_tx: None,
         }
+    }
+
+    pub fn with_ready_tx(mut self, ready_tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        self.ready_tx = Some(ready_tx);
+        self
     }
 }
 impl<R> CentralIoReader<R>
@@ -115,6 +110,9 @@ where
                 format!("unknown header: {hdr:?}"),
             )
         })?;
+        if let Some(ready_tx) = self.ready_tx.take() {
+            let _ = ready_tx.send(());
+        }
         Ok(match hdr {
             Header::Heartbeat => None,
             Header::Open => Some(CentralIoReadMsg::Open(self.recv_stream_id().await?)),

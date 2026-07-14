@@ -1,7 +1,5 @@
 use std::{
-    collections::hash_map::RandomState,
     future::Future,
-    hash::{BuildHasher, Hasher},
     io,
     ops::DerefMut,
     pin::Pin,
@@ -78,16 +76,13 @@ pub struct PairingNonce([u8; PAIRING_NONCE_LEN]);
 
 impl PairingNonce {
     pub fn generate() -> Self {
-        let rs = RandomState::new();
         let mut buf = [0u8; PAIRING_NONCE_LEN];
-        // Fill each u64 word from a separate OS-seeded hasher for full entropy.
-        let mut h0 = rs.build_hasher();
-        h0.write_u64(0);
-        buf[0..8].copy_from_slice(&h0.finish().to_le_bytes());
-        let mut h1 = rs.build_hasher();
-        h1.write_u64(1);
-        buf[8..16].copy_from_slice(&h1.finish().to_le_bytes());
+        getrandom::getrandom(&mut buf).expect("PairingNonce generation failed");
         Self(buf)
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0
     }
 }
 
