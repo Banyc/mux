@@ -266,15 +266,13 @@ where
     let frame_reassembly = config.frame_reassembly;
     let mut central_io_reader_spawner = JoinSet::new();
     central_io_reader_spawner.spawn(async move {
-        let mut central_io_reader = CentralIoReader::new(io_reader, frame_reassembly);
-        if let Some(tx) = ready_tx {
-            central_io_reader = central_io_reader.with_ready_tx(tx);
-        }
+        let central_io_reader = CentralIoReader::new(io_reader, frame_reassembly);
         run_central_io_reader(
             central_io_reader,
             central_io_read_tx,
             heartbeat_interval,
             first_receive_deadline,
+            ready_tx,
         )
         .await
     });

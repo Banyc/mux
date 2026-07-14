@@ -23,6 +23,7 @@ pub async fn run_central_io_reader<R>(
     tx: CentralIoReadTx,
     heartbeat_interval: Duration,
     first_receive_deadline: Option<Duration>,
+    mut first_receive_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), RunCentralIoReaderError>
 where
     R: AsyncRead + Unpin,
@@ -31,7 +32,7 @@ where
     let mut deadline = first_receive_deadline.unwrap_or(steady_deadline);
     loop {
         let msg = io_reader
-            .recv_with_steady_deadline(deadline, steady_deadline)
+            .recv_with_steady_deadline(deadline, steady_deadline, &mut first_receive_tx)
             .await
             .map_err(RunCentralIoReaderError::IoReader)?;
         deadline = steady_deadline;
@@ -57,7 +58,6 @@ pub struct CentralIoReader<R> {
     io_reader: BufReader<R>,
     buf_pool: ArcObjPool<Vec<u8>>,
     frame_reassembly: bool,
-    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl<R> CentralIoReader<R>
 where
@@ -68,13 +68,7 @@ where
             io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, io_reader),
             buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
             frame_reassembly,
-            ready_tx: None,
         }
-    }
-
-    pub fn with_ready_tx(mut self, ready_tx: tokio::sync::oneshot::Sender<()>) -> Self {
-        self.ready_tx = Some(ready_tx);
-        self
     }
 }
 impl<R> CentralIoReader<R>
@@ -85,6 +79,7 @@ where
         &mut self,
         mut deadline: Duration,
         steady_deadline: Duration,
+        first_receive_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> io::Result<CentralIoReadMsg> {
         loop {
             let res = tokio::time::timeout(deadline, self.recv_pkt())
@@ -95,6 +90,9 @@ where
                         "receive deadline - session timed out",
                     )
                 })??;
+            if let Some(tx) = first_receive_tx.take() {
+                let _ = tx.send(());
+            }
             deadline = steady_deadline;
             if let Some(res) = res {
                 return Ok(res);
@@ -110,9 +108,6 @@ where
                 format!("unknown header: {hdr:?}"),
             )
         })?;
-        if let Some(ready_tx) = self.ready_tx.take() {
-            let _ = ready_tx.send(());
-        }
         Ok(match hdr {
             Header::Heartbeat => None,
             Header::Open => Some(CentralIoReadMsg::Open(self.recv_stream_id().await?)),
@@ -224,5 +219,45 @@ impl CentralIoReadRx {
             .recv()
             .await
             .ok_or(DeadCentralIo { side: Side::Read })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn first_receive_ready_waits_for_complete_open_frame() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut reader = CentralIoReader::new(server, false);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let mut first_receive_tx = Some(ready_tx);
+
+        client.write_all(&[0x01]).await.unwrap();
+
+        let _handle = tokio::spawn(async move {
+            let _ = reader
+                .recv_with_steady_deadline(
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                    &mut first_receive_tx,
+                )
+                .await;
+        });
+
+        match tokio::time::timeout(Duration::from_millis(100), &mut ready_rx).await {
+            Err(_elapsed) => {}
+            Ok(Ok(())) => panic!("ready_tx fired before complete frame was consumed"),
+            Ok(Err(_)) => {}
+        }
+
+        client.write_all(&0u32.to_be_bytes()).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut ready_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("ready_tx sender dropped without sending"),
+            Err(_elapsed) => panic!("ready_tx did not resolve after complete frame"),
+        }
     }
 }

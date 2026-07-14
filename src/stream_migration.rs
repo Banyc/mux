@@ -684,7 +684,10 @@ pub fn spawn_splice_driver(
             while let Some((gen, is_final, reader)) = registry.pop_pending(logical_id) {
                 if gen == next {
                     saw_final = saw_final || is_final;
-                    let _ = queue_tx.send((is_final, reader));
+                    if queue_tx.send((is_final, reader)).is_err() {
+                        saw_final = true;
+                        break;
+                    }
                     next = next.checked_add(1).expect("generation overflow");
                 } else {
                     registry.reinsert_pending(logical_id, gen, is_final, reader);
@@ -732,35 +735,41 @@ pub fn spawn_splice_driver(
                     match spliced_opt {
                         Some(spliced) => {
                             if is_gen0 {
-                                let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
-                                let successor_deadline = registry.successor_deadline;
-                                let token = next_incarnation;
-                                next_incarnation = next_incarnation
-                                    .checked_add(1)
-                                    .expect("incarnation overflow");
-                                let spliced = spliced.with_queue_and_cleanup(
-                                    queue_rx,
-                                    successor_deadline,
-                                    cleanup_tx.clone(),
-                                    token,
-                                );
-                                queues.insert(logical_id, queue_tx.clone());
-                                cleanup_tokens.insert(logical_id, token);
-                                next_to_flush.insert(logical_id, 1);
-                                flush_contiguous(
-                                    &mut registry,
-                                    logical_id,
-                                    &queue_tx,
-                                    &mut next_to_flush,
-                                );
-                                if gen0_tx.send((logical_id, spliced)).is_err() {
-                                    cleanup_all(
-                                        logical_id,
-                                        &mut queues,
-                                        &mut cleanup_tokens,
-                                        &mut next_to_flush,
-                                        &mut registry,
+                                if spliced.is_closed() {
+                                    if gen0_tx.send((logical_id, spliced)).is_err() {
+                                    }
+                                } else {
+                                    let (queue_tx, queue_rx) =
+                                        tokio::sync::mpsc::unbounded_channel();
+                                    let successor_deadline = registry.successor_deadline;
+                                    let token = next_incarnation;
+                                    next_incarnation = next_incarnation
+                                        .checked_add(1)
+                                        .expect("incarnation overflow");
+                                    let spliced = spliced.with_queue_and_cleanup(
+                                        queue_rx,
+                                        successor_deadline,
+                                        cleanup_tx.clone(),
+                                        token,
                                     );
+                                    queues.insert(logical_id, queue_tx.clone());
+                                    cleanup_tokens.insert(logical_id, token);
+                                    next_to_flush.insert(logical_id, 1);
+                                    flush_contiguous(
+                                        &mut registry,
+                                        logical_id,
+                                        &queue_tx,
+                                        &mut next_to_flush,
+                                    );
+                                    if gen0_tx.send((logical_id, spliced)).is_err() {
+                                        cleanup_all(
+                                            logical_id,
+                                            &mut queues,
+                                            &mut cleanup_tokens,
+                                            &mut next_to_flush,
+                                            &mut registry,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1674,71 +1683,75 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Splice driver releases completed stream state after FINAL.
+    // Stale-token cleanup: old reader drop after reuse does not kill
+    // the replacement reader. The cleanup token mechanism must
+    // discriminate incarnations.
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn splice_driver_releases_completed_stream_state_after_final() {
+    async fn incarnation_stale_reader_drop_does_not_kill_new_reader() {
         let registry = SpliceRegistry::new();
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
         let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
 
-        let (c0, _s0) = duplex(64);
+        let (c0, mut s0) = duplex(64);
         let h0 = ResumeHeader {
-            logical_id: 1,
+            logical_id: 77,
             generation: 0,
             is_final: false,
         };
-        cont_tx
-            .send((h0, Box::pin(c0)))
-            .unwrap();
+        cont_tx.send((h0, Box::pin(c0))).unwrap();
         let (id0, mut reader0) = gen0_rx.recv().await.unwrap();
-        assert_eq!(id0, 1);
+        assert_eq!(id0, 77);
 
         let (c1, _s1) = duplex(1);
         let h1 = ResumeHeader {
-            logical_id: 1,
+            logical_id: 77,
             generation: 1,
             is_final: true,
         };
-        cont_tx
-            .send((h1, Box::pin(c1)))
-            .unwrap();
+        cont_tx.send((h1, Box::pin(c1))).unwrap();
 
         drop(_s1);
-        drop(_s0);
-        let mut buf = [0u8; 1];
-        let n = reader0.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "gen0 should EOF");
+        s0.write_all(b"hello").await.unwrap();
+        drop(s0);
+        let mut buf = [0u8; 5];
+        reader0.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        let n = reader0.read(&mut buf[..1]).await.unwrap();
+        assert_eq!(n, 0, "reader0 clean EOF after FINAL g1");
 
-        drop(reader0);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let (c_new, _s_new) = duplex(64);
+        let (c_new, mut s_new) = duplex(64);
         let h_new = ResumeHeader {
-            logical_id: 1,
+            logical_id: 77,
             generation: 0,
             is_final: false,
         };
-        cont_tx
-            .send((h_new, Box::pin(c_new)))
-            .unwrap();
-        let (id_new, reader_new) = gen0_rx.recv().await.unwrap();
-        assert_eq!(id_new, 1, "reused logical ID must produce a new reader");
+        cont_tx.send((h_new, Box::pin(c_new))).unwrap();
+        let (id_new, mut reader_new) = gen0_rx.recv().await.unwrap();
+        assert_eq!(id_new, 77);
 
-        let (c1_new, _s1_new) = duplex(64);
+        drop(reader0);
+
+        let (c1_new, mut s1_new) = duplex(64);
         let h1_new = ResumeHeader {
-            logical_id: 1,
+            logical_id: 77,
             generation: 1,
             is_final: false,
         };
-        cont_tx
-            .send((h1_new, Box::pin(c1_new)))
-            .unwrap();
+        cont_tx.send((h1_new, Box::pin(c1_new))).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(reader_new);
-        let _ = _s1_new;
+        s_new.write_all(b"y").await.unwrap();
+        drop(s_new);
+        let mut buf = [0u8; 1];
+        reader_new.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"y", "new reader gen0 byte");
+
+        s1_new.write_all(b"x").await.unwrap();
+        drop(s1_new);
+        let mut buf = [0u8; 1];
+        reader_new.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"x", "new reader receives gen1 byte despite old reader drop");
     }
 }
