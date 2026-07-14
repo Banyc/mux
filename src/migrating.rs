@@ -38,6 +38,11 @@ const DEMOTE_COOLDOWN: Duration = Duration::from_millis(150);
 /// `LATENCY_HISTORY_MAX` in `central_io::writer`).
 const HISTORY_MAX: usize = 16;
 
+#[cfg(not(test))]
+const RESUME_HEADER_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const RESUME_HEADER_DEADLINE: Duration = Duration::from_millis(100);
+
 // ---------------------------------------------------------------------------
 // Mirrored classifier
 // ---------------------------------------------------------------------------
@@ -570,7 +575,11 @@ impl MigratingCapableAccepter {
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
 
-            let (is_migrating, header_opt, reader) = Self::peek_resume_header(reader).await?;
+            let Some((is_migrating, header_opt, reader)) =
+                Self::peek_resume_header(reader).await?
+            else {
+                continue;
+            };
 
             if is_migrating {
                 if let Some(header) = header_opt {
@@ -629,26 +638,28 @@ impl MigratingCapableAccepter {
 
     async fn peek_resume_header(
         mut reader: StreamReader,
-    ) -> Result<(bool, Option<ResumeHeader>, StreamReader), MigratingError> {
-        use crate::stream_migration::RESUME_HEADER_LEN;
+    ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingError> {
+        use crate::stream_migration::{ResumeHeader, RESUME_HEADER_LEN};
         use tokio::io::AsyncReadExt;
-
         let mut buf = [0u8; RESUME_HEADER_LEN];
         let mut filled = 0;
+        let deadline = tokio::time::Instant::now() + RESUME_HEADER_DEADLINE;
         while filled < buf.len() {
-            match reader.read(&mut buf[filled..]).await {
-                Ok(0) | Err(_) => {
-                    reader.prepend(&buf[..filled]);
-                    return Ok((false, None, reader));
-                }
-                Ok(n) => filled += n,
+            let read = tokio::time::timeout_at(deadline, reader.read(&mut buf[filled..])).await;
+            match read {
+                Err(_) => return Ok(None),
+                Ok(result) => match result {
+                    Ok(0) | Err(_) => {
+                        return Ok(Some((false, None, reader)));
+                    }
+                    Ok(n) => filled += n,
+                },
             }
         }
         if let Some(header) = ResumeHeader::parse(&buf) {
-            Ok((true, Some(header), reader))
+            Ok(Some((true, Some(header), reader)))
         } else {
-            reader.prepend(&buf);
-            Ok((false, None, reader))
+            Ok(Some((false, None, reader)))
         }
     }
 }
