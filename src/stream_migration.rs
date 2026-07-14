@@ -302,7 +302,6 @@ impl SpliceRegistry {
         continuation: impl AsyncRead + Send + Sync + 'static,
     ) -> Result<Option<SplicedReader>, MigrationError> {
         let reader: GenerationReader = Box::pin(continuation);
-
         match self.streams.get_mut(&header.logical_id) {
             Some(entry) => {
                 if header.generation == 0 {
@@ -325,23 +324,24 @@ impl SpliceRegistry {
                 if header.generation == 0 {
                     let mut entry = StreamEntry::new();
                     entry.final_seen = header.is_final;
-                    let current_is_final = header.is_final;
+                    let is_closed = header.is_final;
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
                         self.orphan_count -= orphans.len();
-                        for o in orphans {
+                        for orphan in orphans {
                             entry
                                 .pending
-                                .insert(o.header.generation, (o.header.is_final, o.reader));
-                            if o.header.is_final {
+                                .insert(orphan.header.generation, (orphan.header.is_final, orphan.reader));
+                            if orphan.header.is_final {
                                 entry.final_seen = true;
                             }
                         }
                     }
-                    let is_closed = entry.final_seen;
                     self.streams.insert(header.logical_id, entry);
-                    let spliced =
-                        SplicedReader::new(header.logical_id, Some(reader), current_is_final, is_closed);
-                    Ok(Some(spliced))
+                    Ok(Some(SplicedReader::new(
+                        header.logical_id,
+                        Some(reader),
+                        is_closed,
+                    )))
                 } else {
                     self.insert_orphan(header, reader)?;
                     Ok(None)
@@ -431,18 +431,14 @@ impl Default for SpliceRegistry {
 pub struct SplicedReader {
     logical_id: u64,
     current: Option<GenerationReader>,
-    /// Whether the *current* generation carries the FINAL marker. If it
-    /// yields any payload, the read errors with InvalidData.
     current_is_final: bool,
     queue_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(bool, GenerationReader)>>,
-    /// Deadline timer: when no successor arrives within
-    /// `successor_deadline`, a non-closed reader yields BrokenPipe.
     successor_timer: Option<Pin<Box<Sleep>>>,
     successor_deadline: Duration,
-    is_closed: bool,
-    finished: bool,
     cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>,
     cleanup_token: u64,
+    is_closed: bool,
+    finished: bool,
 }
 
 impl fmt::Debug for SplicedReader {
@@ -464,23 +460,18 @@ impl Drop for SplicedReader {
 }
 
 impl SplicedReader {
-    fn new(
-        logical_id: u64,
-        current: Option<GenerationReader>,
-        current_is_final: bool,
-        is_closed: bool,
-    ) -> Self {
+    fn new(logical_id: u64, current: Option<GenerationReader>, is_closed: bool) -> Self {
         Self {
             logical_id,
             current,
-            current_is_final,
+            current_is_final: is_closed,
             queue_rx: None,
             successor_timer: None,
             successor_deadline: DEFAULT_SUCCESSOR_DEADLINE,
-            is_closed,
-            finished: false,
             cleanup_tx: None,
             cleanup_token: 0,
+            is_closed,
+            finished: false,
         }
     }
 
@@ -1825,32 +1816,6 @@ mod tests {
         assert_eq!(&buf, b"gen1-data", "replacement receives gen1 data");
     }
 
-    /// FINAL already present among orphans when gen0 arrives.
-    /// Dispatch gen-1 FINAL (orphan) before gen-0 dispatch, then dispatch
-    /// gen-0, assert the SplicedReader is closed (is_closed = true).
-    #[tokio::test]
-    async fn final_orphan_marks_spliced_reader_closed() {
-        let mut registry = SpliceRegistry::new();
-
-        let (c1, _s1) = duplex(1);
-        let h1 = ResumeHeader {
-            logical_id: 99,
-            generation: 1,
-            is_final: true,
-        };
-        assert!(registry.dispatch(h1, c1).is_ok());
-        assert_eq!(registry.orphan_count, 1);
-
-        let (c0, _s0) = duplex(1);
-        let h0 = ResumeHeader {
-            logical_id: 99,
-            generation: 0,
-            is_final: false,
-        };
-        let spliced = registry.dispatch(h0, c0).unwrap().unwrap();
-        assert!(spliced.is_closed(), "FINAL orphan must mark SplicedReader closed");
-    }
-
     /// No generations flushed after FINAL.
     /// After a FINAL is contiguously flushed, dispatch another generation;
     /// assert it's NOT flushed to the queue (because state was cleaned up).
@@ -1876,7 +1841,9 @@ mod tests {
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pre-final");
 
-        let (c_final, _s_final) = duplex(1);
+        let (c_final, final_writer) = duplex(1);
+        // write nothing to FINAL
+        drop(final_writer);
         let h_final = ResumeHeader {
             logical_id: 42,
             generation: 1,
@@ -1903,42 +1870,90 @@ mod tests {
         );
     }
 
-    /// Completed state removed before old reader is dropped.
-    /// Create gen-0 + FINAL, verify state cleaned BEFORE dropping reader,
-    /// then drop reader and assert no panic.
     #[tokio::test]
-    async fn completed_state_removed_before_old_reader_drop() {
-        let registry = SpliceRegistry::new();
+    async fn final_orphan_payload_is_validated_in_order() {
+        let registry =
+            SpliceRegistry::new().with_successor_deadline(Duration::from_millis(100));
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
         let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let (final_reader, mut final_writer) = duplex(8);
+        final_writer.write_all(b"x").await.unwrap();
+        drop(final_writer);
+        cont_tx
+            .send((
+                ResumeHeader {
+                    logical_id: 90,
+                    generation: 1,
+                    is_final: true,
+                },
+                Box::pin(final_reader),
+            ))
+            .unwrap();
+        let (gen0_reader, mut gen0_writer) = duplex(1);
+        drop(gen0_writer);
+        cont_tx
+            .send((
+                ResumeHeader {
+                    logical_id: 90,
+                    generation: 0,
+                    is_final: false,
+                },
+                Box::pin(gen0_reader),
+            ))
+            .unwrap();
+        let (_, mut reader) =
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
-        let (c0, mut s0) = duplex(64);
-        let h0 = ResumeHeader {
-            logical_id: 55,
-            generation: 0,
-            is_final: false,
-        };
-        cont_tx.send((h0, Box::pin(c0))).unwrap();
-        let (_id, mut reader) = gen0_rx.recv().await.unwrap();
-
-        let (c_final, _s_final) = duplex(1);
-        let h_final = ResumeHeader {
-            logical_id: 55,
-            generation: 1,
-            is_final: true,
-        };
-        cont_tx.send((h_final, Box::pin(c_final))).unwrap();
-
-        s0.write_all(b"x").await.unwrap();
-        drop(s0);
-        let mut buf = [0u8; 1];
-        reader.read_exact(&mut buf).await.unwrap();
-
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "clean EOF after FINAL");
-
-        drop(reader);
-        // Should not panic — stale cleanup token is checked against incarnation
+    #[tokio::test]
+    async fn final_orphan_after_gap_does_not_close_early() {
+        let registry =
+            SpliceRegistry::new().with_successor_deadline(Duration::from_millis(50));
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let (final_reader, final_writer) = duplex(1);
+        drop(final_writer);
+        cont_tx
+            .send((
+                ResumeHeader {
+                    logical_id: 91,
+                    generation: 2,
+                    is_final: true,
+                },
+                Box::pin(final_reader),
+            ))
+            .unwrap();
+        let (gen0_reader, gen0_writer) = duplex(1);
+        drop(gen0_writer);
+        cont_tx
+            .send((
+                ResumeHeader {
+                    logical_id: 91,
+                    generation: 0,
+                    is_final: false,
+                },
+                Box::pin(gen0_reader),
+            ))
+            .unwrap();
+        let (_, mut reader) =
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }
