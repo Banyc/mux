@@ -170,7 +170,15 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     ReconnectFut: Future<Output = Option<(R, W)>> + Send,
 {
-    spawn_mux(io_reader, io_writer, config, Some(reconnect), spawner, None, None)
+    spawn_mux(
+        io_reader,
+        io_writer,
+        config,
+        Some(reconnect),
+        spawner,
+        None,
+        None,
+    )
 }
 fn spawn_mux<R, W, ReconnectFut>(
     io_reader: R,

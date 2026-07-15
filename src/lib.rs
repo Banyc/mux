@@ -39,8 +39,8 @@ pub use migrating::{
 pub use protocol::Offset;
 pub use serve::{
     spawn_mux_no_reconnection, spawn_mux_no_reconnection_with_first_receive_deadline,
-    spawn_mux_no_reconnection_with_first_receive_deadline_and_ready,
-    spawn_mux_with_reconnection, MuxConfig, MuxError,
+    spawn_mux_no_reconnection_with_first_receive_deadline_and_ready, spawn_mux_with_reconnection,
+    MuxConfig, MuxError,
 };
 pub use stream::{
     accepter::StreamAccepter,

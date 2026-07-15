@@ -275,8 +275,14 @@ impl MigratingStreamWriter {
     pub async fn flush(&mut self) -> Result<(), MigratingError> {
         use tokio::io::AsyncWriteExt;
         match &mut self.state {
-            WriterState::Active { writer, .. } => writer.flush().await.map_err(|_| MigratingError::WriteFailed),
-            WriterState::Migrating { .. } => { self.ensure_open().await?; Ok(()) }
+            WriterState::Active { writer, .. } => writer
+                .flush()
+                .await
+                .map_err(|_| MigratingError::WriteFailed),
+            WriterState::Migrating { .. } => {
+                self.ensure_open().await?;
+                Ok(())
+            }
             WriterState::PendingOpen { .. } => Ok(()),
             WriterState::Closed => Err(MigratingError::LaneDead),
         }
@@ -585,8 +591,7 @@ impl MigratingCapableAccepter {
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
 
-            let Some((is_migrating, header_opt, reader)) =
-                Self::peek_resume_header(reader).await?
+            let Some((is_migrating, header_opt, reader)) = Self::peek_resume_header(reader).await?
             else {
                 continue;
             };

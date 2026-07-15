@@ -328,9 +328,10 @@ impl SpliceRegistry {
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
                         self.orphan_count -= orphans.len();
                         for orphan in orphans {
-                            entry
-                                .pending
-                                .insert(orphan.header.generation, (orphan.header.is_final, orphan.reader));
+                            entry.pending.insert(
+                                orphan.header.generation,
+                                (orphan.header.is_final, orphan.reader),
+                            );
                             if orphan.header.is_final {
                                 entry.final_seen = true;
                             }
@@ -667,8 +668,7 @@ pub fn spawn_splice_driver(
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
         let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
-        let (cleanup_tx, mut cleanup_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let mut next_incarnation: u64 = 1;
 
         fn flush_contiguous(
@@ -698,10 +698,7 @@ pub fn spawn_splice_driver(
 
         fn cleanup_all(
             logical_id: u64,
-            queues: &mut HashMap<
-                u64,
-                tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>,
-            >,
+            queues: &mut HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>>,
             cleanup_tokens: &mut HashMap<u64, u64>,
             next_to_flush: &mut HashMap<u64, u32>,
             registry: &mut SpliceRegistry,
@@ -1754,7 +1751,10 @@ mod tests {
         drop(s1_new);
         let mut buf = [0u8; 1];
         reader_new.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"x", "new reader receives gen1 byte despite old reader drop");
+        assert_eq!(
+            &buf, b"x",
+            "new reader receives gen1 byte despite old reader drop"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1863,7 +1863,8 @@ mod tests {
         cont_tx.send((h_after, Box::pin(c_after))).unwrap();
 
         let mut buf = [0u8; 1];
-        let read_result = tokio::time::timeout(Duration::from_millis(100), reader.read(&mut buf)).await;
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(100), reader.read(&mut buf)).await;
         assert!(
             matches!(read_result, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
             "gen2 must NOT surface in reader — state was cleaned up after FINAL"
@@ -1872,8 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_orphan_payload_is_validated_in_order() {
-        let registry =
-            SpliceRegistry::new().with_successor_deadline(Duration::from_millis(100));
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(100));
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
         let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
@@ -1902,11 +1902,10 @@ mod tests {
                 Box::pin(gen0_reader),
             ))
             .unwrap();
-        let (_, mut reader) =
-            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let (_, mut reader) = tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
             .await
             .unwrap()
@@ -1916,8 +1915,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_orphan_after_gap_does_not_close_early() {
-        let registry =
-            SpliceRegistry::new().with_successor_deadline(Duration::from_millis(50));
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(50));
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
         let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
@@ -1945,11 +1943,10 @@ mod tests {
                 Box::pin(gen0_reader),
             ))
             .unwrap();
-        let (_, mut reader) =
-            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let (_, mut reader) = tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
             .await
             .unwrap()
