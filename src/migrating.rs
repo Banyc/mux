@@ -1100,14 +1100,14 @@ mod tests {
         let mut mac = accepter.into_migrating_capable();
 
         let chunk_size = 10 * 1024;
-        let migrations = 100;
+        let migrations: usize = 100;
 
         let send = tokio::spawn(async move {
             let mut writer = opener.open_migrating_manual(77, LaneClass::Interactive);
             for i in 0..migrations {
                 let mut chunk = vec![0u8; chunk_size];
                 for (j, b) in chunk.iter_mut().enumerate() {
-                    *b = ((i as usize).wrapping_mul(chunk_size).wrapping_add(j)) as u8;
+                    *b = (i.wrapping_mul(chunk_size).wrapping_add(j)) as u8;
                 }
                 writer.write_all(&chunk).await.unwrap();
                 let target = if i % 2 == 0 {
@@ -1213,14 +1213,7 @@ mod tests {
 
         // Continuously drain successor generations so the FINAL gen
         // reaches the SplicedReader's queue.
-        let drain = tokio::spawn(async move {
-            loop {
-                match mac.accept().await {
-                    Ok(_) => {} // successor routed internally
-                    Err(_) => break,
-                }
-            }
-        });
+        let drain = tokio::spawn(async move { while mac.accept().await.is_ok() {} });
 
         // SplicedReader should read payload, then see FINAL and get clean EOF
         let mut data = Vec::new();

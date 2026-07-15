@@ -1890,7 +1890,7 @@ mod tests {
                 Box::pin(final_reader),
             ))
             .unwrap();
-        let (gen0_reader, mut gen0_writer) = duplex(1);
+        let (gen0_reader, gen0_writer) = duplex(1);
         drop(gen0_writer);
         cont_tx
             .send((
