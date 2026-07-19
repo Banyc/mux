@@ -121,26 +121,15 @@ async fn handle_central_read(
                     }
                 },
             };
-            stream_init_handle
-                .stream_accept_tx
-                .send(stream)
-                .await
-                .map_err(HandleCentralReadError::DeadStreamInit)?;
+            stream_init_handle.stream_accept_tx.try_send(stream).map_err(HandleCentralReadError::DeadStreamInit)?;
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
-                // CloseWrite-before-Open: implicitly create the stream and
-                // route the accept message exactly once.
                 if !control.stream_table.contains_key(&stream_id) {
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
-                            if stream_init_handle
-                                .stream_accept_tx
-                                .send(stream)
-                                .await
-                                .is_err()
-                            {
+                            if stream_init_handle.stream_accept_tx.try_send(stream).is_err() {
                                 return Ok(());
                             }
                         }
@@ -152,14 +141,9 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if let Err(()) = control
-                    .peer_close_write_with_offset(stream_id, final_offset)
-                    .await
-                {
+                if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx
-                        .send(WriteControlMsg::Close(stream_id, Side::Read))
-                        .await;
+                    let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
                 }
             } else {
                 control.peer_close(stream_id, side).await;
@@ -167,18 +151,11 @@ async fn handle_central_read(
         }
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
             if control.frame_reassembly {
-                // Data-before-Open: implicitly create the stream and route
-                // the accept message exactly once.
                 if !control.stream_table.contains_key(&stream_id) {
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
-                            if stream_init_handle
-                                .stream_accept_tx
-                                .send(stream)
-                                .await
-                                .is_err()
-                            {
+                            if stream_init_handle.stream_accept_tx.try_send(stream).is_err() {
                                 return Ok(());
                             }
                         }
@@ -190,22 +167,13 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if control
-                    .ingest_reassembly(stream_id, offset, data_buf)
-                    .await
-                    .is_err()
-                {
+                if control.ingest_reassembly(stream_id, offset, data_buf).await.is_err() {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx
-                        .send(WriteControlMsg::Close(stream_id, Side::Read))
-                        .await;
+                    let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
                 }
-            } else {
-                let Some(dispatcher) = control.dispatcher(stream_id) else {
-                    return Ok(());
-                };
-                let msg = StreamReadDataMsg::Data(data_buf);
-                let _ = dispatcher.send(msg).await;
+            } else if control.try_dispatch_data(stream_id, data_buf).is_err() {
+                let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
+                let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Write)).await;
             }
         }
     }
@@ -216,6 +184,8 @@ enum HandleCentralReadError {
     DeadCentralIo(DeadCentralIo),
     DeadStreamInit(DeadStreamInit),
 }
+#[derive(Debug)]
+struct StreamReadQueueFull;
 async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -326,6 +296,23 @@ impl MuxControl {
     }
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamReadDataTx> {
         self.stream_table.get(&stream_id)?.dispatcher()
+    }
+    fn try_dispatch_data(
+        &mut self,
+        stream_id: StreamId,
+        data: crate::central_io::DataBuf,
+    ) -> Result<(), StreamReadQueueFull> {
+        let Some(dispatcher) = self.dispatcher(stream_id) else {
+            return Ok(());
+        };
+        match dispatcher.try_send(StreamReadDataMsg::Data(data)) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.clean_closed_stream(stream_id);
+                Err(StreamReadQueueFull)
+            }
+        }
     }
     pub async fn open(
         &mut self,
@@ -963,6 +950,33 @@ mod reassembly_tests {
         let bp = WriteBrokenPipe::new();
         control.open(tx, bp, Some(stream_id)).await.unwrap();
         rx
+    }
+
+    #[tokio::test]
+    async fn full_stream_read_queue_resets_only_that_stream() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        let _blocked_rx = open_test_stream(&mut control, 1).await;
+        let mut sibling_rx = open_test_stream(&mut control, 2).await;
+        let mut queued = 0;
+        loop {
+            let result = control.dispatcher(1).unwrap().try_send(StreamReadDataMsg::Data(buf(&[0xAA])));
+            match result {
+                Ok(()) => queued += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("stream reader unexpectedly closed")
+                }
+            }
+        }
+        assert!(queued > 0);
+        assert!(control.try_dispatch_data(1, buf(&[0xBB])).is_err());
+        assert!(!control.stream_table.contains_key(&1));
+        control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
+        let msg = sibling_rx.try_recv().expect("sibling data must progress");
+        match msg {
+            StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+            other => panic!("expected sibling Data, got {other:?}"),
+        }
     }
 
     /// Stream A has a gap (frame at offset 0 missing); stream B's
