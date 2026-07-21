@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    io::IoSlice,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -149,24 +150,43 @@ impl DualMessageSender {
             None
         };
 
-        let header_len = 4 + if seq.is_some() { 8 } else { 0 };
-        let frame_len = header_len + payload.len();
-
         let (_reader, mut writer) = self.opener.open_auto();
 
-        // Build the frame in a single vectored write so the auto
-        // classifier sees the full total length.
-        let mut frame = Vec::with_capacity(frame_len);
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        // Build a header array on the stack (at most 12 bytes), then issue
+        // a single vectored write so the auto classifier sees the full
+        // frame length (avoids a Vec allocation for the combined frame).
+        let header_len = 4 + if seq.is_some() { 8 } else { 0 };
+        let mut header: [u8; 12] = [0u8; 12];
+        header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         if let Some(s) = seq {
-            frame.extend_from_slice(&s.to_le_bytes());
+            header[4..12].copy_from_slice(&s.to_le_bytes());
         }
-        frame.extend_from_slice(payload);
 
-        writer
-            .write_all(&frame)
-            .await
-            .map_err(|_| SendError::WriteFailed)?;
+        let mut header_remaining: &[u8] = &header[..header_len];
+        let mut payload_remaining: &[u8] = payload;
+        loop {
+            let bufs = &[
+                IoSlice::new(header_remaining),
+                IoSlice::new(payload_remaining),
+            ];
+            let n = writer
+                .write_vectored(bufs)
+                .await
+                .map_err(|_| SendError::WriteFailed)?;
+            if n == 0 {
+                return Err(SendError::WriteFailed);
+            }
+            if n < header_remaining.len() {
+                header_remaining = &header_remaining[n..];
+            } else {
+                let payload_consumed = n - header_remaining.len();
+                if payload_consumed >= payload_remaining.len() {
+                    break;
+                }
+                payload_remaining = &payload_remaining[payload_consumed..];
+                header_remaining = &[];
+            }
+        }
 
         // Shutdown the write side and drop. The permit is held until
         // this scope exits, bounding in-flight streams.
