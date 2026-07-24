@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io,
+    io::{self, IoSlice},
     num::NonZeroUsize,
     ops::DerefMut,
     pin::Pin,
@@ -49,19 +49,38 @@ impl StreamWriterState {
         buf: &[u8],
         cx: &mut Context<'_>,
     ) -> Poll<Result<usize, SendError>> {
+        self.poll_write_vectored(data, &[IoSlice::new(buf)], cx)
+    }
+    pub fn poll_write_vectored(
+        &mut self,
+        data: &mut PollStreamWriteDataTx,
+        bufs: &[IoSlice<'_>],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, SendError>> {
         if self.close.is_none() {
             return Err(SendError::LocalClosedStream).into();
         }
         if self.broken_pipe.is_closed() {
             return Err(SendError::PeerClosedStream).into();
         }
-        if buf.is_empty() {
+        let data_len = bufs
+            .iter()
+            .fold(0usize, |len, buf| len.saturating_add(buf.len()))
+            .min(DATA_STAGING_CAP);
+        if data_len == 0 {
             return Ok(0).into();
         }
         ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
-        let data_len = buf.len().min(DATA_STAGING_CAP);
         let mut data_buf = self.buf_pool.take_scoped();
-        data_buf.extend(&buf[..data_len]);
+        for buf in bufs {
+            let remaining = data_len - data_buf.len();
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(buf.len());
+            data_buf.extend_from_slice(&buf[..take]);
+        }
+        debug_assert_eq!(data_buf.len(), data_len);
         data.send_item(StreamWriteData::Data(data_buf))
             .map_err(SendError::DeadCentralIo)?;
         Ok(data_len).into()
@@ -119,6 +138,13 @@ impl LiveStreamWriter {
     ) -> Poll<Result<usize, SendError>> {
         self.state.poll_write(&mut self.data, buf, cx)
     }
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        bufs: &[IoSlice<'_>],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, SendError>> {
+        self.state.poll_write_vectored(&mut self.data, bufs, cx)
+    }
 }
 
 #[derive(Debug)]
@@ -156,6 +182,18 @@ impl StreamWriter {
         live.poll_write(buf, cx)
     }
 
+    /// Stage at most `DATA_STAGING_CAP` (`4 * DATA_BULK_CAP`) bytes across
+    /// `bufs` as one queue item, preserving slice order. Returns the total
+    /// number of bytes accepted.
+    pub fn poll_write_vectored(
+        &mut self,
+        bufs: &[IoSlice<'_>],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, SendError>> {
+        let live = self.live.as_mut().ok_or(SendError::LocalClosedStream)?;
+        live.poll_write_vectored(bufs, cx)
+    }
+
     /// Stage a prefix of `buf` and return its length; see [`Self::poll_write`]
     /// for the partial-write contract (at most `DATA_STAGING_CAP` (`4 *
     /// DATA_BULK_CAP`) bytes are accepted per call).
@@ -182,6 +220,18 @@ impl AsyncWrite for StreamWriter {
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.deref_mut();
         this.poll_write(buf, cx).map_err(map_send_error_to_io_error)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.deref_mut();
+        this.poll_write_vectored(bufs, cx)
+            .map_err(map_send_error_to_io_error)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Ok(()).into()
@@ -211,36 +261,43 @@ mod tests {
         control::WriteBrokenPipe,
         Side,
     };
+    use std::io::IoSlice;
     use std::task::{Context, Waker};
+
+    async fn stream_writer_state(
+        stream_id: u32,
+    ) -> (
+        StreamWriterState,
+        PollStreamWriteDataTx,
+        crate::central_io::writer::WriteDataRx,
+    ) {
+        let (prototype, mut rx) = write_data_channel();
+        let derive_fut = prototype.derive(stream_id, false);
+        let drive_open = async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if msg.stream_id == stream_id && matches!(msg.data, StreamWriteData::Open { .. }) {
+                    break;
+                }
+            }
+        };
+        let (tx, ()) = tokio::join!(derive_fut, drive_open);
+        let broken_pipe = WriteBrokenPipe::new();
+        let (close_tx, _close_rx) = crate::stream::stream_close_channel();
+        let close = close_tx.derive(Side::Write, stream_id);
+        (
+            StreamWriterState::new(broken_pipe, close),
+            tx.unwrap().into(),
+            rx,
+        )
+    }
 
     /// `poll_write` stages at most DATA_STAGING_CAP bytes per call, so a larger
     /// caller buffer is split and the returned length never exceeds the cap.
     /// This keeps the per-stream object-pool buffer bounded.
     #[tokio::test]
     async fn poll_write_stages_at_most_staging_cap() {
-        let (prototype, mut rx) = write_data_channel();
-
-        // `derive` sends an Open request that only completes while the receiver
-        // is being polled, so drive `rx` concurrently until the Open is
-        // consumed.
-        let derive_fut = prototype.derive(1u32, false);
-        let drive_open = async {
-            loop {
-                let msg = rx.recv().await.unwrap();
-                if msg.stream_id == 1u32 && matches!(msg.data, StreamWriteData::Open { .. }) {
-                    break;
-                }
-            }
-        };
-        let (tx, ()) = tokio::join!(derive_fut, drive_open);
-        let tx = tx.unwrap();
-
-        let broken_pipe = WriteBrokenPipe::new();
-        let (close_tx, _close_rx) = crate::stream::stream_close_channel();
-        let close = close_tx.derive(Side::Write, 1u32);
-        let mut writer = StreamWriterState::new(broken_pipe, close);
-        let mut data_tx: PollStreamWriteDataTx = tx.into();
-
+        let (mut writer, mut data_tx, mut rx) = stream_writer_state(1).await;
         let big = vec![0u8; DATA_STAGING_CAP * 2];
         let mut cx = Context::from_waker(Waker::noop());
         let n = match writer.poll_write(&mut data_tx, &big, &mut cx) {
@@ -251,23 +308,67 @@ mod tests {
             n, DATA_STAGING_CAP,
             "first poll_write must return DATA_STAGING_CAP"
         );
-
-        // The staged chunk is DATA_STAGING_CAP bytes. The downstream dispatcher
-        // may split it into smaller caps, so drain every Data dispatch for
-        // stream 1 until the full staged amount has been observed.
         let mut seen = 0usize;
         while seen < DATA_STAGING_CAP {
             let msg = rx.recv().await.unwrap();
-            assert_eq!(msg.stream_id, 1u32);
+            assert_eq!(msg.stream_id, 1);
             if let StreamWriteData::Data(buf) = msg.data {
                 seen += buf.len();
             } else {
-                panic!("expected Data, got {:?}", msg.data);
+                panic!("expected Data, got {other:?}", other = msg.data);
             }
         }
         assert_eq!(
             seen, DATA_STAGING_CAP,
             "total drained bytes must equal staged chunk"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_write_vectored_stages_slices_as_one_message() {
+        let (mut writer, mut data_tx, mut rx) = stream_writer_state(7).await;
+        let bufs = [
+            IoSlice::new(b"header"),
+            IoSlice::new(b""),
+            IoSlice::new(b"body"),
+        ];
+        let mut cx = Context::from_waker(Waker::noop());
+        let n = match writer.poll_write_vectored(&mut data_tx, &bufs, &mut cx) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("poll_write_vectored should return Ready(Ok(...)): {other:?}"),
+        };
+        assert_eq!(n, 10);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.stream_id, 7);
+        let buf = match msg.data {
+            StreamWriteData::Data(buf) => buf,
+            other => panic!("expected Data, got {other:?}"),
+        };
+        assert_eq!(&buf[..], b"headerbody");
+    }
+
+    #[tokio::test]
+    async fn poll_write_vectored_caps_across_slice_boundary() {
+        let (mut writer, mut data_tx, mut rx) = stream_writer_state(9).await;
+        let first = vec![0xAA; DATA_STAGING_CAP - 2];
+        let second = [0xBB; 4];
+        let bufs = [IoSlice::new(&first), IoSlice::new(&second)];
+        let mut cx = Context::from_waker(Waker::noop());
+        let n = match writer.poll_write_vectored(&mut data_tx, &bufs, &mut cx) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("poll_write_vectored should return Ready(Ok(...)): {other:?}"),
+        };
+        assert_eq!(n, DATA_STAGING_CAP);
+        let mut staged = Vec::with_capacity(DATA_STAGING_CAP);
+        while staged.len() < DATA_STAGING_CAP {
+            let msg = rx.recv().await.unwrap();
+            let buf = match msg.data {
+                StreamWriteData::Data(buf) => buf,
+                other => panic!("expected Data, got {other:?}"),
+            };
+            staged.extend_from_slice(&buf);
+        }
+        assert_eq!(&staged[..DATA_STAGING_CAP - 2], &first);
+        assert_eq!(&staged[DATA_STAGING_CAP - 2..], &[0xBB; 2]);
     }
 }

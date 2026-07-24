@@ -467,7 +467,9 @@ impl AutoWriter {
             return Poll::Ready(Err(AutoWriteError::LaneDead));
         }
         if matches!(self.state, AutoWriterState::Pending { .. }) {
-            let total_len: usize = bufs.iter().map(|s| s.len()).sum();
+            let total_len = bufs
+                .iter()
+                .fold(0usize, |len, buf| len.saturating_add(buf.len()));
             self.try_open(total_len);
         }
         if matches!(self.state, AutoWriterState::Opening { .. }) {
@@ -477,30 +479,9 @@ impl AutoWriter {
             Ok(w) => w,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        let mut total = 0usize;
-        for slice in bufs {
-            match writer.poll_write(slice, cx) {
-                Poll::Ready(Ok(n)) => {
-                    total += n;
-                    if n < slice.len() {
-                        return Poll::Ready(Ok(total));
-                    }
-                }
-                Poll::Ready(Err(e)) => {
-                    if total > 0 {
-                        return Poll::Ready(Ok(total));
-                    }
-                    return Poll::Ready(Err(AutoWriteError::SendFailed(e)));
-                }
-                Poll::Pending => {
-                    if total > 0 {
-                        return Poll::Ready(Ok(total));
-                    }
-                    return Poll::Pending;
-                }
-            }
-        }
-        Poll::Ready(Ok(total))
+        writer
+            .poll_write_vectored(bufs, cx)
+            .map_err(AutoWriteError::SendFailed)
     }
 
     pub fn shutdown(&mut self) -> Result<(), AutoWriteError> {
