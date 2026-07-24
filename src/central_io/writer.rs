@@ -240,18 +240,16 @@ where
     }
     pub async fn send_control(&mut self, msg: WriteControlMsg) -> io::Result<()> {
         match msg {
-            WriteControlMsg::Close(stream_id, side) => match side {
-                Side::Read => self.send_control_(Header::CloseRead, stream_id).await,
-                Side::Write => {
-                    if self.frame_reassembly {
-                        let final_offset = self.next_offset.remove(&stream_id).unwrap_or(0);
-                        self.send_close_write_ext(stream_id, final_offset as Offset)
-                            .await
-                    } else {
-                        self.send_control_(Header::CloseWrite, stream_id).await
-                    }
-                }
-            },
+            WriteControlMsg::CloseRead(stream_id) => {
+                self.send_control_(Header::CloseRead, stream_id).await
+            }
+            WriteControlMsg::ForceCloseWrite(stream_id) => {
+                debug_assert!(
+                    !self.frame_reassembly,
+                    "ForceCloseWrite is the legacy mode-off abort path"
+                );
+                self.send_control_(Header::CloseWrite, stream_id).await
+            }
         }
     }
     async fn send_close_write_ext(
@@ -668,7 +666,8 @@ impl PollStreamWriteDataTx {
 
 #[derive(Debug, Clone)]
 pub enum WriteControlMsg {
-    Close(StreamId, Side),
+    CloseRead(StreamId),
+    ForceCloseWrite(StreamId),
 }
 pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_CHANNEL_SIZE);

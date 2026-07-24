@@ -77,8 +77,7 @@ impl StreamWriterState {
         let _ = data
             .poll_preserve(&mut cx)
             .map_err(SendError::DeadCentralIo)?;
-        let mut close = self.close.take().unwrap();
-        close.mark_close_sent_to_peer();
+        drop(self.close.take());
         Ok(())
     }
 }

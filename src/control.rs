@@ -23,7 +23,7 @@ use crate::{
         reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
         stream_close_channel,
         writer::LiveStreamWriter,
-        DeadStream, DeadStreamInit, StreamCloseTxPrototype, StreamInitHandle,
+        DeadStream, DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitHandle,
     },
     StreamReader, StreamWriter,
 };
@@ -50,19 +50,8 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
             }
             res = stream_close_rx.recv() => {
                 let msg = res.unwrap();
-                control.local_close(msg.stream_id, msg.side);
-                if !msg.already_sent_to_peer {
-                    if control.frame_reassembly && msg.side == Side::Write {
-                        // Fair queue Fin (fired on PollStreamWriteDataTx drop)
-                        // already sends CloseWrite with correct next_offset.
-                        // Sending another via WriteControlMsg::Close races past
-                        // pending Data still in the fair queue.
-                    } else {
-                        let control_msg = WriteControlMsg::Close(msg.stream_id, msg.side);
-                        if let Err(e) = write_control_tx.send(control_msg).await {
-                            break e;
-                        };
-                    }
+                if let Err(e) = handle_stream_close(&mut control, &write_control_tx, msg).await {
+                    break e;
                 }
             }
             Ok(msg) = stream_init_handle.stream_open_rx.recv() => {
@@ -88,6 +77,22 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
         }
     };
     Err(RunControlError::DeadCentralIo(e, stream_init_handle))
+}
+async fn handle_stream_close(
+    control: &mut MuxControl,
+    write_control_tx: &WriteControlTx,
+    msg: StreamCloseMsg,
+) -> Result<(), DeadCentralIo> {
+    control.local_close(msg.stream_id, msg.side);
+    match msg.side {
+        Side::Read => {
+            write_control_tx
+                .send(WriteControlMsg::CloseRead(msg.stream_id))
+                .await?;
+        }
+        Side::Write => {}
+    }
+    Ok(())
 }
 #[derive(Debug)]
 pub enum RunControlError {
@@ -150,7 +155,7 @@ async fn handle_central_read(
                 }
                 if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
+                    let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
                 }
             } else {
                 control.peer_close(stream_id, side).await;
@@ -176,11 +181,11 @@ async fn handle_central_read(
                 }
                 if control.ingest_reassembly(stream_id, offset, data_buf).await.is_err() {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
+                    let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
                 }
             } else if control.try_dispatch_data(stream_id, data_buf).is_err() {
-                let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Read)).await;
-                let _ = write_control_tx.send(WriteControlMsg::Close(stream_id, Side::Write)).await;
+                let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
+                let _ = write_control_tx.send(WriteControlMsg::ForceCloseWrite(stream_id)).await;
             }
         }
     }
