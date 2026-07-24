@@ -73,6 +73,10 @@ impl StreamWriterState {
         if self.broken_pipe.is_closed() {
             return Err(SendError::PeerClosedStream);
         }
+        // poll_preserve probes the fair queue for capacity: it preserves error
+        // reporting (PeerClosedStream surfaces as Err on shutdown) while dropping
+        // self.close independently closes the fair queue and emits FIN after
+        // accepted data has drained.
         let mut cx = Context::from_waker(Waker::noop());
         let _ = data
             .poll_preserve(&mut cx)

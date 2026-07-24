@@ -10,28 +10,23 @@ use tokio::{
 // block on writes during the test.
 const DUPLEX_BUF: usize = 64 * 1024;
 
-// Spins up a pair of mux endpoints connected through tokio duplex pipes and
-// returns the client-side opener, the server-side accepter and the join set
-// holding the background tasks.
-fn spawn_mux_pair() -> (
+fn spawn_mux_pair(
+    frame_reassembly: bool,
+) -> (
     mux::StreamOpener,
     mux::StreamAccepter,
     JoinSet<mux::MuxError>,
 ) {
     let mut spawner = JoinSet::new();
-
-    // (client_read, server_write) and (server_read, client_write) form the two
-    // directions of the underlying byte stream.
     let (client_read, server_write) = duplex(DUPLEX_BUF);
     let (server_read, client_write) = duplex(DUPLEX_BUF);
-
     let (client_opener, _client_accepter) = spawn_mux_no_reconnection(
         client_read,
         client_write,
         MuxConfig {
             initiation: Initiation::Client,
             heartbeat_interval: Duration::from_secs(60),
-            frame_reassembly: false,
+            frame_reassembly,
         },
         &mut spawner,
     );
@@ -41,139 +36,165 @@ fn spawn_mux_pair() -> (
         MuxConfig {
             initiation: Initiation::Server,
             heartbeat_interval: Duration::from_secs(60),
-            frame_reassembly: false,
+            frame_reassembly,
         },
         &mut spawner,
     );
-
     (client_opener, server_accepter, spawner)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_shutdown_reaches_peer() {
-    let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair();
-
-    // Open a stream from the client and accept it on the server.
-    let (_client_reader, mut client_writer) = client_opener.open().await.unwrap();
-    let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
-
-    // Perform the manual shutdown on the writer.
-    client_writer.shutdown().unwrap();
-
-    // The peer must observe EOF on its reader: a read of any size returns 0.
-    let mut buf = [0u8; 8];
-    let n = server_reader.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0, "peer reader should observe EOF after shutdown");
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let (_client_reader, mut client_writer) = client_opener.open().await.unwrap();
+        let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
+        client_writer.shutdown().unwrap();
+        let mut buf = [0u8; 8];
+        let n = server_reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "peer reader should observe EOF after shutdown");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn drop_writer_does_not_break_peer() {
-    let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair();
-
-    // Open a stream from the client and accept it on the server.
-    let (_client_reader, client_writer) = client_opener.open().await.unwrap();
-    let (mut server_reader, mut server_writer) = server_accepter.accept().await.unwrap();
-
-    // Drop the client-side writer without an explicit shutdown.
-    drop(client_writer);
-    // Give the background tasks a moment to process the close message that
-    // the StreamCloseTx Drop emits.
-    tokio::task::yield_now().await;
-
-    // Dropping the client writer should not break the mux connection: the
-    // peer must still be able to open new streams and exchange data.
-    let (mut client_reader2, _client_writer2) = client_opener.open().await.unwrap();
-    let (_server_reader2, mut server_writer2) = server_accepter.accept().await.unwrap();
-
-    let payload = b"still alive";
-    server_writer2.write_all(payload).await.unwrap();
-    server_writer2.shutdown().unwrap();
-
-    let mut got = [0u8; 11];
-    client_reader2.read_exact(&mut got).await.unwrap();
-    assert_eq!(&got, payload);
-
-    // The peer's reader on the first stream should observe EOF (the dropped
-    // writer triggers a close-write control message, which surfaces as a
-    // graceful EOF rather than a broken pipe).
-    let mut buf = [0u8; 8];
-    let n = server_reader.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0, "dropping writer should surface as graceful EOF");
-
-    // The peer's writer on the first stream should still be usable enough to
-    // be shut down cleanly without panicking.
-    server_writer.shutdown().unwrap();
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let (_client_reader, client_writer) = client_opener.open().await.unwrap();
+        let (mut server_reader, mut server_writer) = server_accepter.accept().await.unwrap();
+        drop(client_writer);
+        tokio::task::yield_now().await;
+        let (mut client_reader2, _client_writer2) = client_opener.open().await.unwrap();
+        let (_server_reader2, mut server_writer2) = server_accepter.accept().await.unwrap();
+        let payload = b"still alive";
+        server_writer2.write_all(payload).await.unwrap();
+        server_writer2.shutdown().unwrap();
+        let mut got = [0u8; 11];
+        client_reader2.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload);
+        let mut buf = [0u8; 8];
+        let n = server_reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "dropping writer should surface as graceful EOF");
+        server_writer.shutdown().unwrap();
+    }
 }
 
-// Regression test for mux frame ordering: data must not overtake Open on the
-// central byte stream.
-//
-// Before the fix, `StreamOpener::open()` resolved before the Open control
-// frame was queued on the central writer, and the central writer's select!
-// could pick a data frame before a ready control frame. A concurrent opener
-// could therefore write payload that reached the wire before the peer learned
-// the stream existed, so the receiver dropped the data for the unknown stream
-// and the remote proxy eventually hit early EOF.
-//
-// This test opens many streams concurrently and writes a payload immediately
-// after each `open()` returns. The server accepts every stream and verifies
-// each payload arrives intact. It flakes without the ordering fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_payload_arrives_before_eof() {
+    const PAYLOAD_LEN: usize = 256 * 1024 + 37;
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let (_client_reader, mut client_writer) = client_opener.open().await.unwrap();
+        let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
+        let payload: Vec<u8> = (0u8..=u8::MAX).cycle().take(PAYLOAD_LEN).collect();
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            client_writer.write_all(&payload).await.unwrap();
+            client_writer.shutdown().unwrap();
+        });
+        let mut received = Vec::new();
+        server_reader.read_to_end(&mut received).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(received, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reader_close_does_not_truncate_opposite_direction_data() {
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let (client_reader, mut client_writer) = client_opener.open().await.unwrap();
+        let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
+        let payload = b"close-read does not close-write";
+        drop(client_reader);
+        client_writer.write_all(payload).await.unwrap();
+        client_writer.shutdown().unwrap();
+        let mut received = Vec::new();
+        server_reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_close_read_shutdown_error_still_leaves_mux_usable() {
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let (_client_reader, mut client_writer) = client_opener.open().await.unwrap();
+        let (server_reader, _server_writer) = server_accepter.accept().await.unwrap();
+        client_writer.write_all(b"already accepted").await.unwrap();
+        drop(server_reader);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client_writer.write(b"x").await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer CloseRead must reach the local writer");
+        assert!(
+            client_writer.shutdown().is_err(),
+            "shutdown must preserve PeerClosedStream error reporting"
+        );
+        let (mut client_reader2, _client_writer2) = client_opener.open().await.unwrap();
+        let (_server_reader2, mut server_writer2) = server_accepter.accept().await.unwrap();
+        server_writer2.write_all(b"mux still alive").await.unwrap();
+        server_writer2.shutdown().unwrap();
+        let mut received = Vec::new();
+        client_reader2.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"mux still alive");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_open_then_write_payload_arrives() {
     const NUM_STREAMS: usize = 64;
     const PAYLOAD_LEN: usize = 32;
-
-    let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair();
-
-    // Server: accept NUM_STREAMS streams and read one payload from each.
-    let mut server_handles = tokio::task::JoinSet::new();
-    server_handles.spawn(async move {
-        let mut expected: Vec<Vec<u8>> = (0..NUM_STREAMS)
-            .map(|i| {
-                let mut p = vec![0u8; PAYLOAD_LEN];
+    for frame_reassembly in [false, true] {
+        let (client_opener, mut server_accepter, _spawner) = spawn_mux_pair(frame_reassembly);
+        let mut server_handles = tokio::task::JoinSet::new();
+        server_handles.spawn(async move {
+            let mut expected: Vec<Vec<u8>> = (0..NUM_STREAMS)
+                .map(|i| {
+                    let mut p = vec![0u8; PAYLOAD_LEN];
+                    let seed = i as u8;
+                    for (j, b) in p.iter_mut().enumerate() {
+                        *b = seed.wrapping_add(j as u8);
+                    }
+                    p
+                })
+                .collect();
+            for _ in 0..NUM_STREAMS {
+                let (mut reader, _writer) = server_accepter.accept().await.unwrap();
+                let mut buf = vec![0u8; PAYLOAD_LEN];
+                reader.read_exact(&mut buf).await.unwrap();
+                let idx = expected
+                    .iter()
+                    .position(|p| *p == buf)
+                    .expect("server received an unexpected/unknown payload");
+                expected.swap_remove(idx);
+            }
+            assert!(expected.is_empty(), "server did not receive all payloads");
+        });
+        let mut client_handles = tokio::task::JoinSet::new();
+        for i in 0..NUM_STREAMS {
+            let opener = client_opener.clone();
+            client_handles.spawn(async move {
+                let (_reader, mut writer) = opener.open().await.unwrap();
+                let mut payload = vec![0u8; PAYLOAD_LEN];
                 let seed = i as u8;
-                for (j, b) in p.iter_mut().enumerate() {
+                for (j, b) in payload.iter_mut().enumerate() {
                     *b = seed.wrapping_add(j as u8);
                 }
-                p
-            })
-            .collect();
-        for _ in 0..NUM_STREAMS {
-            let (mut reader, _writer) = server_accepter.accept().await.unwrap();
-            let mut buf = vec![0u8; PAYLOAD_LEN];
-            reader.read_exact(&mut buf).await.unwrap();
-            // The payload must match exactly one of the expected payloads.
-            let idx = expected
-                .iter()
-                .position(|p| *p == buf)
-                .expect("server received an unexpected/unknown payload");
-            expected.swap_remove(idx);
+                writer.write_all(&payload).await.unwrap();
+                writer.shutdown().unwrap();
+                drop(_reader);
+            });
         }
-        assert!(expected.is_empty(), "server did not receive all payloads");
-    });
-
-    // Client: open many streams concurrently and write a distinct payload to
-    // each immediately after open() returns.
-    let mut client_handles = tokio::task::JoinSet::new();
-    for i in 0..NUM_STREAMS {
-        let opener = client_opener.clone();
-        client_handles.spawn(async move {
-            let (_reader, mut writer) = opener.open().await.unwrap();
-            let mut payload = vec![0u8; PAYLOAD_LEN];
-            let seed = i as u8;
-            for (j, b) in payload.iter_mut().enumerate() {
-                *b = seed.wrapping_add(j as u8);
-            }
-            writer.write_all(&payload).await.unwrap();
-            writer.shutdown().unwrap();
-            // Keep the stream reader alive until the writer is done so the
-            // stream isn't torn down before the data is flushed.
-            drop(_reader);
-        });
+        while let Some(res) = client_handles.join_next().await {
+            res.unwrap();
+        }
+        server_handles.join_next().await.unwrap().unwrap();
     }
-
-    while let Some(res) = client_handles.join_next().await {
-        res.unwrap();
-    }
-    server_handles.join_next().await.unwrap().unwrap();
 }

@@ -666,7 +666,9 @@ impl PollStreamWriteDataTx {
 
 #[derive(Debug, Clone)]
 pub enum WriteControlMsg {
+    /// The local reader is closed, so the peer must stop its write half.
     CloseRead(StreamId),
+    /// Legacy mode-off whole-stream abort. This may overtake pending data and must never be used as a graceful write FIN.
     ForceCloseWrite(StreamId),
 }
 pub fn write_control_channel() -> (WriteControlTx, WriteControlRx) {
@@ -715,8 +717,9 @@ mod tests {
 
     use super::{
         priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
-        StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype,
-        DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE, REASSEMBLY_MAX_BODY,
+        StreamWriteData, StreamWriteDataTx, WriteControlMsg, WriteDataMsg, WriteDataRx,
+        WriteDataTxPrototype, DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE,
+        REASSEMBLY_MAX_BODY,
     };
     use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header, StreamId};
     use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
@@ -1766,6 +1769,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mode_off_force_close_write_uses_stock_frame_without_consuming_offset() {
+        struct SinkWriter(Vec<u8>);
+        impl AsyncWrite for SinkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), false);
+        central.next_offset.insert(9, 123);
+        central
+            .send_control(WriteControlMsg::ForceCloseWrite(9))
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.push(Header::CloseWrite.encode()[0]);
+        expected.extend_from_slice(&9u32.to_be_bytes());
+        assert_eq!(central.io_writer.0, expected);
+        assert_eq!(
+            central.next_offset.get(&9),
+            Some(&123),
+            "Legacy abort must not consume FIN offset state"
+        );
+    }
+
     /// Mode on: Data header carries a u32 offset, CloseWrite carries a
     /// final offset. Verify the wire layout is the extended form.
     #[tokio::test]
@@ -1792,7 +1832,7 @@ mod tests {
             }
         }
         let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
-        let body = (0u8..50u8).collect::<Vec<u8>>();
+        let body: Vec<u8> = (0u8..50u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
                 stream_id: 7,
@@ -1807,8 +1847,6 @@ mod tests {
         expected.extend_from_slice(&0u32.to_be_bytes());
         expected.extend_from_slice(&body);
         assert_eq!(central.io_writer.0, expected);
-
-        // Second frame: offset advances by 50.
         central
             .send_data(WriteDataMsg {
                 stream_id: 7,
@@ -1823,6 +1861,21 @@ mod tests {
         expected2.extend_from_slice(&50u32.to_be_bytes());
         expected2.extend_from_slice(&body);
         assert_eq!(central.io_writer.0, expected2);
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Fin,
+            })
+            .await
+            .unwrap();
+        let mut expected3 = expected2;
+        expected3.push(Header::CloseWrite.encode()[0]);
+        expected3.extend_from_slice(&7u32.to_be_bytes());
+        expected3.extend_from_slice(&100u32.to_be_bytes());
+        assert_eq!(
+            central.io_writer.0, expected3,
+            "mode-on must end in exactly one extended CloseWrite"
+        );
     }
 
     /// Reassembly frames must never exceed 64 KiB total on-wire size.

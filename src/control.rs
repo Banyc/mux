@@ -90,7 +90,9 @@ async fn handle_stream_close(
                 .send(WriteControlMsg::CloseRead(msg.stream_id))
                 .await?;
         }
-        Side::Write => {}
+        Side::Write => {
+            // Dropping the per-stream data sender is the sole graceful FIN producer. Its fair queue drains accepted data before closing.
+        }
     }
     Ok(())
 }
@@ -133,7 +135,10 @@ async fn handle_central_read(
                     }
                 },
             };
-            stream_init_handle.stream_accept_tx.try_send(stream).map_err(HandleCentralReadError::DeadStreamInit)?;
+            stream_init_handle
+                .stream_accept_tx
+                .try_send(stream)
+                .map_err(HandleCentralReadError::DeadStreamInit)?;
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
@@ -141,7 +146,11 @@ async fn handle_central_read(
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
-                            if stream_init_handle.stream_accept_tx.try_send(stream).is_err() {
+                            if stream_init_handle
+                                .stream_accept_tx
+                                .try_send(stream)
+                                .is_err()
+                            {
                                 return Ok(());
                             }
                         }
@@ -153,9 +162,14 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if let Err(()) = control.peer_close_write_with_offset(stream_id, final_offset).await {
+                if let Err(()) = control
+                    .peer_close_write_with_offset(stream_id, final_offset)
+                    .await
+                {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
+                    let _ = write_control_tx
+                        .send(WriteControlMsg::CloseRead(stream_id))
+                        .await;
                 }
             } else {
                 control.peer_close(stream_id, side).await;
@@ -167,7 +181,11 @@ async fn handle_central_read(
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
-                            if stream_init_handle.stream_accept_tx.try_send(stream).is_err() {
+                            if stream_init_handle
+                                .stream_accept_tx
+                                .try_send(stream)
+                                .is_err()
+                            {
                                 return Ok(());
                             }
                         }
@@ -179,13 +197,23 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if control.ingest_reassembly(stream_id, offset, data_buf).await.is_err() {
+                if control
+                    .ingest_reassembly(stream_id, offset, data_buf)
+                    .await
+                    .is_err()
+                {
                     control.reassembly_error_teardown(stream_id).await;
-                    let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
+                    let _ = write_control_tx
+                        .send(WriteControlMsg::CloseRead(stream_id))
+                        .await;
                 }
             } else if control.try_dispatch_data(stream_id, data_buf).is_err() {
-                let _ = write_control_tx.send(WriteControlMsg::CloseRead(stream_id)).await;
-                let _ = write_control_tx.send(WriteControlMsg::ForceCloseWrite(stream_id)).await;
+                let _ = write_control_tx
+                    .send(WriteControlMsg::CloseRead(stream_id))
+                    .await;
+                let _ = write_control_tx
+                    .send(WriteControlMsg::ForceCloseWrite(stream_id))
+                    .await;
             }
         }
     }
@@ -784,8 +812,13 @@ pub struct TooManyOpenStreams {}
 #[cfg(test)]
 mod reassembly_tests {
     use super::*;
-    use crate::central_io::DataBuf;
+    use crate::central_io::{
+        writer::{write_control_channel, write_data_channel},
+        DataBuf,
+    };
     use primitive::arena::obj_pool::arc_buf_pool;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     fn buf(bytes: &[u8]) -> DataBuf {
         let pool = arc_buf_pool::<u8>(None, std::num::NonZeroUsize::new(1).unwrap());
@@ -801,6 +834,71 @@ mod reassembly_tests {
             v.extend_from_slice(&b);
         }
         v
+    }
+
+    #[tokio::test]
+    async fn local_write_close_never_uses_mux_control_lane() {
+        for frame_reassembly in [false, true] {
+            let (write_data_tx, _write_data_rx) = write_data_channel();
+            let mut control = MuxControl::new(Initiation::Server, write_data_tx, frame_reassembly);
+            let (write_control_tx, mut write_control_rx) = write_control_channel();
+            handle_stream_close(
+                &mut control,
+                &write_control_tx,
+                StreamCloseMsg {
+                    stream_id: 7,
+                    side: Side::Write,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                timeout(Duration::from_millis(10), write_control_rx.recv())
+                    .await
+                    .is_err(),
+                "write close must be emitted only by the per-stream data queue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_read_close_uses_mux_control_lane_once() {
+        for frame_reassembly in [false, true] {
+            let (write_data_tx, _write_data_rx) = write_data_channel();
+            let mut control = MuxControl::new(Initiation::Server, write_data_tx, frame_reassembly);
+            let (write_control_tx, mut write_control_rx) = write_control_channel();
+            handle_stream_close(
+                &mut control,
+                &write_control_tx,
+                StreamCloseMsg {
+                    stream_id: 11,
+                    side: Side::Read,
+                },
+            )
+            .await
+            .unwrap();
+            let msg = write_control_rx.recv().await.unwrap();
+            assert!(matches!(msg, WriteControlMsg::CloseRead(11)));
+            assert!(
+                timeout(Duration::from_millis(10), write_control_rx.recv())
+                    .await
+                    .is_err(),
+                "read close must emit exactly one control message"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_mode_off_close_write_is_idempotent() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        let mut rx = open_test_stream(&mut control, 19).await;
+        control.peer_close(19, Side::Write).await;
+        control.peer_close(19, Side::Write).await;
+        assert!(matches!(rx.try_recv(), Ok(StreamReadDataMsg::Fin)));
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate mode-off CloseWrite must not emit a second Local FIN"
+        );
     }
 
     /// A frame for a later offset is held in the reorder buffer until the
@@ -966,12 +1064,17 @@ mod reassembly_tests {
 
     #[tokio::test]
     async fn full_stream_read_queue_resets_only_that_stream() {
-        let (mut control, _close_tx, _drain) = make_control(false);
+        use crate::stream::accepter::stream_accept_channel;
+        use crate::stream::opener::stream_open_channel;
+        let (mut control, close_tx, _drain) = make_control(false);
         let _blocked_rx = open_test_stream(&mut control, 1).await;
         let mut sibling_rx = open_test_stream(&mut control, 2).await;
         let mut queued = 0;
         loop {
-            let result = control.dispatcher(1).unwrap().try_send(StreamReadDataMsg::Data(buf(&[0xAA])));
+            let result = control
+                .dispatcher(1)
+                .unwrap()
+                .try_send(StreamReadDataMsg::Data(buf(&[0xAA])));
             match result {
                 Ok(()) => queued += 1,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
@@ -981,8 +1084,37 @@ mod reassembly_tests {
             }
         }
         assert!(queued > 0);
-        assert!(control.try_dispatch_data(1, buf(&[0xBB])).is_err());
+        let (_open_tx, open_rx) = stream_open_channel();
+        let (accept_tx, _accept_rx) = stream_accept_channel();
+        let mut stream_init_handle = StreamInitHandle {
+            stream_open_rx: open_rx,
+            stream_accept_tx: accept_tx,
+        };
+        let (write_control_tx, mut write_control_rx) = write_control_channel();
+        handle_central_read(
+            &mut control,
+            &close_tx,
+            &mut stream_init_handle,
+            &write_control_tx,
+            CentralIoReadMsg::Data(1, 0, buf(&[0xBB])),
+        )
+        .await
+        .unwrap();
         assert!(!control.stream_table.contains_key(&1));
+        assert!(matches!(
+            write_control_rx.recv().await.unwrap(),
+            WriteControlMsg::CloseRead(1)
+        ));
+        assert!(matches!(
+            write_control_rx.recv().await.unwrap(),
+            WriteControlMsg::ForceCloseWrite(1)
+        ));
+        assert!(
+            timeout(Duration::from_millis(10), write_control_rx.recv())
+                .await
+                .is_err(),
+            "overflow abort must emit exactly CloseRead then ForceCloseWrite"
+        );
         control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
         let msg = sibling_rx.try_recv().expect("sibling data must progress");
         match msg {
