@@ -52,10 +52,17 @@ pub async fn run_control(args: RunControlArgs) -> Result<(), RunControlError> {
                 let msg = res.unwrap();
                 control.local_close(msg.stream_id, msg.side);
                 if !msg.already_sent_to_peer {
-                    let control_msg = WriteControlMsg::Close(msg.stream_id, msg.side);
-                    if let Err(e) = write_control_tx.send(control_msg).await {
-                        break e;
-                    };
+                    if control.frame_reassembly && msg.side == Side::Write {
+                        // Fair queue Fin (fired on PollStreamWriteDataTx drop)
+                        // already sends CloseWrite with correct next_offset.
+                        // Sending another via WriteControlMsg::Close races past
+                        // pending Data still in the fair queue.
+                    } else {
+                        let control_msg = WriteControlMsg::Close(msg.stream_id, msg.side);
+                        if let Err(e) = write_control_tx.send(control_msg).await {
+                            break e;
+                        };
+                    }
                 }
             }
             Ok(msg) = stream_init_handle.stream_open_rx.recv() => {
