@@ -1,11 +1,11 @@
 [package]
 name = "mux"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
-getrandom = "0.2"
+getrandom = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 

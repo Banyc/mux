@@ -4,10 +4,10 @@ use std::{
     ops::DerefMut,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
@@ -18,13 +18,13 @@ use tokio::{
 };
 
 use crate::{
+    StreamAccepter, StreamReader,
     protocol::Header,
-    serve::{spawn_mux_no_reconnection, MuxConfig, MuxError},
+    serve::{MuxConfig, MuxError, spawn_mux_no_reconnection},
     stream::{
         opener::{StreamOpenError, StreamOpener},
         writer::StreamWriter,
     },
-    StreamAccepter, StreamReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ pub struct PairingNonce([u8; PAIRING_NONCE_LEN]);
 impl PairingNonce {
     pub fn generate() -> Self {
         let mut buf = [0u8; PAIRING_NONCE_LEN];
-        getrandom::getrandom(&mut buf).expect("PairingNonce generation failed");
+        getrandom::fill(&mut buf).expect("PairingNonce generation failed");
         Self(buf)
     }
 
@@ -960,7 +960,7 @@ pub fn complete_pairing(
 mod tests {
     use super::*;
     use crate::control::Initiation;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{AsyncWriteExt, duplex};
 
     fn srv_config() -> MuxConfig {
         MuxConfig {

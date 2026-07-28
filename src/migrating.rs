@@ -11,13 +11,13 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 use crate::{
+    StreamReader,
     dual_lane::{DualStreamAccepter, DualStreamOpener, LaneClass},
     stream::writer::StreamWriter,
     stream_migration::{
-        spawn_splice_driver, GenerationChain, GenerationReader, MigrationError, ResumeHeader,
-        SpliceRegistry, SplicedReader,
+        GenerationChain, GenerationReader, MigrationError, ResumeHeader, SpliceRegistry,
+        SplicedReader, spawn_splice_driver,
     },
-    StreamReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,11 +211,11 @@ impl MigratingStreamWriter {
                     Ok(x) => x,
                     Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
                 };
-                let gen = self
+                let genn = self
                     .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
-                self.route_opened_reader(gen, reader);
+                self.route_opened_reader(genn, reader);
                 self.state = WriterState::Active { writer, lane };
                 Ok(())
             }
@@ -224,11 +224,11 @@ impl MigratingStreamWriter {
                     Ok(x) => x,
                     Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
                 };
-                let gen = self
+                let genn = self
                     .chain
                     .start_generation(&mut tokio_util_writer(&mut writer), false)
                     .await?;
-                self.route_opened_reader(gen, reader);
+                self.route_opened_reader(genn, reader);
                 self.state = WriterState::Active {
                     writer,
                     lane: target_lane,
@@ -666,7 +666,7 @@ impl MigratingCapableAccepter {
     async fn peek_resume_header(
         mut reader: StreamReader,
     ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingError> {
-        use crate::stream_migration::{ResumeHeader, RESUME_HEADER_LEN};
+        use crate::stream_migration::{RESUME_HEADER_LEN, ResumeHeader};
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; RESUME_HEADER_LEN];
         let mut filled = 0;
@@ -806,13 +806,13 @@ impl DualStreamAccepter {
 mod tests {
     use super::*;
     use crate::{
+        DualStreamAccepter, DualStreamOpener,
         control::Initiation,
         dual_lane::Liveness,
-        serve::{spawn_mux_no_reconnection, MuxConfig},
-        DualStreamAccepter, DualStreamOpener,
+        serve::{MuxConfig, spawn_mux_no_reconnection},
     };
     use std::time::Duration;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{AsyncWriteExt, duplex};
 
     async fn make_dual_session() -> (
         DualStreamOpener,

@@ -23,7 +23,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt, io,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
@@ -213,10 +213,10 @@ impl GenerationChain {
         writer: &mut W,
         is_final: bool,
     ) -> Result<u32, MigrationError> {
-        let gen = self.next_generation;
+        let genn = self.next_generation;
         let header = ResumeHeader {
             logical_id: self.logical_id,
-            generation: gen,
+            generation: genn,
             is_final,
         };
         header.write(writer).await?;
@@ -224,7 +224,7 @@ impl GenerationChain {
             .next_generation
             .checked_add(1)
             .expect("generation overflow");
-        Ok(gen)
+        Ok(genn)
     }
 }
 
@@ -392,8 +392,8 @@ impl SpliceRegistry {
     /// generation-number order (NOT arrival order).
     pub(crate) fn pop_pending(&mut self, logical_id: u64) -> Option<(u32, bool, GenerationReader)> {
         let entry = self.streams.get_mut(&logical_id)?;
-        let (gen, (is_final, reader)) = entry.pending.pop_first()?;
-        Some((gen, is_final, reader))
+        let (genn, (is_final, reader)) = entry.pending.pop_first()?;
+        Some((genn, is_final, reader))
     }
 
     /// Re-insert a generation that was popped by [`pop_pending`](Self::pop_pending)
@@ -678,8 +678,8 @@ pub fn spawn_splice_driver(
             next_to_flush: &mut HashMap<u64, u32>,
         ) -> bool {
             let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
-            while let Some((gen, is_final, reader)) = registry.pop_pending(logical_id) {
-                if gen == next {
+            while let Some((genn, is_final, reader)) = registry.pop_pending(logical_id) {
+                if genn == next {
                     if queue_tx.send((is_final, reader)).is_err() {
                         return true;
                     }
@@ -688,7 +688,7 @@ pub fn spawn_splice_driver(
                         return true;
                     }
                 } else {
-                    registry.reinsert_pending(logical_id, gen, is_final, reader);
+                    registry.reinsert_pending(logical_id, genn, is_final, reader);
                     break;
                 }
             }
@@ -821,7 +821,7 @@ pub fn spawn_splice_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     // -------------------------------------------------------------------
     // ResumeHeader round-trip
