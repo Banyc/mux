@@ -1,9 +1,9 @@
 use crate::{
-    control::{ControlOpenError, DeadControl},
     StreamReader, StreamWriter,
+    control::{ControlOpenError, DeadControl},
 };
 
-use super::{accepter::StreamAcceptMsg, DeadStreamInit};
+use super::{DeadStreamInit, accepter::StreamAcceptMsg};
 
 const CHANNEL_SIZE: usize = 1024;
 

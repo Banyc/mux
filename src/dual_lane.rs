@@ -39,7 +39,7 @@ const HELLO_LEN: usize = 1 + PAIRING_NONCE_LEN;
 /// Threshold for `open_auto` classification. Writes strictly larger than
 /// this go to the bulk lane; equal-or-smaller go to interactive. Mirrors
 /// `DATA_MEDIUM_CAP` in `central_io::writer`.
-pub const AUTO_BULK_THRESHOLD: usize = 2 * 1024; // 2048
+pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 
 // ---------------------------------------------------------------------------
 // LaneClass
@@ -343,7 +343,7 @@ impl AutoWriter {
     }
 
     fn classify_len(total_len: usize) -> LaneClass {
-        if total_len > AUTO_BULK_THRESHOLD {
+        if crate::traffic_class::is_bulk_size(total_len) {
             LaneClass::Bulk
         } else {
             LaneClass::Interactive

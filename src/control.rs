@@ -2,30 +2,30 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use primitive::ops::ring::RingSpace;
 
 use crate::{
+    StreamReader, StreamWriter,
     central_io::{
+        DeadCentralIo,
         reader::{CentralIoReadMsg, CentralIoReadRx},
         writer::{StreamWriteDataTx, WriteControlMsg, WriteControlTx, WriteDataTxPrototype},
-        DeadCentralIo,
     },
     common::Side,
     protocol::{Offset, StreamId},
     stream::{
+        DeadStream, DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitHandle,
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
-        reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataTx},
+        reader::{StreamReadDataMsg, StreamReadDataTx, stream_read_data_channel},
         stream_close_channel,
         writer::LiveStreamWriter,
-        DeadStream, DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitHandle,
     },
-    StreamReader, StreamWriter,
 };
 
 #[derive(Debug)]
@@ -813,8 +813,8 @@ pub struct TooManyOpenStreams {}
 mod reassembly_tests {
     use super::*;
     use crate::central_io::{
-        writer::{write_control_channel, write_data_channel},
         DataBuf,
+        writer::{write_control_channel, write_data_channel},
     };
     use primitive::arena::obj_pool::arc_buf_pool;
     use std::time::Duration;
@@ -1035,7 +1035,7 @@ mod reassembly_tests {
     // ---- End-to-end reassembly tests via MuxControl ----
 
     use crate::control::WriteBrokenPipe;
-    use crate::stream::reader::{stream_read_data_channel, StreamReadDataMsg, StreamReadDataRx};
+    use crate::stream::reader::{StreamReadDataMsg, StreamReadDataRx, stream_read_data_channel};
     use crate::stream::stream_close_channel;
 
     fn make_control(

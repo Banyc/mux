@@ -3,8 +3,8 @@ use std::{
     fmt,
     io::IoSlice,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -15,8 +15,8 @@ use tokio::{
 };
 
 use crate::{
-    dual_lane::{DualAcceptError, DualStreamAccepter, DualStreamOpener},
     StreamReader,
+    dual_lane::{DualAcceptError, DualStreamAccepter, DualStreamOpener},
 };
 
 // ---------------------------------------------------------------------------
@@ -418,10 +418,10 @@ impl DualMessageReceiver {
 mod tests {
     use super::*;
     use crate::{
+        DualStreamAccepter, DualStreamOpener,
         control::Initiation,
         dual_lane::Liveness,
-        serve::{spawn_mux_no_reconnection, MuxConfig},
-        DualStreamAccepter, DualStreamOpener,
+        serve::{MuxConfig, spawn_mux_no_reconnection},
     };
     use std::time::Duration;
     use tokio::io::duplex;

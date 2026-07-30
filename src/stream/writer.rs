@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     ops::DerefMut,
     pin::Pin,
-    task::{ready, Context, Poll, Waker},
+    task::{Context, Poll, Waker, ready},
 };
 
 use primitive::arena::obj_pool::ArcObjPool;
@@ -12,8 +12,8 @@ use tokio::io::AsyncWrite;
 
 use crate::{
     central_io::{
-        writer::{PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx, DATA_BULK_CAP},
         DeadCentralIo,
+        writer::{DATA_BULK_CAP, PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx},
     },
     control::WriteBrokenPipe,
 };
@@ -257,9 +257,9 @@ fn map_send_error_to_io_error(e: SendError) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        central_io::writer::{write_data_channel, StreamWriteData},
-        control::WriteBrokenPipe,
         Side,
+        central_io::writer::{StreamWriteData, write_data_channel},
+        control::WriteBrokenPipe,
     };
     use std::io::IoSlice;
     use std::task::{Context, Waker};

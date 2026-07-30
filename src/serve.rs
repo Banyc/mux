@@ -7,24 +7,24 @@ use tokio::{
 };
 
 use crate::{
+    StreamAccepter,
     central_io::{
         reader::{
-            central_io_read_channel, run_central_io_reader, CentralIoReader,
-            RunCentralIoReaderError,
+            CentralIoReader, RunCentralIoReaderError, central_io_read_channel,
+            run_central_io_reader,
         },
         writer::{
-            run_central_io_writer, write_control_channel, write_data_channel, CentralIoWriter,
-            RunCentralIoWriterError,
+            CentralIoWriter, RunCentralIoWriterError, run_central_io_writer, write_control_channel,
+            write_data_channel,
         },
     },
     common::Side,
-    control::{run_control, Initiation, MuxControl, RunControlArgs, RunControlError},
+    control::{Initiation, MuxControl, RunControlArgs, RunControlError, run_control},
     stream::{
-        accepter::stream_accept_channel,
-        opener::{stream_open_channel, StreamOpener},
         StreamInitHandle,
+        accepter::stream_accept_channel,
+        opener::{StreamOpener, stream_open_channel},
     },
-    StreamAccepter,
 };
 
 #[derive(Debug, Clone)]

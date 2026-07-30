@@ -1,4 +1,4 @@
-use crate::{control::DeadControl, StreamReader, StreamWriter};
+use crate::{StreamReader, StreamWriter, control::DeadControl};
 
 use super::DeadStreamInit;
 

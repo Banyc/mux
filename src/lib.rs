@@ -16,31 +16,33 @@ mod protocol;
 mod serve;
 mod stream;
 mod stream_migration;
+mod traffic_class;
 
 pub use central_io::DeadCentralIo;
 pub use common::Side;
 pub use control::{ControlOpenError, DeadControl, Initiation, TooManyOpenStreams};
 pub use control::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use dual_lane::{
-    complete_pairing, read_lane_hello, spawn_dual_mux_acceptor, spawn_dual_mux_connector,
-    spawn_dual_mux_paired, spawn_dual_mux_paired_supervised, write_birth_heartbeat,
-    write_lane_hello, AutoReader, AutoWriteError, AutoWriter, DualAcceptError, DualMuxError,
+    AUTO_BULK_THRESHOLD, AutoReader, AutoWriteError, AutoWriter, DualAcceptError, DualMuxError,
     DualStreamAccepter, DualStreamOpenError, DualStreamOpener, LaneClass, LaneHelloError, Liveness,
-    PairingNonce, PendingAcceptor, AUTO_BULK_THRESHOLD,
+    PairingNonce, PendingAcceptor, complete_pairing, read_lane_hello, spawn_dual_mux_acceptor,
+    spawn_dual_mux_connector, spawn_dual_mux_paired, spawn_dual_mux_paired_supervised,
+    write_birth_heartbeat, write_lane_hello,
 };
 pub use dual_message::{
-    DeliveryMode, DualMessageReceiver, DualMessageSender, RecvError, SendError,
-    DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP,
+    DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP, DeliveryMode,
+    DualMessageReceiver, DualMessageSender, RecvError, SendError,
 };
 pub use migrating::{
-    AcceptedStream, ClientSplicedReader, MigratingCapableAccepter, MigratingError,
-    MigratingStreamWriter, AUTO_BULK_THRESHOLD as MIGRATING_AUTO_BULK_THRESHOLD,
+    AUTO_BULK_THRESHOLD as MIGRATING_AUTO_BULK_THRESHOLD, AcceptedStream, ClientSplicedReader,
+    MigratingCapableAccepter, MigratingError, MigratingStreamWriter, ResponseRouter,
+    ResponseRouterHandle, StreamName, spawn_response_router,
 };
 pub use protocol::Offset;
 pub use serve::{
-    spawn_mux_no_reconnection, spawn_mux_no_reconnection_with_first_receive_deadline,
+    MuxConfig, MuxError, spawn_mux_no_reconnection,
+    spawn_mux_no_reconnection_with_first_receive_deadline,
     spawn_mux_no_reconnection_with_first_receive_deadline_and_ready, spawn_mux_with_reconnection,
-    MuxConfig, MuxError,
 };
 pub use stream::{
     accepter::StreamAccepter,
@@ -49,6 +51,6 @@ pub use stream::{
     writer::StreamWriter,
 };
 pub use stream_migration::{
-    GenerationChain, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader,
-    DEFAULT_SUCCESSOR_DEADLINE, MAX_PENDING_GENERATIONS, RESUME_HEADER_LEN,
+    DEFAULT_SUCCESSOR_DEADLINE, GenerationChain, MAX_PENDING_GENERATIONS, MigrationError,
+    RESUME_HEADER_LEN, ResumeHeader, SpliceRegistry, SplicedReader,
 };

@@ -2,7 +2,7 @@ use std::{
     io,
     ops::DerefMut,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use tokio::io::{AsyncRead, ReadBuf};
@@ -127,9 +127,10 @@ impl AsyncRead for StreamReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.deref_mut();
-        let n = ready!(this
-            .state
-            .poll_recv(&mut this.data, buf.initialize_unfilled(), cx))?;
+        let n = ready!(
+            this.state
+                .poll_recv(&mut this.data, buf.initialize_unfilled(), cx)
+        )?;
         buf.advance(n);
         Poll::Ready(Ok(()))
     }

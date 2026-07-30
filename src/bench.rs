@@ -13,7 +13,7 @@ mod benches {
     };
 
     use crate::{
-        spawn_mux_no_reconnection, Initiation, MuxConfig, MuxError, StreamReader, StreamWriter,
+        Initiation, MuxConfig, MuxError, StreamReader, StreamWriter, spawn_mux_no_reconnection,
     };
 
     static RT: LazyLock<Runtime> = LazyLock::new(|| {

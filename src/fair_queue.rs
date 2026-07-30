@@ -5,7 +5,7 @@ use std::{
     ops::DerefMut,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use tokio::sync::{mpsc, oneshot};

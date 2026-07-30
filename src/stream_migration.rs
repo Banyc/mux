@@ -42,6 +42,8 @@ const MAGIC: u64 = 0x4D_49_47_52_41_54_45_53; // "MIGRATES"
 pub const RESUME_HEADER_LEN: usize = 21; // 8 (magic) + 8 (u64) + 4 (u32) + 1 (flags)
 
 const FLAG_IS_FINAL: u8 = 0x01;
+const FLAG_IS_RESPONSE: u8 = 0x02;
+const FLAG_ALL: u8 = FLAG_IS_FINAL | FLAG_IS_RESPONSE;
 
 /// Default deadline for a successor generation to arrive before the
 /// reader signals `BrokenPipe`.
@@ -121,6 +123,7 @@ pub struct ResumeHeader {
     pub logical_id: u64,
     pub generation: u32,
     pub is_final: bool,
+    pub is_response: bool,
 }
 
 impl ResumeHeader {
@@ -129,7 +132,13 @@ impl ResumeHeader {
         buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         buf[8..16].copy_from_slice(&self.logical_id.to_le_bytes());
         buf[16..20].copy_from_slice(&self.generation.to_le_bytes());
-        let flags = if self.is_final { FLAG_IS_FINAL } else { 0 };
+        let mut flags = 0;
+        if self.is_final {
+            flags |= FLAG_IS_FINAL;
+        }
+        if self.is_response {
+            flags |= FLAG_IS_RESPONSE;
+        }
         buf[20] = flags;
         buf
     }
@@ -143,14 +152,15 @@ impl ResumeHeader {
         let generation = u32::from_le_bytes(buf[16..20].try_into().unwrap());
         let flags = buf[20];
         let is_final = (flags & FLAG_IS_FINAL) != 0;
-        // Reject unknown flag bits
-        if flags & !FLAG_IS_FINAL != 0 {
+        let is_response = (flags & FLAG_IS_RESPONSE) != 0;
+        if flags & !FLAG_ALL != 0 {
             return None;
         }
         Some(Self {
             logical_id,
             generation,
             is_final,
+            is_response,
         })
     }
 
@@ -180,6 +190,7 @@ impl ResumeHeader {
 pub struct GenerationChain {
     logical_id: u64,
     next_generation: u32,
+    response: bool,
 }
 
 impl fmt::Debug for GenerationChain {
@@ -196,6 +207,15 @@ impl GenerationChain {
         Self {
             logical_id,
             next_generation: 0,
+            response: false,
+        }
+    }
+
+    pub fn new_response(logical_id: u64) -> Self {
+        Self {
+            logical_id,
+            next_generation: 1,
+            response: true,
         }
     }
 
@@ -218,6 +238,7 @@ impl GenerationChain {
             logical_id: self.logical_id,
             generation: genn,
             is_final,
+            is_response: self.response,
         };
         header.write(writer).await?;
         self.next_generation = self
@@ -833,6 +854,7 @@ mod tests {
             logical_id: 42,
             generation: 7,
             is_final: false,
+            is_response: false,
         };
         let buf = h.encode();
         let h2 = ResumeHeader::parse(&buf).unwrap();
@@ -845,12 +867,31 @@ mod tests {
             logical_id: 1,
             generation: 3,
             is_final: true,
+            is_response: false,
         };
         let buf = h.encode();
         let h2 = ResumeHeader::parse(&buf).unwrap();
         assert!(h2.is_final);
         assert_eq!(h2.logical_id, 1);
         assert_eq!(h2.generation, 3);
+    }
+
+    #[tokio::test]
+    async fn resume_header_response_flag() {
+        let h = ResumeHeader {
+            logical_id: 9,
+            generation: 1,
+            is_final: false,
+            is_response: true,
+        };
+        let h2 = ResumeHeader::parse(&h.encode()).unwrap();
+        assert_eq!(h, h2);
+        let hf = ResumeHeader {
+            is_final: true,
+            ..h
+        };
+        let hf2 = ResumeHeader::parse(&hf.encode()).unwrap();
+        assert_eq!(hf, hf2);
     }
 
     #[tokio::test]
@@ -866,6 +907,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut buf = h.encode();
         buf[20] = 0xFE;
@@ -942,6 +984,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
@@ -950,6 +993,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         registry.dispatch(h1, gen1_server).unwrap();
 
@@ -1004,6 +1048,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
@@ -1012,6 +1057,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         registry.dispatch(h1, gen1_server).unwrap();
 
@@ -1069,6 +1115,7 @@ mod tests {
             logical_id: 1,
             generation: 2,
             is_final: true,
+            is_response: false,
         };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
@@ -1101,6 +1148,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
@@ -1134,6 +1182,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
@@ -1157,6 +1206,7 @@ mod tests {
             logical_id: 1,
             generation: 2,
             is_final: true,
+            is_response: false,
         };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
@@ -1182,6 +1232,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
@@ -1195,6 +1246,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
@@ -1227,6 +1279,7 @@ mod tests {
             logical_id: 1,
             generation: 2,
             is_final: true,
+            is_response: false,
         };
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
@@ -1253,6 +1306,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _spliced = registry.dispatch(h0, c0).unwrap();
 
@@ -1263,6 +1317,7 @@ mod tests {
                 logical_id: 1,
                 generation: i,
                 is_final: false,
+                is_response: false,
             };
             assert!(registry.dispatch(h, c).is_ok(), "gen {i} should be ok");
         }
@@ -1273,6 +1328,7 @@ mod tests {
             logical_id: 1,
             generation: MAX_PENDING_GENERATIONS as u32 + 1,
             is_final: false,
+            is_response: false,
         };
         let result = registry.dispatch(h_over, c_over);
         assert!(matches!(
@@ -1296,6 +1352,7 @@ mod tests {
                 logical_id: 100 + i,
                 generation: 1,
                 is_final: false,
+                is_response: false,
             };
             assert!(
                 registry.dispatch(h, c).is_ok(),
@@ -1308,6 +1365,7 @@ mod tests {
             logical_id: 200,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         let result = registry.dispatch(h_over, c_over);
         assert!(matches!(result, Err(MigrationError::TooManyOrphans)));
@@ -1324,6 +1382,7 @@ mod tests {
                 logical_id: 200 + i,
                 generation: 1,
                 is_final: false,
+                is_response: false,
             };
             assert!(registry.dispatch(h, c).is_ok());
         }
@@ -1338,6 +1397,7 @@ mod tests {
                 logical_id: 300 + i,
                 generation: 1,
                 is_final: false,
+                is_response: false,
             };
             assert!(
                 registry.dispatch(h, c).is_ok(),
@@ -1364,6 +1424,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, s0).unwrap().unwrap();
         drop(_c0); // gen0 EOF immediately
@@ -1373,6 +1434,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: true,
+            is_response: false,
         };
         registry.dispatch(h1, c1).unwrap();
         s1.write_all(b"x").await.unwrap();
@@ -1402,6 +1464,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: true,
+            is_response: false,
         };
         let spliced = registry.dispatch(h0, c0).unwrap().unwrap();
         assert!(spliced.is_closed, "gen0 FINAL => is_closed true");
@@ -1425,6 +1488,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, c0).unwrap().unwrap();
 
@@ -1465,6 +1529,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _spliced = registry.dispatch(h0, c0).unwrap();
 
@@ -1473,6 +1538,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         assert!(registry.dispatch(h1, c1).is_ok());
 
@@ -1490,6 +1556,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
 
@@ -1529,6 +1596,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
 
@@ -1538,6 +1606,7 @@ mod tests {
             logical_id: 1,
             generation: 2,
             is_final: false,
+            is_response: false,
         };
         assert!(registry.dispatch(h2, c2).is_ok());
 
@@ -1546,6 +1615,7 @@ mod tests {
             logical_id: 1,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         assert!(registry.dispatch(h1, c1).is_ok());
 
@@ -1571,6 +1641,7 @@ mod tests {
             logical_id: 42,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         assert!(registry.dispatch(h1, c1).is_ok());
         assert_eq!(registry.orphan_count, 1);
@@ -1580,6 +1651,7 @@ mod tests {
             logical_id: 42,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _gen0 = registry.dispatch(h0, c0).unwrap();
         // The stream entry now exists; orphans for this logical id should
@@ -1621,6 +1693,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let _ = registry.dispatch(h0, c0).unwrap();
         for i in 1..=MAX_PENDING_GENERATIONS as u32 {
@@ -1629,6 +1702,7 @@ mod tests {
                 logical_id: 1,
                 generation: i,
                 is_final: false,
+                is_response: false,
             };
             assert!(registry.dispatch(h, c).is_ok(), "gen {i} should be ok");
         }
@@ -1637,6 +1711,7 @@ mod tests {
             logical_id: 1,
             generation: MAX_PENDING_GENERATIONS as u32 + 1,
             is_final: false,
+            is_response: false,
         };
         let result = registry.dispatch(h_over, c_over);
         assert!(matches!(
@@ -1657,6 +1732,7 @@ mod tests {
             logical_id: 1,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         let mut spliced = registry.dispatch(h0, c0).unwrap().unwrap();
 
@@ -1699,6 +1775,7 @@ mod tests {
             logical_id: 77,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h0, Box::pin(c0))).unwrap();
         let (id0, mut reader0) = gen0_rx.recv().await.unwrap();
@@ -1709,6 +1786,7 @@ mod tests {
             logical_id: 77,
             generation: 1,
             is_final: true,
+            is_response: false,
         };
         cont_tx.send((h1, Box::pin(c1))).unwrap();
 
@@ -1726,6 +1804,7 @@ mod tests {
             logical_id: 77,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h_new, Box::pin(c_new))).unwrap();
         let (id_new, mut reader_new) = gen0_rx.recv().await.unwrap();
@@ -1738,6 +1817,7 @@ mod tests {
             logical_id: 77,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h1_new, Box::pin(c1_new))).unwrap();
 
@@ -1776,6 +1856,7 @@ mod tests {
             logical_id: 77,
             generation: 0,
             is_final: true,
+            is_response: false,
         };
         cont_tx.send((h_final, Box::pin(c_final))).unwrap();
 
@@ -1787,6 +1868,7 @@ mod tests {
             logical_id: 77,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h_reuse, Box::pin(c_reuse))).unwrap();
 
@@ -1798,6 +1880,7 @@ mod tests {
             logical_id: 77,
             generation: 1,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h_gen1, Box::pin(c_gen1))).unwrap();
 
@@ -1831,6 +1914,7 @@ mod tests {
             logical_id: 42,
             generation: 0,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h0, Box::pin(c0))).unwrap();
         let (_id, mut reader) = gen0_rx.recv().await.unwrap();
@@ -1848,6 +1932,7 @@ mod tests {
             logical_id: 42,
             generation: 1,
             is_final: true,
+            is_response: false,
         };
         cont_tx.send((h_final, Box::pin(c_final))).unwrap();
 
@@ -1859,6 +1944,7 @@ mod tests {
             logical_id: 42,
             generation: 2,
             is_final: false,
+            is_response: false,
         };
         cont_tx.send((h_after, Box::pin(c_after))).unwrap();
 
@@ -1886,6 +1972,7 @@ mod tests {
                     logical_id: 90,
                     generation: 1,
                     is_final: true,
+                    is_response: false,
                 },
                 Box::pin(final_reader),
             ))
@@ -1898,6 +1985,7 @@ mod tests {
                     logical_id: 90,
                     generation: 0,
                     is_final: false,
+                    is_response: false,
                 },
                 Box::pin(gen0_reader),
             ))
@@ -1927,6 +2015,7 @@ mod tests {
                     logical_id: 91,
                     generation: 2,
                     is_final: true,
+                    is_response: false,
                 },
                 Box::pin(final_reader),
             ))
@@ -1939,6 +2028,7 @@ mod tests {
                     logical_id: 91,
                     generation: 0,
                     is_final: false,
+                    is_response: false,
                 },
                 Box::pin(gen0_reader),
             ))

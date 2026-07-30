@@ -2,6 +2,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -25,18 +26,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Cross-reference: `DATA_MEDIUM_CAP` in `central_io::writer`.
-pub const AUTO_BULK_THRESHOLD: usize = 2048;
-
-/// Number of consecutive small writes needed on the bulk lane before a
-/// demotion to interactive is considered.
-const DEMOTE_STREAK: usize = 4;
-
-/// Minimum time between any two migrations for the same stream.
-const DEMOTE_COOLDOWN: Duration = Duration::from_millis(150);
-
-/// History window for the mirrored classification ratio (mirrors
-/// `LATENCY_HISTORY_MAX` in `central_io::writer`).
-const HISTORY_MAX: usize = 16;
+pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 
 #[cfg(not(test))]
 const RESUME_HEADER_DEADLINE: Duration = Duration::from_secs(30);
@@ -47,42 +37,14 @@ const RESUME_HEADER_DEADLINE: Duration = Duration::from_millis(100);
 // Mirrored classifier
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct StreamClassifier {
-    small_count: u32,
-    bulk_count: u32,
-}
-
-impl StreamClassifier {
-    fn new() -> Self {
-        Self {
-            small_count: 0,
-            bulk_count: 0,
-        }
+#[derive(Debug, Clone, Default)]
+pub struct StreamName(Arc<OnceLock<Box<str>>>);
+impl StreamName {
+    pub fn set(&self, name: &str) {
+        let _ = self.0.set(name.into());
     }
-
-    fn record(&mut self, size: usize) {
-        if self.small_count + self.bulk_count >= HISTORY_MAX as u32 {
-            self.small_count /= 2;
-            self.bulk_count /= 2;
-        }
-        if size > AUTO_BULK_THRESHOLD {
-            self.bulk_count += 1;
-        } else {
-            self.small_count += 1;
-        }
-    }
-
-    /// Mirrors `LatencyControl::is_bulk` in `central_io::writer`:
-    /// `small_count * 3 < total * 2` with a minimum of 3 observations.
-    /// Equivalent to `small_count < 2 * bulk_count` when total ≥ 3.
-    fn is_bulk(&self) -> bool {
-        let total = self.small_count + self.bulk_count;
-        const HISTORY_MIN: u32 = 3; // mirrors LATENCY_HISTORY_MIN in central_io::writer
-        if total < HISTORY_MIN {
-            return false;
-        }
-        self.small_count * 3 < total * 2
+    fn get(&self) -> &str {
+        self.0.get().map(|s| &**s).unwrap_or("")
     }
 }
 
@@ -131,10 +93,8 @@ pub struct MigratingStreamWriter {
     opener: DualStreamOpener,
     chain: GenerationChain,
     state: WriterState,
-    classifier: StreamClassifier,
-    // Auto-policy state
-    small_streak: usize,
-    last_migration: Option<tokio::time::Instant>,
+    policy: crate::traffic_class::LanePolicy,
+    name: StreamName,
     auto: bool,
     gen0_reader_tx: Option<tokio::sync::oneshot::Sender<StreamReader>>,
     /// When set, successor generation readers are held alive here so
@@ -162,9 +122,8 @@ impl MigratingStreamWriter {
             opener,
             chain: GenerationChain::new(logical_id),
             state: WriterState::PendingOpen { lane: initial_lane },
-            classifier: StreamClassifier::new(),
-            small_streak: 0,
-            last_migration: None,
+            policy: crate::traffic_class::LanePolicy::new(),
+            name: StreamName::default(),
             auto,
             gen0_reader_tx: None,
             held_readers: None,
@@ -182,9 +141,8 @@ impl MigratingStreamWriter {
             opener,
             chain: GenerationChain::new(logical_id),
             state: WriterState::PendingOpen { lane: initial_lane },
-            classifier: StreamClassifier::new(),
-            small_streak: 0,
-            last_migration: None,
+            policy: crate::traffic_class::LanePolicy::new(),
+            name: StreamName::default(),
             auto,
             gen0_reader_tx: Some(gen0_reader_tx),
             held_readers: Some(Vec::new()),
@@ -197,6 +155,31 @@ impl MigratingStreamWriter {
     /// misroute).
     pub async fn force_migrate(&mut self, target: LaneClass) -> Result<(), MigratingError> {
         self.migrate_to(target).await
+    }
+
+    pub fn name_handle(&self) -> StreamName {
+        self.name.clone()
+    }
+
+    pub(crate) fn new_response_seeded(
+        opener: DualStreamOpener,
+        logical_id: u64,
+        gen0_writer: StreamWriter,
+        gen0_lane: LaneClass,
+    ) -> Self {
+        Self {
+            opener,
+            chain: GenerationChain::new_response(logical_id),
+            state: WriterState::Active {
+                writer: gen0_writer,
+                lane: gen0_lane,
+            },
+            policy: crate::traffic_class::LanePolicy::new(),
+            name: StreamName::default(),
+            auto: true,
+            gen0_reader_tx: None,
+            held_readers: None,
+        }
     }
 
     async fn ensure_open(&mut self) -> Result<(), MigratingError> {
@@ -240,15 +223,19 @@ impl MigratingStreamWriter {
     }
 
     async fn migrate_to(&mut self, target: LaneClass) -> Result<(), MigratingError> {
-        // Close current generation
+        let from = match &self.state {
+            WriterState::Active { lane, .. } | WriterState::PendingOpen { lane } => Some(*lane),
+            WriterState::Migrating { target_lane } => Some(*target_lane),
+            WriterState::Closed => None,
+        };
+        tracing::info!(name = self.name.get(), ?from, to = ?target, "stream lane migration");
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
         self.state = WriterState::Migrating {
             target_lane: target,
         };
-        self.last_migration = Some(tokio::time::Instant::now());
-        self.small_streak = 0;
+        self.policy.note_migration(tokio::time::Instant::now());
         Ok(())
     }
 
@@ -304,37 +291,15 @@ impl MigratingStreamWriter {
     }
 
     async fn classify_and_maybe_migrate(&mut self, size: usize) -> Result<(), MigratingError> {
-        self.classifier.record(size);
-
-        match &self.state {
-            WriterState::Active { lane, .. } | WriterState::PendingOpen { lane } => {
-                let current_lane = *lane;
-
-                // PROMOTE: any single write > threshold migrates BEFORE the write
-                if size > AUTO_BULK_THRESHOLD && current_lane == LaneClass::Interactive {
-                    return self.migrate_to(LaneClass::Bulk).await;
-                }
-
-                // DEMOTE: conservative
-                if current_lane == LaneClass::Bulk {
-                    if size <= AUTO_BULK_THRESHOLD {
-                        self.small_streak += 1;
-                    } else {
-                        self.small_streak = 0;
-                    }
-
-                    if self.small_streak >= DEMOTE_STREAK && !self.classifier.is_bulk() {
-                        if let Some(last) = self.last_migration {
-                            if last.elapsed() >= DEMOTE_COOLDOWN {
-                                return self.migrate_to(LaneClass::Interactive).await;
-                            }
-                        } else {
-                            return self.migrate_to(LaneClass::Interactive).await;
-                        }
-                    }
-                }
-            }
-            _ => {}
+        let current = match &self.state {
+            WriterState::Active { lane, .. } | WriterState::PendingOpen { lane } => Some(*lane),
+            _ => None,
+        };
+        let decision = self
+            .policy
+            .on_write(size, current, tokio::time::Instant::now());
+        if let Some(target) = decision {
+            return self.migrate_to(target).await;
         }
         Ok(())
     }
@@ -557,6 +522,7 @@ impl DualStreamOpener {
 pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
     pass_plain_streams: bool,
+    response_opener: Option<DualStreamOpener>,
     cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
     gen0_rx: mpsc::UnboundedReceiver<(u64, SplicedReader)>,
     #[allow(dead_code)]
@@ -577,10 +543,37 @@ impl MigratingCapableAccepter {
         Self {
             inner,
             pass_plain_streams,
+            response_opener: None,
             cont_tx,
             gen0_rx,
             driver,
             stash: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn accepted_migrating(
+        &self,
+        reader: SplicedReader,
+        writer: StreamWriter,
+        source_lane: LaneClass,
+        logical_id: u64,
+    ) -> AcceptedStream {
+        match &self.response_opener {
+            Some(opener) => AcceptedStream::MigratingDuplex {
+                reader,
+                writer: MigratingStreamWriter::new_response_seeded(
+                    opener.clone(),
+                    logical_id,
+                    writer,
+                    source_lane,
+                ),
+                source_lane,
+            },
+            None => AcceptedStream::Migrating {
+                reader,
+                writer,
+                source_lane,
+            },
         }
     }
 
@@ -610,6 +603,9 @@ impl MigratingCapableAccepter {
 
             if is_migrating {
                 if let Some(header) = header_opt {
+                    if header.is_response {
+                        continue;
+                    };
                     let logical_id = header.logical_id;
                     let is_gen0 = header.generation == 0;
 
@@ -626,19 +622,15 @@ impl MigratingCapableAccepter {
                                 self.stash.iter().position(|(id, _)| *id == logical_id)
                             {
                                 let (_, spliced) = self.stash.remove(pos).unwrap();
-                                return Ok(AcceptedStream::Migrating {
-                                    reader: spliced,
-                                    writer,
-                                    source_lane: lane,
-                                });
+                                return Ok(
+                                    self.accepted_migrating(spliced, writer, lane, logical_id)
+                                );
                             }
                             match self.gen0_rx.recv().await {
                                 Some((id, spliced)) if id == logical_id => {
-                                    return Ok(AcceptedStream::Migrating {
-                                        reader: spliced,
-                                        writer,
-                                        source_lane: lane,
-                                    });
+                                    return Ok(
+                                        self.accepted_migrating(spliced, writer, lane, logical_id)
+                                    );
                                 }
                                 Some((other_id, spliced)) => {
                                     self.stash.push_back((other_id, spliced));
@@ -663,7 +655,7 @@ impl MigratingCapableAccepter {
         }
     }
 
-    async fn peek_resume_header(
+    pub(crate) async fn peek_resume_header(
         mut reader: StreamReader,
     ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingError> {
         use crate::stream_migration::{RESUME_HEADER_LEN, ResumeHeader};
@@ -706,6 +698,11 @@ pub enum AcceptedStream {
     Migrating {
         reader: SplicedReader,
         writer: StreamWriter,
+        source_lane: LaneClass,
+    },
+    MigratingDuplex {
+        reader: SplicedReader,
+        writer: MigratingStreamWriter,
         source_lane: LaneClass,
     },
     /// A plain (non-migrating) stream.
@@ -796,6 +793,116 @@ impl DualStreamAccepter {
     pub fn into_migrating_only(self) -> MigratingCapableAccepter {
         MigratingCapableAccepter::new_with_plain_streams(self, false)
     }
+
+    pub fn into_migrating_duplex(self, opener: DualStreamOpener) -> MigratingCapableAccepter {
+        let mut mac = MigratingCapableAccepter::new_with_plain_streams(self, false);
+        mac.response_opener = Some(opener);
+        mac
+    }
+}
+
+#[derive(Debug)]
+pub struct ResponseRouter {
+    handle: ResponseRouterHandle,
+    #[allow(dead_code)]
+    tasks: tokio::task::JoinSet<()>,
+    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
+}
+impl Drop for ResponseRouter {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+impl ResponseRouter {
+    pub fn handle(&self) -> ResponseRouterHandle {
+        self.handle.clone()
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ResponseRouterHandle {
+    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
+    register_tx: mpsc::UnboundedSender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
+}
+impl ResponseRouterHandle {
+    pub fn expect_response(
+        &self,
+        logical_id: u64,
+        gen0_reader: StreamReader,
+    ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.register_tx.send((logical_id, tx));
+        let header = ResumeHeader {
+            logical_id,
+            generation: 0,
+            is_final: false,
+            is_response: true,
+        };
+        let _ = self
+            .cont_tx
+            .send((header, Box::pin(gen0_reader) as GenerationReader));
+        rx
+    }
+}
+pub fn spawn_response_router(mut accepter: DualStreamAccepter) -> ResponseRouter {
+    let (cont_tx, cont_rx) = mpsc::unbounded_channel();
+    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, SplicedReader)>();
+    let (register_tx, mut register_rx) =
+        mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>();
+    let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let mut waiters: std::collections::HashMap<
+            u64,
+            tokio::sync::oneshot::Sender<SplicedReader>,
+        > = std::collections::HashMap::new();
+        let mut ready: std::collections::HashMap<u64, SplicedReader> =
+            std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                reg = register_rx.recv() => match reg {
+                    Some((id, tx)) => match ready.remove(&id) {
+                        Some(spliced) => { let _ = tx.send(spliced); }
+                        None => { waiters.insert(id, tx); }
+                    },
+                    None => break,
+                },
+                gen0 = gen0_rx.recv() => match gen0 {
+                    Some((id, spliced)) => match waiters.remove(&id) {
+                        Some(tx) => { let _ = tx.send(spliced); }
+                        None => { ready.insert(id, spliced); }
+                    },
+                    None => break,
+                },
+            }
+        }
+    });
+    let cont_tx_accept = cont_tx.clone();
+    tasks.spawn(async move {
+        loop {
+            let Ok((reader, _writer, _lane)) = accepter.accept().await else {
+                break;
+            };
+            match MigratingCapableAccepter::peek_resume_header(reader).await {
+                Ok(Some((true, Some(header), reader))) if header.is_response => {
+                    if cont_tx_accept
+                        .send((header, Box::pin(reader) as GenerationReader))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    ResponseRouter {
+        handle: ResponseRouterHandle {
+            cont_tx,
+            register_tx,
+        },
+        tasks,
+        driver,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +969,186 @@ mod tests {
         let accepter = DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
 
         (opener, accepter, srv_int, srv_bulk, cli_int, cli_bulk)
+    }
+
+    async fn make_duplex_session() -> (
+        DualStreamOpener,
+        DualStreamAccepter,
+        DualStreamOpener,
+        DualStreamAccepter,
+        Vec<tokio::task::JoinSet<crate::serve::MuxError>>,
+    ) {
+        let buf_size = 4 * 1024 * 1024;
+        let (int_c2s, int_s2c) = duplex(buf_size);
+        let (bulk_c2s, bulk_s2c) = duplex(buf_size);
+        let (int_x_r, int_x_w) = tokio::io::split(int_c2s);
+        let (int_y_r, int_y_w) = tokio::io::split(int_s2c);
+        let (bulk_x_r, bulk_x_w) = tokio::io::split(bulk_c2s);
+        let (bulk_y_r, bulk_y_w) = tokio::io::split(bulk_s2c);
+        let x_cfg = MuxConfig {
+            initiation: Initiation::Server,
+            heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
+        };
+        let y_cfg = MuxConfig {
+            initiation: Initiation::Client,
+            heartbeat_interval: Duration::from_secs(1),
+            frame_reassembly: false,
+        };
+        let mut tasks = Vec::new();
+        let mut js = tokio::task::JoinSet::new();
+        let (int_x_op, int_x_acc) =
+            spawn_mux_no_reconnection(int_x_r, int_x_w, x_cfg.clone(), &mut js);
+        tasks.push(js);
+        let mut js = tokio::task::JoinSet::new();
+        let (bulk_x_op, bulk_x_acc) = spawn_mux_no_reconnection(bulk_x_r, bulk_x_w, x_cfg, &mut js);
+        tasks.push(js);
+        let mut js = tokio::task::JoinSet::new();
+        let (int_y_op, int_y_acc) =
+            spawn_mux_no_reconnection(int_y_r, int_y_w, y_cfg.clone(), &mut js);
+        tasks.push(js);
+        let mut js = tokio::task::JoinSet::new();
+        let (bulk_y_op, bulk_y_acc) = spawn_mux_no_reconnection(bulk_y_r, bulk_y_w, y_cfg, &mut js);
+        tasks.push(js);
+        let x_opener = DualStreamOpener::new(int_x_op, bulk_x_op, Liveness::new());
+        let x_accepter = DualStreamAccepter::new(int_x_acc, bulk_x_acc, Liveness::new());
+        let y_opener = DualStreamOpener::new(int_y_op, bulk_y_op, Liveness::new());
+        let y_accepter = DualStreamAccepter::new(int_y_acc, bulk_y_acc, Liveness::new());
+        (x_opener, x_accepter, y_opener, y_accepter, tasks)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_response_migrates_independently_with_clean_eof() {
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(42, LaneClass::Interactive);
+        req_writer.write_all(b"request").await.unwrap();
+        let accepted = mac.accept().await.unwrap();
+        let (mut req_reader, mut resp_writer) = match accepted {
+            AcceptedStream::MigratingDuplex { reader, writer, .. } => (reader, writer),
+            other => panic!("expected MigratingDuplex, got {other:?}"),
+        };
+        let mut req = [0u8; 7];
+        tokio::io::AsyncReadExt::read_exact(&mut req_reader, &mut req)
+            .await
+            .unwrap();
+        assert_eq!(&req, b"request");
+        let gen0_reader = gen0_rx.await.unwrap();
+        let spliced_rx = router.handle().expect_response(42, gen0_reader);
+        let mut resp_reader = spliced_rx.await.unwrap();
+        resp_writer.write_all(b"head-").await.unwrap();
+        resp_writer.write_all(&vec![0xEE; 40_000]).await.unwrap();
+        resp_writer.write_all(b"-tail").await.unwrap();
+        resp_writer.finalize().await.unwrap();
+        let mut resp = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut resp_reader, &mut resp)
+            .await
+            .unwrap();
+        assert_eq!(resp.len(), 5 + 40_000 + 5, "response length mismatch");
+        assert_eq!(&resp[..5], b"head-");
+        assert!(resp[5..5 + 40_000].iter().all(|b| *b == 0xEE));
+        assert_eq!(&resp[5 + 40_000..], b"-tail");
+        req_writer.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_response_without_migration_needs_final_for_clean_eof() {
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(7, LaneClass::Interactive);
+        req_writer.write_all(b"ping").await.unwrap();
+        let accepted = mac.accept().await.unwrap();
+        let mut resp_writer = match accepted {
+            AcceptedStream::MigratingDuplex { writer, .. } => writer,
+            other => panic!("expected MigratingDuplex, got {other:?}"),
+        };
+        let gen0_reader = gen0_rx.await.unwrap();
+        let mut resp_reader = router
+            .handle()
+            .expect_response(7, gen0_reader)
+            .await
+            .unwrap();
+        resp_writer.write_all(b"pong").await.unwrap();
+        resp_writer.finalize().await.unwrap();
+        let mut resp = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut resp_reader, &mut resp)
+            .await
+            .unwrap();
+        assert_eq!(resp, "pong");
+        req_writer.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplex_bidirectional_migration_integrity() {
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let upload = 512 * 1024;
+        let download = 512 * 1024;
+        let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(9, LaneClass::Interactive);
+        let send = tokio::spawn(async move {
+            let chunk = vec![0xABu8; 64 * 1024];
+            let mut sent = 0;
+            while sent < upload {
+                req_writer.write_all(&chunk).await.unwrap();
+                sent += chunk.len();
+            }
+            req_writer.finalize().await.unwrap();
+        });
+        let accepted = mac.accept().await.unwrap();
+        let (mut req_reader, mut resp_writer) = match accepted {
+            AcceptedStream::MigratingDuplex { reader, writer, .. } => (reader, writer),
+            other => panic!("expected MigratingDuplex, got {other:?}"),
+        };
+        let drain = tokio::spawn(async move {
+            loop {
+                _ = mac.accept().await;
+            }
+        });
+        let respond = tokio::spawn(async move {
+            let chunk = vec![0xCDu8; 64 * 1024];
+            let mut sent = 0;
+            while sent < download {
+                resp_writer.write_all(&chunk).await.unwrap();
+                sent += chunk.len();
+            }
+            resp_writer.finalize().await.unwrap();
+        });
+        let gen0_reader = gen0_rx.await.unwrap();
+        let mut resp_reader = router
+            .handle()
+            .expect_response(9, gen0_reader)
+            .await
+            .unwrap();
+        let (up, down) = tokio::join!(
+            async {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut req_reader, &mut buf)
+                    .await
+                    .unwrap();
+                buf
+            },
+            async {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut resp_reader, &mut buf)
+                    .await
+                    .unwrap();
+                buf
+            }
+        );
+        assert_eq!(up.len(), upload, "upload byte count mismatch");
+        assert!(
+            up.iter().all(|b| *b == 0xAB),
+            "upload
+    corrupted"
+        );
+        assert_eq!(down.len(), download, "download byte count mismatch");
+        assert!(down.iter().all(|b| *b == 0xCD), "download corrupted");
+        send.await.unwrap();
+        respond.await.unwrap();
+        drain.abort();
     }
 
     // -------------------------------------------------------------------
@@ -955,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn mirrored_classifier_tracks_bulk_ratio() {
-        let mut c = StreamClassifier::new();
+        let mut c = crate::traffic_class::Classifier::new();
 
         // Small writes → interactive
         for _ in 0..10 {

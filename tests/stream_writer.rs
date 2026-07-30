@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use mux::{spawn_mux_no_reconnection, Initiation, MuxConfig};
+use mux::{Initiation, MuxConfig, spawn_mux_no_reconnection};
 use tokio::{
-    io::{duplex, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, duplex},
     task::JoinSet,
 };
 

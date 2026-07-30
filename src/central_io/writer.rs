@@ -20,6 +20,7 @@ use crate::{
     protocol::{
         BodyLen, CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId, StreamIdMsg,
     },
+    traffic_class::Classifier,
 };
 
 use super::{DataBuf, DeadCentralIo};
@@ -28,7 +29,7 @@ const CONTROL_CHANNEL_SIZE: usize = 1024;
 const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
 const DATA_EXTREME_CAP: usize = 1200;
-const DATA_MEDIUM_CAP: usize = 2 * 1024;
+const DATA_MEDIUM_CAP: usize = crate::traffic_class::BULK_THRESHOLD;
 pub(crate) const DATA_BULK_CAP: usize = 32 * 1024;
 
 /// Maximum body length in a single Data frame when `frame_reassembly` is on.
@@ -42,13 +43,12 @@ const REASSEMBLY_MAX_BODY: usize = 64 * 1024 - Header::SIZE - DataHeaderExt::SIZ
 const LATENCY_IDLE: Duration = Duration::from_secs(30);
 
 /// Minimum number of sends before the 2/3-under-QUANTUM ratio is evaluated.
-const LATENCY_HISTORY_MIN: usize = 3;
-
 /// Maximum send history kept per stream. Once the counters reach this size
 /// they are halved before tallying the new observation, so classification
 /// tracks recent behaviour and a MustBulk stream reverts to latency-sensitive
 /// within a bounded number of small sends.
-const LATENCY_HISTORY_MAX: usize = 16;
+#[cfg(test)]
+const LATENCY_HISTORY_MAX: usize = crate::traffic_class::HISTORY_MAX;
 
 /// Per-stream traffic class, keyed by fair-queue token.
 ///
@@ -70,7 +70,7 @@ struct LatencyControl {
     /// incrementally so the 2/3-under-QUANTUM ratio is a cheap division, and
     /// `last_sent` lets `MustBulk` revert to latency-sensitive if a stream
     /// resumes after the idle window.
-    streams: HashMap<fair_queue::Token, StreamObs>,
+    streams: HashMap<fair_queue::Token, Classifier>,
     /// Number of currently-open streams (`Open` seen, no `Close`/`Fin` yet).
     open_count: usize,
     /// Number of open streams currently classified `MustBulk`.
@@ -83,21 +83,6 @@ struct LatencyControl {
     next_bulk_transition: Option<Instant>,
 }
 
-#[derive(Debug)]
-struct StreamObs {
-    small_count: usize,
-    bulk_count: usize,
-}
-impl StreamObs {
-    fn is_bulk(&self) -> bool {
-        let total = self.small_count + self.bulk_count;
-        if total < LATENCY_HISTORY_MIN {
-            return false;
-        }
-        self.small_count * 3 < total * 2
-    }
-}
-
 impl LatencyControl {
     fn new() -> Self {
         Self {
@@ -108,10 +93,7 @@ impl LatencyControl {
         }
     }
     fn open(&mut self, token: fair_queue::Token, now: Instant) {
-        let obs = StreamObs {
-            small_count: 0,
-            bulk_count: 0,
-        };
+        let obs = Classifier::new();
         self.open_count += 1;
         if obs.is_bulk() {
             self.bulk_count += 1;
@@ -134,18 +116,7 @@ impl LatencyControl {
             return;
         };
         let was_bulk = obs.is_bulk();
-        // Halve the counters when the history would exceed the bound, so the
-        // classification reflects recent behaviour and MustBulk reverts within
-        // a bounded number of small sends.
-        if obs.small_count + obs.bulk_count >= LATENCY_HISTORY_MAX {
-            obs.small_count /= 2;
-            obs.bulk_count /= 2;
-        }
-        if size <= DATA_MEDIUM_CAP {
-            obs.small_count += 1;
-        } else {
-            obs.bulk_count += 1;
-        }
+        obs.record(size);
         let is_bulk = obs.is_bulk();
         if was_bulk != is_bulk {
             if is_bulk {
@@ -162,9 +133,7 @@ impl LatencyControl {
         if self.open_count == self.bulk_count {
             return false;
         }
-        let t = self.next_bulk_transition.unwrap();
-        let now = Instant::now();
-        now < t
+        self.next_bulk_transition.is_none_or(|t| Instant::now() < t)
     }
 }
 
@@ -716,10 +685,10 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     use super::{
-        priority_size, round_robin_distance, write_data_channel, CentralIoWriter, HeadEntry,
-        StreamWriteData, StreamWriteDataTx, WriteControlMsg, WriteDataMsg, WriteDataRx,
-        WriteDataTxPrototype, DATA_BULK_CAP, DATA_EXTREME_CAP, LATENCY_HISTORY_MAX, LATENCY_IDLE,
-        REASSEMBLY_MAX_BODY,
+        CentralIoWriter, DATA_BULK_CAP, DATA_EXTREME_CAP, HeadEntry, LATENCY_HISTORY_MAX,
+        LATENCY_IDLE, REASSEMBLY_MAX_BODY, StreamWriteData, StreamWriteDataTx, WriteControlMsg,
+        WriteDataMsg, WriteDataRx, WriteDataTxPrototype, priority_size, round_robin_distance,
+        write_data_channel,
     };
     use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header, StreamId};
     use crate::{central_io::writer::DATA_MEDIUM_CAP, fair_queue};
@@ -1227,7 +1196,7 @@ mod tests {
     async fn large_write_all_reaches_peer_intact() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        use crate::{spawn_mux_no_reconnection, Initiation, MuxConfig};
+        use crate::{Initiation, MuxConfig, spawn_mux_no_reconnection};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

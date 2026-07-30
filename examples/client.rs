@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
 use file_transfer::FileTransferCommand;
-use mux::{spawn_mux_no_reconnection, Initiation, MuxConfig};
+use mux::{Initiation, MuxConfig, spawn_mux_no_reconnection};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,

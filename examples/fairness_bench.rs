@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Parser;
-use mux::{spawn_mux_no_reconnection, Initiation, MuxConfig};
+use mux::{Initiation, MuxConfig, spawn_mux_no_reconnection};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
