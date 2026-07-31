@@ -372,6 +372,19 @@ impl MigratingStreamWriter {
         self.state = WriterState::Closed;
         Ok(())
     }
+
+    pub async fn rebind(&mut self, opener: DualStreamOpener) -> Result<(), MigratingError> {
+        self.opener = opener;
+        match &self.state {
+            WriterState::Active { lane, .. } => {
+                let lane = *lane;
+                self.migrate_to(lane).await
+            }
+            WriterState::PendingOpen { .. }
+            | WriterState::Migrating { .. }
+            | WriterState::Closed => Ok(()),
+        }
+    }
 }
 
 impl Drop for MigratingStreamWriter {
@@ -523,11 +536,8 @@ pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
     pass_plain_streams: bool,
     response_opener: Option<DualStreamOpener>,
-    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
-    gen0_rx: mpsc::UnboundedReceiver<(u64, SplicedReader)>,
-    #[allow(dead_code)]
-    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
-    stash: std::collections::VecDeque<(u64, SplicedReader)>,
+    feed: SpliceFeedHandle,
+    _own_feed: Option<SpliceFeed>,
 }
 
 impl MigratingCapableAccepter {
@@ -536,18 +546,23 @@ impl MigratingCapableAccepter {
     }
 
     fn new_with_plain_streams(inner: DualStreamAccepter, pass_plain_streams: bool) -> Self {
-        let (cont_tx, cont_rx) = mpsc::unbounded_channel();
-        let (gen0_tx, gen0_rx) = mpsc::unbounded_channel();
-        let registry = SpliceRegistry::new();
-        let driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let feed = spawn_splice_feed();
         Self {
             inner,
             pass_plain_streams,
             response_opener: None,
-            cont_tx,
-            gen0_rx,
-            driver,
-            stash: std::collections::VecDeque::new(),
+            feed: feed.handle(),
+            _own_feed: Some(feed),
+        }
+    }
+
+    fn new_shared(inner: DualStreamAccepter, feed: SpliceFeedHandle) -> Self {
+        Self {
+            inner,
+            pass_plain_streams: false,
+            response_opener: None,
+            feed,
+            _own_feed: None,
         }
     }
 
@@ -585,22 +600,16 @@ impl MigratingCapableAccepter {
     /// Gen-0 readers arriving out of logical-id order are stashed in
     /// a [`VecDeque`] and re-tried on subsequent accepts.
     pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingError> {
-        // Check stash first for previously-mismatched gen-0 readers.
         loop {
-            // We need a full accept cycle (inner.accept → peek → maybe
-            // check stash). Drain the stash when there's no pending
-            // accept in progress.
             let (reader, writer, lane) = self
                 .inner
                 .accept()
                 .await
                 .map_err(|_| MigratingError::LaneDead)?;
-
             let Some((is_migrating, header_opt, reader)) = Self::peek_resume_header(reader).await?
             else {
                 continue;
             };
-
             if is_migrating {
                 if let Some(header) = header_opt {
                     if header.is_response {
@@ -608,42 +617,22 @@ impl MigratingCapableAccepter {
                     };
                     let logical_id = header.logical_id;
                     let is_gen0 = header.generation == 0;
-
                     let gen_reader: GenerationReader = Box::pin(reader);
-                    self.cont_tx
-                        .send((header, gen_reader))
-                        .map_err(|_| MigratingError::LaneDead)?;
-
                     if is_gen0 {
-                        // Drain gen-0 rx, checking stash first.
-                        loop {
-                            // Check stash.
-                            if let Some(pos) =
-                                self.stash.iter().position(|(id, _)| *id == logical_id)
-                            {
-                                let (_, spliced) = self.stash.remove(pos).unwrap();
-                                return Ok(
-                                    self.accepted_migrating(spliced, writer, lane, logical_id)
-                                );
-                            }
-                            match self.gen0_rx.recv().await {
-                                Some((id, spliced)) if id == logical_id => {
-                                    return Ok(
-                                        self.accepted_migrating(spliced, writer, lane, logical_id)
-                                    );
-                                }
-                                Some((other_id, spliced)) => {
-                                    self.stash.push_back((other_id, spliced));
-                                }
-                                None => return Err(MigratingError::LaneDead),
-                            }
-                        }
+                        let spliced_rx = self.feed.expect_gen0(logical_id);
+                        self.feed
+                            .send_continuation(header, gen_reader)
+                            .map_err(|_| MigratingError::LaneDead)?;
+                        let spliced = spliced_rx.await.map_err(|_| MigratingError::LaneDead)?;
+                        return Ok(self.accepted_migrating(spliced, writer, lane, logical_id));
                     } else {
+                        self.feed
+                            .send_continuation(header, gen_reader)
+                            .map_err(|_| MigratingError::LaneDead)?;
                         continue;
                     }
                 }
             }
-
             if !self.pass_plain_streams {
                 continue;
             }
@@ -799,29 +788,64 @@ impl DualStreamAccepter {
         mac.response_opener = Some(opener);
         mac
     }
+
+    pub fn into_migrating_only_shared(self, feed: SpliceFeedHandle) -> MigratingCapableAccepter {
+        MigratingCapableAccepter::new_shared(self, feed)
+    }
+
+    pub fn into_migrating_duplex_shared(
+        self,
+        opener: DualStreamOpener,
+        feed: SpliceFeedHandle,
+    ) -> MigratingCapableAccepter {
+        let mut mac = MigratingCapableAccepter::new_shared(self, feed);
+        mac.response_opener = Some(opener);
+        mac
+    }
 }
 
 #[derive(Debug)]
 pub struct ResponseRouter {
-    handle: ResponseRouterHandle,
-    #[allow(dead_code)]
+    feed: SpliceFeed,
     tasks: tokio::task::JoinSet<()>,
-    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
 }
 impl Drop for ResponseRouter {
     fn drop(&mut self) {
-        self.driver.abort();
+        self.feed.abort();
     }
 }
 impl ResponseRouter {
     pub fn handle(&self) -> ResponseRouterHandle {
-        self.handle.clone()
+        ResponseRouterHandle {
+            feed: self.feed.handle(),
+        }
+    }
+
+    pub fn add_accepter(&mut self, mut accepter: DualStreamAccepter) {
+        let feed = self.feed.handle();
+        self.tasks.spawn(async move {
+            loop {
+                let Ok((reader, _writer, _lane)) = accepter.accept().await else {
+                    break;
+                };
+                match MigratingCapableAccepter::peek_resume_header(reader).await {
+                    Ok(Some((true, Some(header), reader))) if header.is_response => {
+                        if feed
+                            .send_continuation(header, Box::pin(reader) as GenerationReader)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 }
 #[derive(Debug, Clone)]
 pub struct ResponseRouterHandle {
-    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
-    register_tx: mpsc::UnboundedSender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
+    feed: SpliceFeedHandle,
 }
 impl ResponseRouterHandle {
     pub fn expect_response(
@@ -829,8 +853,7 @@ impl ResponseRouterHandle {
         logical_id: u64,
         gen0_reader: StreamReader,
     ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.register_tx.send((logical_id, tx));
+        let rx = self.feed.expect_gen0(logical_id);
         let header = ResumeHeader {
             logical_id,
             generation: 0,
@@ -838,71 +861,18 @@ impl ResponseRouterHandle {
             is_response: true,
         };
         let _ = self
-            .cont_tx
-            .send((header, Box::pin(gen0_reader) as GenerationReader));
+            .feed
+            .send_continuation(header, Box::pin(gen0_reader) as GenerationReader);
         rx
     }
 }
-pub fn spawn_response_router(mut accepter: DualStreamAccepter) -> ResponseRouter {
-    let (cont_tx, cont_rx) = mpsc::unbounded_channel();
-    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, SplicedReader)>();
-    let (register_tx, mut register_rx) =
-        mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>();
-    let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(async move {
-        let mut waiters: std::collections::HashMap<
-            u64,
-            tokio::sync::oneshot::Sender<SplicedReader>,
-        > = std::collections::HashMap::new();
-        let mut ready: std::collections::HashMap<u64, SplicedReader> =
-            std::collections::HashMap::new();
-        loop {
-            tokio::select! {
-                reg = register_rx.recv() => match reg {
-                    Some((id, tx)) => match ready.remove(&id) {
-                        Some(spliced) => { let _ = tx.send(spliced); }
-                        None => { waiters.insert(id, tx); }
-                    },
-                    None => break,
-                },
-                gen0 = gen0_rx.recv() => match gen0 {
-                    Some((id, spliced)) => match waiters.remove(&id) {
-                        Some(tx) => { let _ = tx.send(spliced); }
-                        None => { ready.insert(id, spliced); }
-                    },
-                    None => break,
-                },
-            }
-        }
-    });
-    let cont_tx_accept = cont_tx.clone();
-    tasks.spawn(async move {
-        loop {
-            let Ok((reader, _writer, _lane)) = accepter.accept().await else {
-                break;
-            };
-            match MigratingCapableAccepter::peek_resume_header(reader).await {
-                Ok(Some((true, Some(header), reader))) if header.is_response => {
-                    if cont_tx_accept
-                        .send((header, Box::pin(reader) as GenerationReader))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-    ResponseRouter {
-        handle: ResponseRouterHandle {
-            cont_tx,
-            register_tx,
-        },
-        tasks,
-        driver,
-    }
+pub fn spawn_response_router(accepter: DualStreamAccepter) -> ResponseRouter {
+    let mut router = ResponseRouter {
+        feed: spawn_splice_feed(),
+        tasks: tokio::task::JoinSet::new(),
+    };
+    router.add_accepter(accepter);
+    router
 }
 
 // ---------------------------------------------------------------------------
@@ -2002,5 +1972,217 @@ mod tests {
 
         write.await.unwrap();
         drain.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_feed_second_accepter_splices_byte_exact() {
+        let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
+        let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
+        let feed = spawn_splice_feed();
+        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
+        let mut mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let send = tokio::spawn(async move {
+            let mut w = op1.open_migrating_manual(42, LaneClass::Interactive);
+            w.write_all(b"born-on-session-one|").await.unwrap();
+            w.rebind(op2).await.unwrap();
+            w.write_all(b"continued-on-session-two").await.unwrap();
+            w.finalize().await.unwrap();
+        });
+        let accepted = mac1.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            other => panic!("expected migrating, got {other:?}"),
+        };
+        let drain1 = tokio::spawn(async move {
+            loop {
+                let _ = mac1.accept().await;
+            }
+        });
+        let drain2 = tokio::spawn(async move {
+            loop {
+                let _ = mac2.accept().await;
+            }
+        });
+        let mut data = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data),
+        )
+        .await
+        .expect("cross-session splice stalled")
+        .unwrap();
+        assert_eq!(data, "born-on-session-one|continued-on-session-two");
+        send.await.unwrap();
+        drain1.abort();
+        drain2.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebind_mid_stream_is_lossless() {
+        let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
+        let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
+        let feed = spawn_splice_feed();
+        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
+        let mut mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let half = 200 * 1024;
+        let pattern: Vec<u8> = (0..2 * half).map(|i| (i % 251) as u8).collect();
+        let expected = pattern.clone();
+        let send = tokio::spawn(async move {
+            let mut w = op1.open_migrating(9, LaneClass::Interactive);
+            w.write_all(&pattern[..half]).await.unwrap();
+            w.rebind(op2).await.unwrap();
+            w.write_all(&pattern[half..]).await.unwrap();
+            w.finalize().await.unwrap();
+        });
+        let accepted = mac1.accept().await.unwrap();
+        let mut reader = match accepted {
+            AcceptedStream::Migrating { reader, .. } => reader,
+            other => panic!("expected migrating, got {other:?}"),
+        };
+        let drain1 = tokio::spawn(async move {
+            loop {
+                let _ = mac1.accept().await;
+            }
+        });
+        let drain2 = tokio::spawn(async move {
+            loop {
+                let _ = mac2.accept().await;
+            }
+        });
+        let mut data = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data),
+        )
+        .await
+        .expect("rebound stream stalled")
+        .unwrap();
+        assert_eq!(data.len(), expected.len(), "byte count mismatch");
+        assert_eq!(data, expected, "bytes lost or reordered across rebind");
+        send.await.unwrap();
+        drain1.abort();
+        drain2.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_final_crossing_shared_feed_closes_cleanly() {
+        let (x1_op, x1_acc, y1_op, y1_acc, _t1) = make_duplex_session().await;
+        let (_x2_op, x2_acc, y2_op, _y2_acc, _t2) = make_duplex_session().await;
+        let mut router = spawn_response_router(x1_acc);
+        router.add_accepter(x2_acc);
+        let mut mac1 = y1_acc.into_migrating_duplex(y1_op);
+        let (mut req_writer, gen0_rx) = x1_op.open_migrating_with_reader(7, LaneClass::Interactive);
+        req_writer.write_all(b"ping").await.unwrap();
+        let accepted = mac1.accept().await.unwrap();
+        let mut resp_writer = match accepted {
+            AcceptedStream::MigratingDuplex { writer, .. } => writer,
+            other => panic!("expected MigratingDuplex, got {other:?}"),
+        };
+        let gen0_reader = gen0_rx.await.unwrap();
+        let mut resp_reader = router
+            .handle()
+            .expect_response(7, gen0_reader)
+            .await
+            .unwrap();
+        resp_writer.write_all(b"pong-").await.unwrap();
+        resp_writer.rebind(y2_op).await.unwrap();
+        resp_writer.write_all(b"across").await.unwrap();
+        resp_writer.finalize().await.unwrap();
+        let mut resp = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_to_string(&mut resp_reader, &mut resp),
+        )
+        .await
+        .expect("RESPONSE|FINAL did not cross the shared feed")
+        .unwrap();
+        assert_eq!(resp, "pong-across");
+        req_writer.shutdown().unwrap();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpliceFeedHandle {
+    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
+    register_tx: mpsc::UnboundedSender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
+}
+
+impl SpliceFeedHandle {
+    fn send_continuation(&self, header: ResumeHeader, reader: GenerationReader) -> Result<(), ()> {
+        self.cont_tx.send((header, reader)).map_err(|_| ())
+    }
+
+    fn expect_gen0(&self, logical_id: u64) -> tokio::sync::oneshot::Receiver<SplicedReader> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.register_tx.send((logical_id, tx));
+        rx
+    }
+}
+
+#[derive(Debug)]
+pub struct SpliceFeed {
+    handle: SpliceFeedHandle,
+    matcher: tokio::task::JoinHandle<()>,
+    driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
+}
+
+impl SpliceFeed {
+    pub fn handle(&self) -> SpliceFeedHandle {
+        self.handle.clone()
+    }
+
+    fn abort(&self) {
+        self.driver.abort();
+        self.matcher.abort();
+    }
+}
+
+pub fn spawn_splice_feed() -> SpliceFeed {
+    let (cont_tx, cont_rx) = mpsc::unbounded_channel();
+    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, SplicedReader)>();
+    let (register_tx, mut register_rx) =
+        mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>();
+    let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
+    let matcher = tokio::spawn(async move {
+        let mut waiters: std::collections::HashMap<
+            u64,
+            tokio::sync::oneshot::Sender<SplicedReader>,
+        > = std::collections::HashMap::new();
+        let mut ready: std::collections::HashMap<u64, SplicedReader> =
+            std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                reg = register_rx.recv() => match reg {
+                    Some((id, tx)) => match ready.remove(&id) {
+                        Some(spliced) => {
+                            let _ = tx.send(spliced);
+                        }
+                        None => {
+                            waiters.insert(id, tx);
+                        }
+                    },
+                    None => break,
+                },
+                gen0 = gen0_rx.recv() => match gen0 {
+                    Some((id, spliced)) => match waiters.remove(&id) {
+                        Some(tx) => {
+                            let _ = tx.send(spliced);
+                        }
+                        None => {
+                            ready.insert(id, spliced);
+                        }
+                    },
+                    None => break,
+                },
+            }
+        }
+    });
+    SpliceFeed {
+        handle: SpliceFeedHandle {
+            cont_tx,
+            register_tx,
+        },
+        matcher,
+        driver,
     }
 }

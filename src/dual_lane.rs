@@ -34,7 +34,7 @@ use crate::{
 const LANE_HELLO_INTERACTIVE: u8 = 0xD1;
 const LANE_HELLO_BULK: u8 = 0xD2;
 const PAIRING_NONCE_LEN: usize = 16;
-const HELLO_LEN: usize = 1 + PAIRING_NONCE_LEN;
+const HELLO_LEN: usize = 1 + PAIRING_NONCE_LEN + GROUP_TOKEN_LEN;
 
 /// Threshold for `open_auto` classification. Writes strictly larger than
 /// this go to the bulk lane; equal-or-smaller go to interactive. Mirrors
@@ -129,11 +129,13 @@ pub async fn write_lane_hello<W: AsyncWrite + Unpin>(
     writer: &mut W,
     class: LaneClass,
     nonce: PairingNonce,
+    group: GroupToken,
 ) -> Result<(), LaneHelloError> {
     use tokio::io::AsyncWriteExt;
     let mut buf = [0u8; HELLO_LEN];
     buf[0] = class.hello_byte();
-    buf[1..].copy_from_slice(nonce.as_ref());
+    buf[1..1 + PAIRING_NONCE_LEN].copy_from_slice(nonce.as_ref());
+    buf[1 + PAIRING_NONCE_LEN..].copy_from_slice(group.as_ref());
     writer
         .write_all(&buf)
         .await
@@ -143,7 +145,7 @@ pub async fn write_lane_hello<W: AsyncWrite + Unpin>(
 
 pub async fn read_lane_hello<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<(LaneClass, PairingNonce), LaneHelloError> {
+) -> Result<(LaneClass, PairingNonce, GroupToken), LaneHelloError> {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; HELLO_LEN];
     reader
@@ -152,8 +154,10 @@ pub async fn read_lane_hello<R: AsyncRead + Unpin>(
         .map_err(|e| LaneHelloError::Io(e.kind()))?;
     let class = LaneClass::from_hello_byte(buf[0]).ok_or(LaneHelloError::BadLaneClass(buf[0]))?;
     let mut nonce_bytes = [0u8; PAIRING_NONCE_LEN];
-    nonce_bytes.copy_from_slice(&buf[1..]);
-    Ok((class, PairingNonce(nonce_bytes)))
+    nonce_bytes.copy_from_slice(&buf[1..1 + PAIRING_NONCE_LEN]);
+    let mut group_bytes = [0u8; GROUP_TOKEN_LEN];
+    group_bytes.copy_from_slice(&buf[1 + PAIRING_NONCE_LEN..]);
+    Ok((class, PairingNonce(nonce_bytes), GroupToken(group_bytes)))
 }
 
 // ---------------------------------------------------------------------------
@@ -781,35 +785,31 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let nonce = PairingNonce::generate();
-
+    let group = GroupToken::generate();
     let Some((int_reader, mut int_writer)) = connect_interactive().await else {
         return Err(DualMuxError::LaneHello(LaneHelloError::Io(
             io::ErrorKind::ConnectionRefused,
         )));
     };
-    write_lane_hello(&mut int_writer, LaneClass::Interactive, nonce)
+    write_lane_hello(&mut int_writer, LaneClass::Interactive, nonce, group)
         .await
         .map_err(DualMuxError::LaneHello)?;
-
     let Some((bulk_reader, mut bulk_writer)) = connect_bulk().await else {
         return Err(DualMuxError::LaneHello(LaneHelloError::Io(
             io::ErrorKind::ConnectionRefused,
         )));
     };
-    write_lane_hello(&mut bulk_writer, LaneClass::Bulk, nonce)
+    write_lane_hello(&mut bulk_writer, LaneClass::Bulk, nonce, group)
         .await
         .map_err(DualMuxError::LaneHello)?;
-
     let mut int_spawner = JoinSet::new();
     let (int_opener, int_accepter) =
         spawn_mux_no_reconnection(int_reader, int_writer, config.clone(), &mut int_spawner);
     let mut bulk_spawner = JoinSet::new();
     let (bulk_opener, bulk_accepter) =
         spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
-
     let liveness = Liveness::new();
     let alive = liveness.alive.clone();
-
     spawner.spawn(async move {
         tokio::select! {
             res = int_spawner.join_next() => {
@@ -824,7 +824,6 @@ where
             }
         }
     });
-
     let opener = DualStreamOpener::new(int_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_accepter, bulk_accepter, liveness);
     Ok((opener, accepter))
@@ -843,16 +842,14 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (class, nonce) =
+    let (class, nonce, _group) =
         match tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader)).await {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => return Err(DualMuxError::LaneHello(e)),
             Err(_) => return Err(DualMuxError::HelloDeadline),
         };
-
     let mut lane_spawner = JoinSet::new();
     let (opener, accepter) = spawn_mux_no_reconnection(reader, writer, config, &mut lane_spawner);
-
     let pending = PendingAcceptor {
         class,
         nonce,
@@ -977,23 +974,25 @@ mod tests {
     #[tokio::test]
     async fn hello_round_trip() {
         let nonce = PairingNonce::generate();
+        let group = GroupToken::generate();
         let (c2s, s2c) = duplex(64);
         let (mut crx, mut ctx) = tokio::io::split(c2s);
         let (mut srx, mut stx) = tokio::io::split(s2c);
-
-        write_lane_hello(&mut ctx, LaneClass::Interactive, nonce)
+        write_lane_hello(&mut ctx, LaneClass::Interactive, nonce, group)
             .await
             .unwrap();
-        let (class, read_nonce) = read_lane_hello(&mut srx).await.unwrap();
+        let (class, read_nonce, read_group) = read_lane_hello(&mut srx).await.unwrap();
         assert_eq!(class, LaneClass::Interactive);
         assert_eq!(read_nonce, nonce);
+        assert_eq!(read_group, group);
 
-        write_lane_hello(&mut stx, LaneClass::Bulk, nonce)
+        write_lane_hello(&mut stx, LaneClass::Bulk, nonce, group)
             .await
             .unwrap();
-        let (class, read_nonce) = read_lane_hello(&mut crx).await.unwrap();
+        let (class, read_nonce, read_group) = read_lane_hello(&mut crx).await.unwrap();
         assert_eq!(class, LaneClass::Bulk);
         assert_eq!(read_nonce, nonce);
+        assert_eq!(read_group, group);
     }
 
     #[tokio::test]
@@ -1005,7 +1004,7 @@ mod tests {
 
         let mut buf = [0u8; HELLO_LEN];
         buf[0] = 0xFF;
-        buf[1..].copy_from_slice(nonce.as_ref());
+        buf[1..1 + PAIRING_NONCE_LEN].copy_from_slice(nonce.as_ref());
         ctx.write_all(&buf).await.unwrap();
 
         let result = read_lane_hello(&mut srx).await;
@@ -1293,15 +1292,15 @@ mod tests {
     async fn nonce_mismatch_rejected() {
         let nonce_a = PairingNonce([0x01u8; PAIRING_NONCE_LEN]);
         let nonce_b = PairingNonce([0x02u8; PAIRING_NONCE_LEN]);
-
+        let group = GroupToken::generate();
         let (c2s, s2c) = duplex(64);
         let (int_r, mut int_w) = tokio::io::split(c2s);
         let (bulk_r, mut bulk_w) = tokio::io::split(s2c);
 
-        write_lane_hello(&mut int_w, LaneClass::Interactive, nonce_a)
+        write_lane_hello(&mut int_w, LaneClass::Interactive, nonce_a, group)
             .await
             .unwrap();
-        write_lane_hello(&mut bulk_w, LaneClass::Bulk, nonce_b)
+        write_lane_hello(&mut bulk_w, LaneClass::Bulk, nonce_b, group)
             .await
             .unwrap();
 
@@ -1631,5 +1630,24 @@ mod tests {
             }
             other => panic!("expected aggregate dual-lane error, got {other:?}"),
         }
+    }
+}
+
+const GROUP_TOKEN_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroupToken([u8; GROUP_TOKEN_LEN]);
+
+impl GroupToken {
+    pub fn generate() -> Self {
+        let mut buf = [0u8; GROUP_TOKEN_LEN];
+        getrandom::fill(&mut buf).expect("GroupToken generation failed");
+        Self(buf)
+    }
+}
+
+impl AsRef<[u8]> for GroupToken {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
