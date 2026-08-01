@@ -300,9 +300,9 @@ impl<T> Receiver<T> {
         E: FnMut(Token) -> bool,
     {
         let mut excluded = excluded;
-        if self.queues.len() != MAX_QUEUE_COUNT {
+        while self.queues.len() != MAX_QUEUE_COUNT {
             match self.opener.poll_recv(cx) {
-                Poll::Ready(None) => (),
+                Poll::Ready(None) => break,
                 Poll::Ready(Some(open_req)) => {
                     let (tx, mut rx) = mpsc::channel(DATA_QUEUE_SIZE);
                     assert!(rx.poll_recv(cx).is_pending(), "register waker");
@@ -318,12 +318,13 @@ impl<T> Receiver<T> {
                         token: new_token,
                         ready: self.ready.clone(),
                     };
-                    if open_req.resp.send(resp).is_ok() {
-                        self.queues.insert(new_token, rx);
+                    if open_req.resp.send(resp).is_err() {
+                        continue;
                     }
+                    self.queues.insert(new_token, rx);
                     return Some((new_token, ReceiverRecv::Open(open_req.opening_value))).into();
                 }
-                Poll::Pending => (),
+                Poll::Pending => break,
             }
         }
         let mut saw_ready = false;

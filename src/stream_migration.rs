@@ -70,6 +70,7 @@ pub enum MigrationError {
     BadMagic(u64),
     CorruptHeader,
     DuplicateGeneration,
+    GenerationAfterFinal,
     /// A FINAL-marker generation carried a non-zero payload.
     FinalWithPayload,
     TooManyPendingGenerations,
@@ -85,6 +86,9 @@ impl fmt::Display for MigrationError {
             MigrationError::BadMagic(m) => write!(f, "bad resume header magic: {m:#x}"),
             MigrationError::CorruptHeader => write!(f, "corrupt or truncated resume header"),
             MigrationError::DuplicateGeneration => write!(f, "duplicate generation number"),
+            MigrationError::GenerationAfterFinal => {
+                write!(f, "generation arrived after the chain's FINAL")
+            }
             MigrationError::FinalWithPayload => {
                 write!(f, "FINAL-marker generation must have zero payload")
             }
@@ -223,6 +227,12 @@ impl GenerationChain {
         self.logical_id
     }
 
+    /// Whether generation 0 has never been started — the stream was never
+    /// announced to the peer.
+    pub fn is_unannounced(&self) -> bool {
+        self.next_generation == 0
+    }
+
     /// Start a new generation on `writer`. Writes the resume header
     /// **before** returning control, so the peer sees it before any
     /// payload bytes. Returns the generation number that was started.
@@ -259,15 +269,16 @@ struct StreamEntry {
     /// Pending generations sorted by generation number. Each carries a
     /// FINAL flag and its reader.
     pending: BTreeMap<u32, (bool, GenerationReader)>,
-    /// Whether a FINAL marker has been seen among the pending set.
-    final_seen: bool,
+    /// Highest generation number at which a FINAL marker was seen. Once
+    /// set, any later generation is a protocol error.
+    final_generation: Option<u32>,
 }
 
 impl StreamEntry {
     fn new() -> Self {
         Self {
             pending: BTreeMap::new(),
-            final_seen: false,
+            final_generation: None,
         }
     }
 }
@@ -323,6 +334,8 @@ impl SpliceRegistry {
         continuation: impl AsyncRead + Send + Sync + 'static,
     ) -> Result<Option<SplicedReader>, MigrationError> {
         let reader: GenerationReader = Box::pin(continuation);
+        let claimed = (header.generation == 0).then_some(header.logical_id);
+        self.reap_orphans(claimed);
         match self.streams.get_mut(&header.logical_id) {
             Some(entry) => {
                 if header.generation == 0 {
@@ -331,8 +344,13 @@ impl SpliceRegistry {
                 if entry.pending.contains_key(&header.generation) {
                     return Err(MigrationError::DuplicateGeneration);
                 }
+                if let Some(final_generation) = entry.final_generation
+                    && (header.is_final || header.generation >= final_generation)
+                {
+                    return Err(MigrationError::GenerationAfterFinal);
+                }
                 if header.is_final {
-                    entry.final_seen = true;
+                    entry.final_generation = Some(header.generation);
                 } else if entry.pending.len() >= MAX_PENDING_GENERATIONS {
                     return Err(MigrationError::TooManyPendingGenerations);
                 }
@@ -344,7 +362,6 @@ impl SpliceRegistry {
             None => {
                 if header.generation == 0 {
                     let mut entry = StreamEntry::new();
-                    entry.final_seen = header.is_final;
                     let is_closed = header.is_final;
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
                         self.orphan_count -= orphans.len();
@@ -353,11 +370,16 @@ impl SpliceRegistry {
                                 orphan.header.generation,
                                 (orphan.header.is_final, orphan.reader),
                             );
-                            if orphan.header.is_final {
-                                entry.final_seen = true;
-                            }
                         }
                     }
+                    entry.final_generation = match header.is_final {
+                        true => Some(0),
+                        false => entry
+                            .pending
+                            .iter()
+                            .find(|(_, (is_final, _))| *is_final)
+                            .map(|(generation, _)| *generation),
+                    };
                     self.streams.insert(header.logical_id, entry);
                     Ok(Some(SplicedReader::new(
                         header.logical_id,
@@ -377,7 +399,7 @@ impl SpliceRegistry {
         header: ResumeHeader,
         reader: GenerationReader,
     ) -> Result<(), MigrationError> {
-        self.reap_orphans();
+        self.reap_orphans(None);
         if self.orphan_count >= MAX_ORPHANS {
             return Err(MigrationError::TooManyOrphans);
         }
@@ -394,9 +416,16 @@ impl SpliceRegistry {
         Ok(())
     }
 
-    fn reap_orphans(&mut self) {
+    /// Reap orphan entries whose TTL has expired. The stream whose
+    /// generation-0 is arriving right now (`claimed`) is skipped, so
+    /// orphans from that stream survive long enough to be merged into it
+    /// — orphan expiry stays bound under ordinary traffic.
+    fn reap_orphans(&mut self, claimed: Option<u64>) {
         let now = Instant::now();
-        for entries in self.orphans.values_mut() {
+        for (logical_id, entries) in self.orphans.iter_mut() {
+            if Some(*logical_id) == claimed {
+                continue;
+            }
             while let Some(front) = entries.front() {
                 if front.deadline <= now {
                     entries.pop_front();
@@ -550,6 +579,9 @@ impl AsyncRead for SplicedReader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if self.finished {
                 return Poll::Ready(Ok(()));
@@ -682,7 +714,7 @@ impl AsyncRead for SplicedReader {
 pub fn spawn_splice_driver(
     mut registry: SpliceRegistry,
     mut cont_rx: tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
-    gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, SplicedReader)>,
+    gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
 ) -> tokio::task::JoinHandle<Result<(), MigrationError>> {
     tokio::spawn(async move {
         let mut queues: HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>> =
@@ -700,6 +732,10 @@ pub fn spawn_splice_driver(
         ) -> bool {
             let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
             while let Some((genn, is_final, reader)) = registry.pop_pending(logical_id) {
+                if genn < next {
+                    drop(reader);
+                    continue;
+                }
                 if genn == next {
                     if queue_tx.send((is_final, reader)).is_err() {
                         return true;
@@ -743,7 +779,21 @@ pub fn spawn_splice_driver(
 
                     let spliced_opt = match registry.dispatch(header, reader) {
                         Ok(opt) => opt,
-                        Err(MigrationError::DuplicateGeneration) => {
+                        Err(
+                            MigrationError::DuplicateGeneration
+                            | MigrationError::GenerationAfterFinal
+                            | MigrationError::TooManyOrphans,
+                        ) => {
+                            continue;
+                        }
+                        Err(MigrationError::TooManyPendingGenerations) => {
+                            cleanup_all(
+                                logical_id,
+                                &mut queues,
+                                &mut cleanup_tokens,
+                                &mut next_to_flush,
+                                &mut registry,
+                            );
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -755,7 +805,7 @@ pub fn spawn_splice_driver(
                                 if is_final {
                                     registry.remove_stream(logical_id);
                                     cleanup_tokens.remove(&logical_id);
-                                    let _ = gen0_tx.send((logical_id, spliced));
+                                    let _ = gen0_tx.send((logical_id, Some(spliced)));
                                 } else {
                                     let (queue_tx, queue_rx) =
                                         tokio::sync::mpsc::unbounded_channel();
@@ -779,7 +829,7 @@ pub fn spawn_splice_driver(
                                         &queue_tx,
                                         &mut next_to_flush,
                                     );
-                                    if gen0_tx.send((logical_id, spliced)).is_err()
+                                    if gen0_tx.send((logical_id, Some(spliced))).is_err()
                                         || reached_final
                                     {
                                         cleanup_all(
@@ -794,6 +844,9 @@ pub fn spawn_splice_driver(
                             }
                         }
                         None => {
+                            if is_gen0 {
+                                let _ = gen0_tx.send((logical_id, None));
+                            }
                             if let Some(queue_tx) = queues.get(&logical_id).cloned() {
                                 let reached_final = flush_contiguous(
                                     &mut registry,

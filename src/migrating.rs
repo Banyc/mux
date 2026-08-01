@@ -10,6 +10,7 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::{
     StreamReader,
@@ -183,43 +184,23 @@ impl MigratingStreamWriter {
     }
 
     async fn ensure_open(&mut self) -> Result<(), MigratingError> {
-        let state = std::mem::replace(&mut self.state, WriterState::Closed);
-        match state {
-            WriterState::Active { .. } => {
-                self.state = state;
-                Ok(())
-            }
-            WriterState::PendingOpen { lane } => {
-                let (reader, mut writer) = match self.opener.open(lane).await {
-                    Ok(x) => x,
-                    Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
-                };
-                let genn = self
-                    .chain
-                    .start_generation(&mut tokio_util_writer(&mut writer), false)
-                    .await?;
-                self.route_opened_reader(genn, reader);
-                self.state = WriterState::Active { writer, lane };
-                Ok(())
-            }
-            WriterState::Migrating { target_lane } => {
-                let (reader, mut writer) = match self.opener.open(target_lane).await {
-                    Ok(x) => x,
-                    Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
-                };
-                let genn = self
-                    .chain
-                    .start_generation(&mut tokio_util_writer(&mut writer), false)
-                    .await?;
-                self.route_opened_reader(genn, reader);
-                self.state = WriterState::Active {
-                    writer,
-                    lane: target_lane,
-                };
-                Ok(())
-            }
-            WriterState::Closed => Err(MigratingError::LaneDead),
-        }
+        let lane = match &self.state {
+            WriterState::Active { .. } => return Ok(()),
+            WriterState::PendingOpen { lane } => *lane,
+            WriterState::Migrating { target_lane } => *target_lane,
+            WriterState::Closed => return Err(MigratingError::LaneDead),
+        };
+        let (reader, mut writer) = match self.opener.open(lane).await {
+            Ok(x) => x,
+            Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
+        };
+        let genn = self
+            .chain
+            .start_generation(&mut tokio_util_writer(&mut writer), false)
+            .await?;
+        self.route_opened_reader(genn, reader);
+        self.state = WriterState::Active { writer, lane };
+        Ok(())
     }
 
     async fn migrate_to(&mut self, target: LaneClass) -> Result<(), MigratingError> {
@@ -308,58 +289,50 @@ impl MigratingStreamWriter {
     /// FINAL-marker generation so the peer receives a clean EOF. The
     /// FINAL generation is written by a detached background task (the
     /// [`GenerationChain`] and an owned [`DualStreamOpener`] clone move
-    /// into it), so this method stays synchronous. If no data was ever
-    /// written (still [`PendingOpen`](WriterState::PendingOpen)), this is
-    /// a no-op — the peer was never aware of the stream, so no FINAL is
-    /// needed.
+    /// into it), so this method stays synchronous. If the stream was
+    /// never announced to the peer (still unopened), this is a no-op — no
+    /// FINAL is emitted for a stream the peer never saw.
     pub fn shutdown(&mut self) -> Result<(), MigratingError> {
-        match self.state {
-            WriterState::PendingOpen { .. } | WriterState::Closed => {
-                self.state = WriterState::Closed;
-                return Ok(());
-            }
-            _ => {}
+        if self.nothing_to_close() {
+            self.state = WriterState::Closed;
+            return Ok(());
         }
-        // Close the data-carrying generation first.
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
-        // Move the chain + a clone of the opener into a detached task
-        // that opens a fresh substream, writes the FINAL resume header,
-        // and closes — giving the peer a positive end-of-stream signal.
         let opener = self.opener.clone();
         let mut chain = std::mem::replace(&mut self.chain, GenerationChain::new(0));
-        tokio::spawn(async move {
-            if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
-                let _ = chain
-                    .start_generation(&mut tokio_util_writer(&mut final_writer), true)
-                    .await;
-                let _ = final_writer.shutdown();
-            }
-        });
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
+                    let _ = chain
+                        .start_generation(&mut tokio_util_writer(&mut final_writer), true)
+                        .await;
+                    let _ = final_writer.shutdown();
+                }
+            });
+        }
         self.state = WriterState::Closed;
         Ok(())
     }
 
-    /// Clean close: opens a new subs-stream for a FINAL-marker generation,
+    /// Clean close: opens a new substream for a FINAL-marker generation,
     /// writes the FINAL resume header, and closes. The peer receives a
-    /// clean EOF (the [`SplicedReader`] sees `is_closed = true`). If no
-    /// data was ever written (still [`PendingOpen`](WriterState::PendingOpen)),
-    /// this is a no-op — the peer was never aware of the stream.
+    /// clean EOF (the [`SplicedReader`] sees `is_closed = true`). If the
+    /// stream was never announced to the peer (still unopened), this is
+    /// a no-op — no FINAL is emitted for a stream the peer never saw.
     pub async fn finalize(&mut self) -> Result<(), MigratingError> {
-        match &self.state {
-            WriterState::PendingOpen { .. } | WriterState::Closed => {
-                self.state = WriterState::Closed;
-                return Ok(());
-            }
-            _ => {}
+        if self.nothing_to_close() {
+            self.state = WriterState::Closed;
+            return Ok(());
         }
-        // Close the data-carrying generation first.
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
         }
-        // Open a fresh subs-tream for the FINAL-only generation.
-        // Any lane works — the resume header is 21 bytes.
+        if let Some(held) = &mut self.held_readers {
+            held.clear();
+        }
+        self.state = WriterState::Closed;
         let (_, mut final_writer) = self
             .opener
             .open(LaneClass::Interactive)
@@ -369,8 +342,13 @@ impl MigratingStreamWriter {
             .start_generation(&mut tokio_util_writer(&mut final_writer), true)
             .await?;
         let _ = final_writer.shutdown();
-        self.state = WriterState::Closed;
         Ok(())
+    }
+
+    /// A stream with nothing left to close is either already closed or
+    /// was never announced to the peer (generation 0 never opened).
+    fn nothing_to_close(&self) -> bool {
+        matches!(self.state, WriterState::Closed) || self.chain.is_unannounced()
     }
 
     pub async fn rebind(&mut self, opener: DualStreamOpener) -> Result<(), MigratingError> {
@@ -538,6 +516,20 @@ pub struct MigratingCapableAccepter {
     response_opener: Option<DualStreamOpener>,
     feed: SpliceFeedHandle,
     _own_feed: Option<SpliceFeed>,
+    peeks: JoinSet<PeekedStream>,
+}
+
+const MAX_CONCURRENT_PEEKS: usize = 256;
+
+struct PeekedStream {
+    peeked: Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingError>,
+    writer: StreamWriter,
+    lane: LaneClass,
+}
+
+enum AcceptStep {
+    Accepted(Result<(StreamReader, StreamWriter, LaneClass), crate::dual_lane::DualAcceptError>),
+    Peeked(Option<Result<PeekedStream, tokio::task::JoinError>>),
 }
 
 impl MigratingCapableAccepter {
@@ -553,6 +545,7 @@ impl MigratingCapableAccepter {
             response_opener: None,
             feed: feed.handle(),
             _own_feed: Some(feed),
+            peeks: JoinSet::new(),
         }
     }
 
@@ -563,6 +556,7 @@ impl MigratingCapableAccepter {
             response_opener: None,
             feed,
             _own_feed: None,
+            peeks: JoinSet::new(),
         }
     }
 
@@ -597,24 +591,45 @@ impl MigratingCapableAccepter {
     /// generation 0, a new [`SplicedReader`] is returned once the driver
     /// creates it. Non-migrating streams pass through unchanged.
     ///
-    /// Gen-0 readers arriving out of logical-id order are stashed in
-    /// a [`VecDeque`] and re-tried on subsequent accepts.
+    /// Incoming streams are peeked concurrently (up to
+    /// [`MAX_CONCURRENT_PEEKS`]) so a slow or dead header on one substream
+    /// does not stall the accept loop for every other stream.
     pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingError> {
         loop {
-            let (reader, writer, lane) = self
-                .inner
-                .accept()
-                .await
-                .map_err(|_| MigratingError::LaneDead)?;
-            let Some((is_migrating, header_opt, reader)) = Self::peek_resume_header(reader).await?
-            else {
+            let can_accept = self.peeks.len() < MAX_CONCURRENT_PEEKS;
+            let has_peeks = !self.peeks.is_empty();
+            let step = tokio::select! {
+                accepted = self.inner.accept(), if can_accept => AcceptStep::Accepted(accepted),
+                joined = self.peeks.join_next(), if has_peeks => AcceptStep::Peeked(joined),
+            };
+            let peek = match step {
+                AcceptStep::Accepted(accepted) => {
+                    let (reader, writer, lane) = accepted.map_err(|_| MigratingError::LaneDead)?;
+                    self.peeks.spawn(async move {
+                        PeekedStream {
+                            peeked: Self::peek_resume_header(reader).await,
+                            writer,
+                            lane,
+                        }
+                    });
+                    continue;
+                }
+                AcceptStep::Peeked(None) | AcceptStep::Peeked(Some(Err(_))) => continue,
+                AcceptStep::Peeked(Some(Ok(peek))) => peek,
+            };
+            let PeekedStream {
+                peeked,
+                writer,
+                lane,
+            } = peek;
+            let Some((is_migrating, header_opt, reader)) = peeked? else {
                 continue;
             };
             if is_migrating {
                 if let Some(header) = header_opt {
                     if header.is_response {
                         continue;
-                    };
+                    }
                     let logical_id = header.logical_id;
                     let is_gen0 = header.generation == 0;
                     let gen_reader: GenerationReader = Box::pin(reader);
@@ -623,7 +638,9 @@ impl MigratingCapableAccepter {
                         self.feed
                             .send_continuation(header, gen_reader)
                             .map_err(|_| MigratingError::LaneDead)?;
-                        let spliced = spliced_rx.await.map_err(|_| MigratingError::LaneDead)?;
+                        let Ok(spliced) = spliced_rx.await else {
+                            continue;
+                        };
                         return Ok(self.accepted_migrating(spliced, writer, lane, logical_id));
                     } else {
                         self.feed
@@ -822,22 +839,40 @@ impl ResponseRouter {
     }
 
     pub fn add_accepter(&mut self, mut accepter: DualStreamAccepter) {
+        while self.tasks.try_join_next().is_some() {}
         let feed = self.feed.handle();
         self.tasks.spawn(async move {
+            let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
+            let mut accepting = true;
             loop {
-                let Ok((reader, _writer, _lane)) = accepter.accept().await else {
+                let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
+                let has_peeks = !peeks.is_empty();
+                if !can_accept && !has_peeks {
                     break;
-                };
-                match MigratingCapableAccepter::peek_resume_header(reader).await {
-                    Ok(Some((true, Some(header), reader))) if header.is_response => {
-                        if feed
-                            .send_continuation(header, Box::pin(reader) as GenerationReader)
-                            .is_err()
+                }
+                tokio::select! {
+                    accepted = accepter.accept(), if can_accept => match accepted {
+                        Ok((reader, _writer, _lane)) => {
+                            peeks.spawn(async move {
+                                match MigratingCapableAccepter::peek_resume_header(reader).await {
+                                    Ok(Some((true, Some(header), reader))) if header.is_response => {
+                                        Some((header, reader))
+                                    }
+                                    _ => None,
+                                }
+                            });
+                        }
+                        Err(_) => accepting = false,
+                    },
+                    joined = peeks.join_next(), if has_peeks => {
+                        if let Some(Ok(Some((header, reader)))) = joined
+                            && feed
+                                .send_continuation(header, Box::pin(reader) as GenerationReader)
+                                .is_err()
                         {
                             break;
                         }
                     }
-                    _ => {}
                 }
             }
         });
@@ -2139,7 +2174,7 @@ impl SpliceFeed {
 
 pub fn spawn_splice_feed() -> SpliceFeed {
     let (cont_tx, cont_rx) = mpsc::unbounded_channel();
-    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, SplicedReader)>();
+    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, Option<SplicedReader>)>();
     let (register_tx, mut register_rx) =
         mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>();
     let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
@@ -2164,7 +2199,7 @@ pub fn spawn_splice_feed() -> SpliceFeed {
                     None => break,
                 },
                 gen0 = gen0_rx.recv() => match gen0 {
-                    Some((id, spliced)) => match waiters.remove(&id) {
+                    Some((id, Some(spliced))) => match waiters.remove(&id) {
                         Some(tx) => {
                             let _ = tx.send(spliced);
                         }
@@ -2172,6 +2207,9 @@ pub fn spawn_splice_feed() -> SpliceFeed {
                             ready.insert(id, spliced);
                         }
                     },
+                    Some((id, None)) => {
+                        let _ = waiters.remove(&id);
+                    }
                     None => break,
                 },
             }

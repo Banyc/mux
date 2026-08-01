@@ -268,6 +268,23 @@ impl DualMessageReceiver {
                 }
             }
 
+            if self.accepter_dead && self.inflight == 0 {
+                if matches!(self.mode, DeliveryMode::Ordered) {
+                    while self.ordered.len() >= self.reorder_cap
+                        || self.ordered.first_key_value().is_some()
+                    {
+                        if let Some(payload) = self.pop_ordered() {
+                            return Ok(Some(payload));
+                        }
+                        if self.ordered.is_empty() {
+                            break;
+                        }
+                        self.next_seq = *self.ordered.first_key_value().unwrap().0;
+                    }
+                }
+                return Ok(None);
+            }
+
             tokio::select! {
                 res = self.accepter.accept(), if !self.accepter_dead => {
                     match res {
@@ -307,23 +324,6 @@ impl DualMessageReceiver {
                     }
                 }
             }
-
-            if self.accepter_dead && self.inflight == 0 {
-                if matches!(self.mode, DeliveryMode::Ordered) {
-                    while self.ordered.len() >= self.reorder_cap
-                        || self.ordered.first_key_value().is_some()
-                    {
-                        if let Some(payload) = self.pop_ordered() {
-                            return Ok(Some(payload));
-                        }
-                        if self.ordered.is_empty() {
-                            break;
-                        }
-                        self.next_seq = *self.ordered.first_key_value().unwrap().0;
-                    }
-                }
-                return Ok(None);
-            }
         }
     }
 
@@ -332,7 +332,6 @@ impl DualMessageReceiver {
         let mode = self.mode;
         self.inflight += 1;
         self.read_tasks.spawn(async move {
-            // Read 4-byte length prefix (LE)
             let mut len_buf = [0u8; 4];
             if reader.read_exact(&mut len_buf).await.is_err() {
                 return None;
@@ -342,7 +341,6 @@ impl DualMessageReceiver {
                 return None;
             }
 
-            // Read optional sequence number
             let seq = if matches!(mode, DeliveryMode::Ordered) {
                 let mut seq_buf = [0u8; 8];
                 if reader.read_exact(&mut seq_buf).await.is_err() {
@@ -353,9 +351,16 @@ impl DualMessageReceiver {
                 None
             };
 
-            // Read payload
-            let mut payload = vec![0u8; payload_len];
-            if reader.read_exact(&mut payload).await.is_err() {
+            let mut payload = Vec::new();
+            if reader
+                .take(payload_len as u64)
+                .read_to_end(&mut payload)
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            if payload.len() != payload_len {
                 return None;
             }
 

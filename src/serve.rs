@@ -218,9 +218,10 @@ where
         let Some(mut curr_stream_init_handle) = stream_init_handle else {
             return err;
         };
+        let mut last_err = err;
         loop {
             let Some((io_reader, io_writer)) = reconnect().await else {
-                return err;
+                return last_err;
             };
             let (stream_init_handle, err) = run_services(
                 io_reader,
@@ -231,8 +232,9 @@ where
                 None,
             )
             .await;
+            last_err = err;
             let Some(stream_init_handle) = stream_init_handle else {
-                return err;
+                return last_err;
             };
             curr_stream_init_handle = stream_init_handle;
         }

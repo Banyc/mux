@@ -123,7 +123,10 @@ async fn handle_central_read(
 ) -> Result<(), HandleCentralReadError> {
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
-            if control.frame_reassembly && control.stream_table.contains_key(&stream_id) {
+            if control.is_local_opened_stream(stream_id) {
+                return Ok(());
+            }
+            if control.stream_table.contains_key(&stream_id) {
                 return Ok(());
             }
             let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
@@ -135,14 +138,17 @@ async fn handle_central_read(
                     }
                 },
             };
-            stream_init_handle
-                .stream_accept_tx
-                .try_send(stream)
-                .map_err(HandleCentralReadError::DeadStreamInit)?;
+            if let Err(e) = stream_init_handle.stream_accept_tx.try_send(stream) {
+                control.clean_closed_stream(stream_id);
+                return Err(HandleCentralReadError::DeadStreamInit(e));
+            }
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
                 if !control.stream_table.contains_key(&stream_id) {
+                    if control.is_local_opened_stream(stream_id) {
+                        return Ok(());
+                    }
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
@@ -151,6 +157,7 @@ async fn handle_central_read(
                                 .try_send(stream)
                                 .is_err()
                             {
+                                control.clean_closed_stream(stream_id);
                                 return Ok(());
                             }
                         }
@@ -162,11 +169,12 @@ async fn handle_central_read(
                         }
                     }
                 }
-                if let Err(()) = control
+                if control
                     .peer_close_write_with_offset(stream_id, final_offset)
                     .await
+                    .is_err()
+                    && control.reassembly_error_teardown(stream_id).await
                 {
-                    control.reassembly_error_teardown(stream_id).await;
                     let _ = write_control_tx
                         .send(WriteControlMsg::CloseRead(stream_id))
                         .await;
@@ -178,6 +186,9 @@ async fn handle_central_read(
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
             if control.frame_reassembly {
                 if !control.stream_table.contains_key(&stream_id) {
+                    if control.is_local_opened_stream(stream_id) {
+                        return Ok(());
+                    }
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
                     match res {
                         Ok((_, stream)) => {
@@ -186,6 +197,7 @@ async fn handle_central_read(
                                 .try_send(stream)
                                 .is_err()
                             {
+                                control.clean_closed_stream(stream_id);
                                 return Ok(());
                             }
                         }
@@ -201,8 +213,8 @@ async fn handle_central_read(
                     .ingest_reassembly(stream_id, offset, data_buf)
                     .await
                     .is_err()
+                    && control.reassembly_error_teardown(stream_id).await
                 {
-                    control.reassembly_error_teardown(stream_id).await;
                     let _ = write_control_tx
                         .send(WriteControlMsg::CloseRead(stream_id))
                         .await;
@@ -342,6 +354,9 @@ impl MuxControl {
         stream_id: StreamId,
         data: crate::central_io::DataBuf,
     ) -> Result<(), StreamReadQueueFull> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let Some(dispatcher) = self.dispatcher(stream_id) else {
             return Ok(());
         };
@@ -463,12 +478,12 @@ impl MuxControl {
     /// also send `CloseRead` to the peer so the other side knows to stop
     /// sending. Sibling streams keep running — only this one stream is
     /// affected.
-    async fn reassembly_error_teardown(&mut self, stream_id: StreamId) {
+    async fn reassembly_error_teardown(&mut self, stream_id: StreamId) -> bool {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
-            return;
+            return false;
         };
         if stream.is_read_closed {
-            return;
+            return false;
         }
         let _ = stream
             .read_dispatcher
@@ -479,9 +494,10 @@ impl MuxControl {
         stream.reassembly = None;
         stream.is_read_closed = true;
         stream.is_peer_write_closed = true;
+        true
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ControlOpenError {
     TooManyOpenStreams(TooManyOpenStreams),
     DeadCentralIo(DeadCentralIo),
@@ -630,7 +646,7 @@ impl ReorderBuffer {
         if dist == i32::MIN {
             return None;
         }
-        Some((self.cursor as i64 + dist as i64) as u64)
+        u64::try_from(self.cursor as i64 + dist as i64).ok()
     }
 
     /// Ingest one complete frame at `offset`. Duplicates (offset+len ≤
@@ -776,7 +792,7 @@ impl ReorderBuffer {
 }
 
 fn tracing_reassembly_error(stream_id: StreamId, offset: Offset, e: &ReassemblyError) {
-    eprintln!("mux: reassembly protocol error on stream {stream_id} at offset {offset:#x}: {e:?}");
+    tracing::warn!(stream_id, offset, error = ?e, "mux reassembly protocol error");
 }
 
 #[derive(Debug, Clone)]
@@ -806,7 +822,7 @@ pub enum Initiation {
     Client,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TooManyOpenStreams {}
 
 #[cfg(test)]

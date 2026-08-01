@@ -59,7 +59,7 @@ impl StreamOpenRx {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StreamOpenError {
     DeadControl(DeadControl),
     ControlOpen(ControlOpenError),

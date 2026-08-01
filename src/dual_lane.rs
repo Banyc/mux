@@ -248,6 +248,10 @@ impl DualStreamOpener {
         }
     }
 
+    pub fn is_alive(&self) -> bool {
+        self.liveness.is_alive()
+    }
+
     pub async fn open(
         &self,
         class: LaneClass,
@@ -396,7 +400,9 @@ impl AutoWriter {
         }
         match &mut self.state {
             AutoWriterState::Active { writer } => Ok(writer),
-            _ => Err(AutoWriteError::LaneDead),
+            _ => Err(AutoWriteError::SendFailed(
+                crate::stream::writer::SendError::LocalClosedStream,
+            )),
         }
     }
 
@@ -422,11 +428,11 @@ impl AutoWriter {
             }
             Poll::Ready(Err(e)) => {
                 if let Some(tx) = reader_tx {
-                    let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e)));
+                    let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e.clone())));
                 }
                 self.state = AutoWriterState::Failed;
                 Poll::Ready(Err(AutoWriteError::OpenFailed(
-                    DualStreamOpenError::LaneDead,
+                    DualStreamOpenError::StreamOpen(e),
                 )))
             }
             Poll::Pending => {
@@ -585,6 +591,7 @@ enum AutoReaderState {
     Ready {
         reader: StreamReader,
     },
+    Eof,
     Failed,
 }
 
@@ -617,7 +624,7 @@ impl AsyncRead for AutoReader {
                         continue;
                     }
                     Ok(Err(DualStreamOpenError::CleanClose)) => {
-                        this.state = AutoReaderState::Failed;
+                        this.state = AutoReaderState::Eof;
                         return Poll::Ready(Ok(()));
                     }
                     Ok(Err(_)) | Err(_) => {
@@ -628,6 +635,7 @@ impl AsyncRead for AutoReader {
                 AutoReaderState::Ready { reader } => {
                     return Pin::new(reader).poll_read(cx, buf);
                 }
+                AutoReaderState::Eof => return Poll::Ready(Ok(())),
                 AutoReaderState::Failed => {
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
                 }
