@@ -1831,7 +1831,7 @@ mod tests {
             is_response: false,
         };
         cont_tx.send((h0, Box::pin(c0))).unwrap();
-        let (id0, mut reader0) = gen0_rx.recv().await.unwrap();
+        let (id0, mut reader0) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id0, 77);
 
         let (c1, _s1) = duplex(1);
@@ -1850,7 +1850,7 @@ mod tests {
         reader0.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
         let n = reader0.read(&mut buf[..1]).await.unwrap();
-        assert_eq!(n, 0, "reader0 clean EOF after FINAL g1");
+        assert_eq!(n, 0, "reader0 clean EOF after FINAL g2");
 
         let (c_new, mut s_new) = duplex(64);
         let h_new = ResumeHeader {
@@ -1860,7 +1860,7 @@ mod tests {
             is_response: false,
         };
         cont_tx.send((h_new, Box::pin(c_new))).unwrap();
-        let (id_new, mut reader_new) = gen0_rx.recv().await.unwrap();
+        let (id_new, mut reader_new) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id_new, 77);
 
         drop(reader0);
@@ -1913,7 +1913,7 @@ mod tests {
         };
         cont_tx.send((h_final, Box::pin(c_final))).unwrap();
 
-        let (_, old_reader) = gen0_rx.recv().await.unwrap();
+        let (_, old_reader) = expect_gen0_reader(gen0_rx.recv().await);
         assert!(old_reader.is_closed(), "gen0 FINAL reader must be closed");
 
         let (c_reuse, mut s_reuse) = duplex(64);
@@ -1925,7 +1925,7 @@ mod tests {
         };
         cont_tx.send((h_reuse, Box::pin(c_reuse))).unwrap();
 
-        let (id_new, mut replacement) = gen0_rx.recv().await.unwrap();
+        let (id_new, mut replacement) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id_new, 77, "reuse ID must be 77");
 
         let (c_gen1, mut s_gen1) = duplex(64);
@@ -1970,7 +1970,7 @@ mod tests {
             is_response: false,
         };
         cont_tx.send((h0, Box::pin(c0))).unwrap();
-        let (_id, mut reader) = gen0_rx.recv().await.unwrap();
+        let (_id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
 
         s0.write_all(b"pre-final").await.unwrap();
         drop(s0);
@@ -2043,10 +2043,11 @@ mod tests {
                 Box::pin(gen0_reader),
             ))
             .unwrap();
-        let (_, mut reader) = tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let (_, mut reader) = expect_gen0_reader(
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .unwrap(),
+        );
         let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
             .await
             .unwrap()
@@ -2086,14 +2087,179 @@ mod tests {
                 Box::pin(gen0_reader),
             ))
             .unwrap();
-        let (_, mut reader) = tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let (_, mut reader) = expect_gen0_reader(
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .unwrap(),
+        );
         let error = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut [0]))
             .await
             .unwrap()
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    type Gen0Rx = tokio::sync::mpsc::UnboundedReceiver<(u64, Option<SplicedReader>)>;
+    type ContTx = tokio::sync::mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>;
+
+    fn expect_gen0_reader(received: Option<(u64, Option<SplicedReader>)>) -> (u64, SplicedReader) {
+        let (logical_id, spliced) = received.expect("the driver answered the gen-0");
+        (
+            logical_id,
+            spliced.expect("the gen-0 produced a spliced reader"),
+        )
+    }
+
+    fn driver(registry: SpliceRegistry) -> (ContTx, Gen0Rx) {
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gen0_tx, gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_splice_driver(registry, cont_rx, gen0_tx);
+        (cont_tx, gen0_rx)
+    }
+
+    fn hdr(logical_id: u64, generation: u32, is_final: bool) -> ResumeHeader {
+        ResumeHeader {
+            logical_id,
+            generation,
+            is_final,
+            is_response: false,
+        }
+    }
+
+    fn send_gen(cont_tx: &ContTx, header: ResumeHeader) -> tokio::io::DuplexStream {
+        let (theirs, ours) = duplex(64);
+        cont_tx.send((header, Box::pin(theirs))).unwrap();
+        ours
+    }
+
+    #[tokio::test]
+    async fn generations_after_a_final_are_refused() {
+        let mut registry = SpliceRegistry::new();
+        let (c0, _s0) = duplex(1);
+        registry.dispatch(hdr(1, 0, false), c0).unwrap().unwrap();
+        let (c, _s) = duplex(1);
+        registry.dispatch(hdr(1, 5, true), c).unwrap();
+        for generation in 6..(MAX_PENDING_GENERATIONS as u32 + 16) {
+            let (c, _s) = duplex(1);
+            assert!(
+                matches!(
+                    registry.dispatch(hdr(1, generation, true), c),
+                    Err(MigrationError::GenerationAfterFinal)
+                ),
+                "gen {generation} was accepted behind a FINAL"
+            );
+        }
+        assert_eq!(
+            registry.streams[&1].pending.len(),
+            1,
+            "generations kept piling up behind a FINAL, so the pending cap a FINAL is allowed to skip bounds nothing at all"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn orphans_expire_without_another_orphan_to_trigger_the_reap() {
+        let mut registry = SpliceRegistry::new();
+        let (c, _s) = duplex(1);
+        registry.dispatch(hdr(7, 1, false), c).unwrap();
+        assert_eq!(registry.orphan_count, 1);
+        tokio::time::advance(ORPHAN_TTL + Duration::from_millis(1)).await;
+        let (c0, _s0) = duplex(1);
+        registry.dispatch(hdr(8, 0, false), c0).unwrap().unwrap();
+        assert_eq!(
+            registry.orphan_count, 0,
+            "the expired orphan survived the reaping triggered by a gen-0 dispatch"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_orphan_is_still_adopted_by_its_own_gen0() {
+        let mut registry = SpliceRegistry::new();
+        let (c, _s) = duplex(1);
+        registry.dispatch(hdr(7, 1, false), c).unwrap();
+        tokio::time::advance(ORPHAN_TTL + Duration::from_millis(1)).await;
+        let (c0, _s0) = duplex(1);
+        registry.dispatch(hdr(7, 0, false), c0).unwrap().unwrap();
+        assert!(
+            registry.streams[&7].pending.contains_key(&1),
+            "the gen-0 this orphan was waiting for dropped it instead of adopting it"
+        );
+        assert_eq!(registry.orphan_count, 0);
+    }
+
+    #[tokio::test]
+    async fn redelivered_generation_does_not_wedge_the_stream() {
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(500));
+        let (cont_tx, mut gen0_rx) = driver(registry);
+        let mut s0 = send_gen(&cont_tx, hdr(7, 0, false));
+        let (_id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
+        s0.write_all(b"gen0-").await.unwrap();
+        drop(s0);
+        let mut s1 = send_gen(&cont_tx, hdr(7, 1, false));
+        s1.write_all(b"gen1-").await.unwrap();
+        drop(s1);
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"gen0-gen1-");
+        let _s1b = send_gen(&cont_tx, hdr(7, 1, false));
+        let s2 = send_gen(&cont_tx, hdr(7, 2, true));
+        drop(s2);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_to_end(&mut rest))
+            .await
+            .expect("stale generation wedged the stream")
+            .expect("stale generation wedged the stream");
+        assert!(rest.is_empty(), "FINAL must carry no payload");
+    }
+
+    #[tokio::test]
+    async fn orphan_cap_does_not_kill_the_splice_driver() {
+        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        for i in 0..=MAX_ORPHANS as u64 {
+            let _s = send_gen(&cont_tx, hdr(1000 + i, 1, false));
+        }
+        let _s0 = send_gen(&cont_tx, hdr(77, 0, false));
+        let (id, _reader) = expect_gen0_reader(
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .expect("splice driver stopped serving after a refused orphan"),
+        );
+        assert_eq!(id, 77);
+    }
+
+    #[tokio::test]
+    async fn pending_generation_cap_retires_only_the_offending_stream() {
+        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        let _s0 = send_gen(&cont_tx, hdr(77, 0, false));
+        let (id, _reader) = expect_gen0_reader(gen0_rx.recv().await);
+        assert_eq!(id, 77);
+        for genn in 2..=(MAX_PENDING_GENERATIONS as u32 + 2) {
+            let _s = send_gen(&cont_tx, hdr(77, genn, false));
+        }
+        let _s_other = send_gen(&cont_tx, hdr(88, 0, false));
+        let (other_id, _other_reader) = expect_gen0_reader(
+            tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
+                .await
+                .expect("splice driver stopped serving after a refused generation"),
+        );
+        assert_eq!(other_id, 88);
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_keeps_the_current_generation() {
+        let (mut gen0_client, gen0_server) = duplex(64);
+        let mut registry = SpliceRegistry::new();
+        let mut spliced = registry
+            .dispatch(hdr(7, 0, false), gen0_server)
+            .unwrap()
+            .unwrap();
+        gen0_client.write_all(b"AAAA").await.unwrap();
+        let mut empty: [u8; 0] = [];
+        assert_eq!(spliced.read(&mut empty).await.unwrap(), 0);
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(1), spliced.read_exact(&mut buf))
+            .await
+            .expect("a zero-length read stranded the reader on a successor that never comes")
+            .expect("a zero-length read retired the live generation");
+        assert_eq!(&buf, b"AAAA");
     }
 }

@@ -524,7 +524,7 @@ pub struct Token(pub usize);
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{task::Waker, time::Duration};
 
     use super::*;
 
@@ -559,5 +559,28 @@ mod tests {
             assert_eq!(token_1, token_2);
             assert_eq!(token_1, token_3);
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_open_is_not_announced() {
+        let (opener, mut receiver) = channel::<u32>();
+        {
+            let mut cancelled = Box::pin(opener.open(7));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        }
+        let live = {
+            let opener = opener.clone();
+            tokio::spawn(async move { opener.open(9).await })
+        };
+        let (token, res) = receiver.recv().await.unwrap();
+        match res {
+            ReceiverRecv::Open(value) => assert_eq!(value, 9, "a cancelled open was announced"),
+            _ => panic!("expected an open"),
+        }
+        drop(live.await.unwrap().unwrap());
+        let (close_token, res) = receiver.recv().await.unwrap();
+        assert_eq!(close_token, token);
+        assert!(matches!(res, ReceiverRecv::Close));
     }
 }

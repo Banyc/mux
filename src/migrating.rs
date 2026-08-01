@@ -267,6 +267,7 @@ impl MigratingStreamWriter {
             }
         }
         if let Some(held) = &mut self.held_readers {
+            held.clear();
             held.push(reader);
         }
     }
@@ -328,9 +329,6 @@ impl MigratingStreamWriter {
         }
         if let WriterState::Active { writer, .. } = &mut self.state {
             let _ = writer.shutdown();
-        }
-        if let Some(held) = &mut self.held_readers {
-            held.clear();
         }
         self.state = WriterState::Closed;
         let (_, mut final_writer) = self
@@ -1030,10 +1028,7 @@ mod tests {
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(42, LaneClass::Interactive);
         req_writer.write_all(b"request").await.unwrap();
         let accepted = mac.accept().await.unwrap();
-        let (mut req_reader, mut resp_writer) = match accepted {
-            AcceptedStream::MigratingDuplex { reader, writer, .. } => (reader, writer),
-            other => panic!("expected MigratingDuplex, got {other:?}"),
-        };
+        let (mut req_reader, mut resp_writer) = migrating_duplex(accepted);
         let mut req = [0u8; 7];
         tokio::io::AsyncReadExt::read_exact(&mut req_reader, &mut req)
             .await
@@ -1064,11 +1059,7 @@ mod tests {
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(7, LaneClass::Interactive);
         req_writer.write_all(b"ping").await.unwrap();
-        let accepted = mac.accept().await.unwrap();
-        let mut resp_writer = match accepted {
-            AcceptedStream::MigratingDuplex { writer, .. } => writer,
-            other => panic!("expected MigratingDuplex, got {other:?}"),
-        };
+        let (_, mut resp_writer) = migrating_duplex(mac.accept().await.unwrap());
         let gen0_reader = gen0_rx.await.unwrap();
         let mut resp_reader = router
             .handle()
@@ -1103,15 +1094,8 @@ mod tests {
             req_writer.finalize().await.unwrap();
         });
         let accepted = mac.accept().await.unwrap();
-        let (mut req_reader, mut resp_writer) = match accepted {
-            AcceptedStream::MigratingDuplex { reader, writer, .. } => (reader, writer),
-            other => panic!("expected MigratingDuplex, got {other:?}"),
-        };
-        let drain = tokio::spawn(async move {
-            loop {
-                _ = mac.accept().await;
-            }
-        });
+        let (mut req_reader, mut resp_writer) = migrating_duplex(accepted);
+        let drain = spawn_drain(mac);
         let respond = tokio::spawn(async move {
             let chunk = vec![0xCDu8; 64 * 1024];
             let mut sent = 0;
@@ -1144,11 +1128,7 @@ mod tests {
             }
         );
         assert_eq!(up.len(), upload, "upload byte count mismatch");
-        assert!(
-            up.iter().all(|b| *b == 0xAB),
-            "upload
-    corrupted"
-        );
+        assert!(up.iter().all(|b| *b == 0xAB), "upload corrupted");
         assert_eq!(down.len(), download, "download byte count mismatch");
         assert!(down.iter().all(|b| *b == 0xCD), "download corrupted");
         send.await.unwrap();
@@ -1369,18 +1349,11 @@ mod tests {
 
         // Accept gen0
         let accepted = mac.accept().await.unwrap();
-        let reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            other => panic!("expected Migrating, got: {other:?}"),
-        };
+        let (reader, _) = migrating(accepted);
 
         // Drain successor generations so the FINAL gen reaches the
         // SplicedReader's queue before we read.
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         send.await.unwrap();
 
@@ -1425,16 +1398,9 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating stream"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1470,16 +1436,9 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating stream"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1510,10 +1469,7 @@ mod tests {
 
         // Accept gen0 → SplicedReader with payload
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
         // Continuously drain successor generations so the FINAL gen
         // reaches the SplicedReader's queue.
@@ -1548,16 +1504,9 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating stream"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut buf = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf)
@@ -1599,24 +1548,14 @@ mod tests {
 
         // Accept first gen0
         let a = mac.accept().await.unwrap();
-        let reader_a = match a {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating"),
-        };
+        let (reader_a, _) = migrating(a);
 
         // Accept second gen0
         let b = mac.accept().await.unwrap();
-        let reader_b = match b {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating"),
-        };
+        let (reader_b, _) = migrating(b);
 
         // Drain successors while readers consume data
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let (ra, rb) = tokio::join!(
             async {
@@ -1677,16 +1616,9 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating stream"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut data = Vec::with_capacity(sync_size + 200);
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1778,16 +1710,9 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating stream"),
-        };
+        let (mut reader, _) = migrating(accepted);
 
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut data = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data)
@@ -1818,10 +1743,7 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let (_accepted_reader, mut accepted_writer) = match accepted {
-            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
-            _ => panic!("expected migrating"),
-        };
+        let (_accepted_reader, mut accepted_writer) = migrating(accepted);
         tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"hello-from-s2c  ")
             .await
             .unwrap();
@@ -1865,10 +1787,7 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let (_accepted_reader, mut accepted_writer) = match accepted {
-            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
-            _ => panic!("expected migrating"),
-        };
+        let (_accepted_reader, mut accepted_writer) = migrating(accepted);
         tokio::io::AsyncWriteExt::write_all(&mut accepted_writer, b"first-response ")
             .await
             .unwrap();
@@ -1924,11 +1843,7 @@ mod tests {
         };
 
         // Drain successors while echoing
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let echo = tokio::spawn(async move {
             let mut buf = vec![0u8; 256];
@@ -1986,18 +1901,11 @@ mod tests {
         });
 
         let accepted = mac.accept().await.unwrap();
-        let mut accepted_reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            _ => panic!("expected migrating"),
-        };
+        let (mut accepted_reader, _) = migrating(accepted);
 
         // Drain successors (FINAL generation from shutdown) so the
         // SplicedReader can chain through to clean EOF.
-        let drain = tokio::spawn(async move {
-            loop {
-                let _ = mac.accept().await;
-            }
-        });
+        let drain = spawn_drain(mac);
 
         let mut data = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut accepted_reader, &mut data)
@@ -2024,10 +1932,7 @@ mod tests {
             w.finalize().await.unwrap();
         });
         let accepted = mac1.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            other => panic!("expected migrating, got {other:?}"),
-        };
+        let (mut reader, _) = migrating(accepted);
         let drain1 = tokio::spawn(async move {
             loop {
                 let _ = mac1.accept().await;
@@ -2070,10 +1975,7 @@ mod tests {
             w.finalize().await.unwrap();
         });
         let accepted = mac1.accept().await.unwrap();
-        let mut reader = match accepted {
-            AcceptedStream::Migrating { reader, .. } => reader,
-            other => panic!("expected migrating, got {other:?}"),
-        };
+        let (mut reader, _) = migrating(accepted);
         let drain1 = tokio::spawn(async move {
             loop {
                 let _ = mac1.accept().await;
@@ -2134,6 +2036,317 @@ mod tests {
         assert_eq!(resp, "pong-across");
         req_writer.shutdown().unwrap();
     }
+
+    fn migrating(accepted: AcceptedStream) -> (SplicedReader, StreamWriter) {
+        match accepted {
+            AcceptedStream::Migrating { reader, writer, .. } => (reader, writer),
+            other => panic!("expected Migrating, got {other:?}"),
+        }
+    }
+
+    fn migrating_duplex(accepted: AcceptedStream) -> (SplicedReader, MigratingStreamWriter) {
+        match accepted {
+            AcceptedStream::MigratingDuplex { reader, writer, .. } => (reader, writer),
+            other => panic!("expected MigratingDuplex, got {other:?}"),
+        }
+    }
+
+    fn spawn_drain(mut mac: MigratingCapableAccepter) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let _ = mac.accept().await;
+            }
+        })
+    }
+
+    fn counting_dead_opener() -> (DualStreamOpener, Arc<std::sync::atomic::AtomicUsize>) {
+        use crate::stream::opener::{StreamOpener, stream_open_channel};
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (int_tx, mut int_rx) = stream_open_channel();
+        let (bulk_tx, _bulk_rx) = stream_open_channel();
+        {
+            let opens = Arc::clone(&opens);
+            tokio::spawn(async move {
+                while int_rx.recv().await.is_ok() {
+                    opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+        let opener = DualStreamOpener::new(
+            StreamOpener::new(int_tx),
+            StreamOpener::new(bulk_tx),
+            Liveness::new(),
+        );
+        (opener, opens)
+    }
+
+    #[test]
+    fn dropping_a_writer_outside_the_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime for setup");
+        let writer = runtime.block_on(async {
+            let (opener, _accepter, _srv_int, _srv_bulk, _cli_int, _cli_bulk) =
+                make_dual_session().await;
+            let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+            writer
+                .write_all(b"announce")
+                .await
+                .expect("the session is live");
+            writer
+                .force_migrate(LaneClass::Interactive)
+                .await
+                .expect("migrating is a local state change");
+            writer
+        });
+        drop(writer);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_finalize_is_not_retried_behind_the_caller() {
+        let (opener, _accepter, _srv_int, _srv_bulk, _cli_int, _cli_bulk) =
+            make_dual_session().await;
+        let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+        writer
+            .write_all(b"announce")
+            .await
+            .expect("the session is live");
+        let (dead, opens) = counting_dead_opener();
+        writer
+            .rebind(dead)
+            .await
+            .expect("rebinding is a local state change");
+        writer
+            .finalize()
+            .await
+            .expect_err("the opener never fulfills the open");
+        drop(writer);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a peer can still receive a FINAL for a stream whose close reported an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_gen0_releases_its_waiter_instead_of_parking_the_accepter() {
+        let feed = spawn_splice_feed();
+        let handle = feed.handle();
+        let gen0 = |logical_id| ResumeHeader {
+            logical_id,
+            generation: 0,
+            is_final: false,
+            is_response: false,
+        };
+        let first = handle.expect_gen0(7);
+        handle
+            .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
+            .expect("the feed is alive");
+        let _live = first.await.expect("the first gen-0 is spliced");
+        let second = handle.expect_gen0(7);
+        handle
+            .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
+            .expect("the feed is alive");
+        let settled = tokio::time::timeout(Duration::from_millis(200), second).await;
+        let Ok(result) = settled else {
+            panic!(
+                "the repeated gen-0 left its waiter parked, so accept blocks forever and the session takes no further stream"
+            );
+        };
+        assert!(
+            result.is_err(),
+            "the repeated gen-0 handed out a second reader for a logical stream that already has one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_never_announced_stream_tells_the_peer_nothing() {
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let _router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let mut writer = x_op.open_migrating_manual(77, LaneClass::Interactive);
+        writer
+            .force_migrate(LaneClass::Bulk)
+            .await
+            .expect("migrating is a local state change");
+        writer.finalize().await.expect("closing an unopened stream");
+        drop(writer);
+        let accepted = tokio::time::timeout(Duration::from_millis(500), mac.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the peer accepted a stream that was never opened: the close wrote a FINAL on a chain still at generation 0, which is the marker that introduces a stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn silent_substreams_do_not_block_accepting_others() {
+        const SILENT: usize = 60;
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let _router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let mut silent = Vec::new();
+        for _ in 0..SILENT {
+            silent.push(x_op.open(LaneClass::Interactive).await.unwrap());
+        }
+        let (mut req_writer, _gen0_rx) =
+            x_op.open_migrating_with_reader(11, LaneClass::Interactive);
+        req_writer.write_all(b"payload").await.unwrap();
+        let budget = RESUME_HEADER_DEADLINE * 4;
+        let accepted = tokio::time::timeout(budget, mac.accept())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the {SILENT} silent sub-streams head-of-line-blocked the accepter for {SILENT} x RESUME_HEADER_DEADLINE ({:?}), stalling every other sub-stream on the session - including the successor generations live migrating streams wait on",
+                    RESUME_HEADER_DEADLINE * SILENT as u32
+                )
+            })
+            .unwrap();
+        let (mut req_reader, _) = migrating_duplex(accepted);
+        let mut got = [0u8; 7];
+        tokio::io::AsyncReadExt::read_exact(&mut req_reader, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"payload");
+        req_writer.shutdown().unwrap();
+        drop(silent);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn silent_substreams_do_not_block_the_response_router() {
+        const SILENT: usize = 60;
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let router = spawn_response_router(x_acc);
+        let y_op2 = y_op.clone();
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(21, LaneClass::Interactive);
+        req_writer.write_all(b"ping").await.unwrap();
+        let (_, mut resp_writer) = migrating_duplex(mac.accept().await.unwrap());
+        let gen0_reader = gen0_rx.await.unwrap();
+        let mut resp_reader = router
+            .handle()
+            .expect_response(21, gen0_reader)
+            .await
+            .unwrap();
+        resp_writer.write_all(b"pong-").await.unwrap();
+        let mut silent = Vec::new();
+        for _ in 0..SILENT {
+            silent.push(y_op2.open(LaneClass::Interactive).await.unwrap());
+        }
+        resp_writer.force_migrate(LaneClass::Bulk).await.unwrap();
+        resp_writer.write_all(b"across").await.unwrap();
+        resp_writer.finalize().await.unwrap();
+        let budget = RESUME_HEADER_DEADLINE * 4;
+        let mut resp = String::new();
+        tokio::time::timeout(
+            budget,
+            tokio::io::AsyncReadExt::read_to_string(&mut resp_reader, &mut resp),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the {SILENT} silent sub-streams head-of-line-blocked the response router for {SILENT} x RESUME_HEADER_DEADLINE ({:?}), stalling every response successor generation on the session",
+                RESUME_HEADER_DEADLINE * SILENT as u32
+            )
+        })
+        .unwrap();
+        assert_eq!(resp, "pong-across");
+        req_writer.shutdown().unwrap();
+        drop(silent);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superseded_generations_release_their_readers() {
+        const MIGRATIONS: usize = 24;
+        let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
+        let _router = spawn_response_router(x_acc);
+        let mut mac = y_acc.into_migrating_duplex(y_op);
+        let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(5, LaneClass::Interactive);
+        req_writer.write_all(b"gen0").await.unwrap();
+        let (mut req_reader, _resp_writer) = migrating_duplex(mac.accept().await.unwrap());
+        let _gen0_reader = gen0_rx.await.unwrap();
+        let drain = spawn_drain(mac);
+        for i in 0..MIGRATIONS {
+            let target = match i % 2 {
+                0 => LaneClass::Bulk,
+                _ => LaneClass::Interactive,
+            };
+            req_writer.force_migrate(target).await.unwrap();
+            req_writer.write_all(b"genn").await.unwrap();
+        }
+        let held = req_writer.held_readers.as_ref().unwrap().len();
+        assert!(
+            held <= 1,
+            "held {held} readers after {MIGRATIONS} migrations; a superseded generation is write-shut on both sides, so holding its reader pins a stream-table entry on both peers - and a 1024-slot read channel - per migration, for the life of the stream"
+        );
+        req_writer.finalize().await.unwrap();
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut req_reader, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            4 * (MIGRATIONS + 1),
+            "bytes lost across generations"
+        );
+        assert_eq!(&got[..4], b"gen0");
+        assert!(got[4..].as_chunks::<4>().0.iter().all(|c| c == b"genn"));
+        drain.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebind_revives_writer_after_open_failure() {
+        let (op1, _acc1, s1a, s1b, s1c, s1d) = make_dual_session().await;
+        let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
+        drop((s1a, s1b, s1c, s1d));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut mac2 = acc2.into_migrating_only();
+        let mut w = op1.open_migrating(11, LaneClass::Interactive);
+        assert!(
+            w.write_all(b"dead").await.is_err(),
+            "write on a dead session must fail"
+        );
+        w.rebind(op2).await.unwrap();
+        let send = tokio::spawn(async move {
+            w.write_all(b"revived").await.unwrap();
+            w.finalize().await.unwrap();
+        });
+        let accepted = tokio::time::timeout(Duration::from_secs(10), mac2.accept())
+            .await
+            .expect("rebound stream never reached the fresh session")
+            .unwrap();
+        let (mut reader, _) = migrating(accepted);
+        let drain = spawn_drain(mac2);
+        let mut data = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data),
+        )
+        .await
+        .expect("rebound stream stalled")
+        .unwrap();
+        assert_eq!(data, "revived");
+        send.await.unwrap();
+        drain.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_accepter_reaps_finished_accepters() {
+        let (_x_op, live, _y_op, _y_acc, live_tasks) = make_duplex_session().await;
+        let mut router = spawn_response_router(live);
+        for _ in 0..8 {
+            let (_x_op, dead, _y_op, _y_acc, tasks) = make_duplex_session().await;
+            drop(tasks);
+            router.add_accepter(dead);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            router.tasks.len() <= 3,
+            "finished accepter tasks accumulate: {}",
+            router.tasks.len()
+        );
+        drop(live_tasks);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2183,13 +2396,14 @@ pub fn spawn_splice_feed() -> SpliceFeed {
             u64,
             tokio::sync::oneshot::Sender<SplicedReader>,
         > = std::collections::HashMap::new();
-        let mut ready: std::collections::HashMap<u64, SplicedReader> =
+        let mut ready: std::collections::HashMap<u64, Option<SplicedReader>> =
             std::collections::HashMap::new();
         loop {
             tokio::select! {
                 reg = register_rx.recv() => match reg {
                     Some((id, tx)) => match ready.remove(&id) {
-                        Some(spliced) => {
+                        Some(None) => drop(tx),
+                        Some(Some(spliced)) => {
                             let _ = tx.send(spliced);
                         }
                         None => {
@@ -2199,17 +2413,16 @@ pub fn spawn_splice_feed() -> SpliceFeed {
                     None => break,
                 },
                 gen0 = gen0_rx.recv() => match gen0 {
-                    Some((id, Some(spliced))) => match waiters.remove(&id) {
+                    Some((id, spliced)) => match waiters.remove(&id) {
                         Some(tx) => {
-                            let _ = tx.send(spliced);
+                            if let Some(spliced) = spliced {
+                                let _ = tx.send(spliced);
+                            }
                         }
                         None => {
                             ready.insert(id, spliced);
                         }
                     },
-                    Some((id, None)) => {
-                        let _ = waiters.remove(&id);
-                    }
                     None => break,
                 },
             }

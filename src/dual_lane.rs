@@ -1639,6 +1639,94 @@ mod tests {
             other => panic!("expected aggregate dual-lane error, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn auto_reader_eof_stays_eof_after_a_clean_close() {
+        use tokio::io::AsyncReadExt;
+        let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let liveness = Liveness::new();
+        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+        let (mut reader, writer) = opener.open_auto();
+        drop(writer);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            reader
+                .read(&mut buf)
+                .await
+                .expect("clean close reads as EOF"),
+            0
+        );
+        assert_eq!(
+            reader
+                .read(&mut buf)
+                .await
+                .expect("a second read after EOF must not error"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_write_reports_the_real_open_failure() {
+        use crate::stream::opener::stream_open_channel;
+        let (int_tx, int_rx) = stream_open_channel();
+        let (bulk_tx, bulk_rx) = stream_open_channel();
+        drop(int_rx);
+        drop(bulk_rx);
+        let opener = DualStreamOpener::new(
+            StreamOpener::new(int_tx),
+            StreamOpener::new(bulk_tx),
+            Liveness::new(),
+        );
+        let (_reader, mut writer) = opener.open_auto();
+        let error = std::future::poll_fn(|cx| writer.poll_write(b"hi", cx))
+            .await
+            .expect_err("an open with no control channel must fail");
+        assert!(
+            matches!(
+                error,
+                AutoWriteError::OpenFailed(DualStreamOpenError::StreamOpen(
+                    StreamOpenError::DeadControl(_)
+                ))
+            ),
+            "the open failure must be reported as-is, got {error:?}"
+        );
+        let again = std::future::poll_fn(|cx| writer.poll_write(b"hi", cx))
+            .await
+            .expect_err("the writer stays failed");
+        assert!(
+            !matches!(again, AutoWriteError::LaneDead),
+            "the write after the failed open reported LaneDead, so the very mislabelling the first write avoids returns one poll later: got {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_local_close_is_not_a_dead_lane() {
+        use std::task::Waker;
+        let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let liveness = Liveness::new();
+        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
+        let (_reader, mut writer) = opener.open_auto();
+        writer
+            .shutdown()
+            .expect("closing before the first write is clean");
+        assert!(liveness.is_alive(), "both lanes are still up");
+        let mut cx = Context::from_waker(Waker::noop());
+        let error = match writer.poll_write(b"Late", &mut cx) {
+            Poll::Ready(Err(e)) => e,
+            other => panic!("a write after the local close must fail: {other:?}"),
+        };
+        assert!(
+            !matches!(error, AutoWriteError::LaneDead),
+            "a locally-closed writer reported LaneDead while both lanes were alive: got {error:?}"
+        );
+        assert_eq!(
+            auto_write_to_io(error).kind(),
+            io::ErrorKind::NotConnected,
+            "a locally-closed writer must read the same as StreamWriter's own local close"
+        );
+    }
 }
 
 const GROUP_TOKEN_LEN: usize = 16;

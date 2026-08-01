@@ -1080,14 +1080,13 @@ mod reassembly_tests {
 
     #[tokio::test]
     async fn full_stream_read_queue_resets_only_that_stream() {
-        use crate::stream::accepter::stream_accept_channel;
-        use crate::stream::opener::stream_open_channel;
-        let (mut control, close_tx, _drain) = make_control(false);
-        let _blocked_rx = open_test_stream(&mut control, 1).await;
-        let mut sibling_rx = open_test_stream(&mut control, 2).await;
+        let mut rig = central_read_rig(false);
+        let _blocked_rx = open_test_stream(&mut rig.control, 1).await;
+        let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
         let mut queued = 0;
         loop {
-            let result = control
+            let result = rig
+                .control
                 .dispatcher(1)
                 .unwrap()
                 .try_send(StreamReadDataMsg::Data(buf(&[0xAA])));
@@ -1100,38 +1099,25 @@ mod reassembly_tests {
             }
         }
         assert!(queued > 0);
-        let (_open_tx, open_rx) = stream_open_channel();
-        let (accept_tx, _accept_rx) = stream_accept_channel();
-        let mut stream_init_handle = StreamInitHandle {
-            stream_open_rx: open_rx,
-            stream_accept_tx: accept_tx,
-        };
-        let (write_control_tx, mut write_control_rx) = write_control_channel();
-        handle_central_read(
-            &mut control,
-            &close_tx,
-            &mut stream_init_handle,
-            &write_control_tx,
-            CentralIoReadMsg::Data(1, 0, buf(&[0xBB])),
-        )
-        .await
-        .unwrap();
-        assert!(!control.stream_table.contains_key(&1));
+        rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[0xBB])))
+            .await
+            .unwrap();
+        assert!(!rig.control.stream_table.contains_key(&1));
         assert!(matches!(
-            write_control_rx.recv().await.unwrap(),
+            rig.write_control_rx.recv().await.unwrap(),
             WriteControlMsg::CloseRead(1)
         ));
         assert!(matches!(
-            write_control_rx.recv().await.unwrap(),
+            rig.write_control_rx.recv().await.unwrap(),
             WriteControlMsg::ForceCloseWrite(1)
         ));
         assert!(
-            timeout(Duration::from_millis(10), write_control_rx.recv())
+            timeout(Duration::from_millis(10), rig.write_control_rx.recv())
                 .await
                 .is_err(),
             "overflow abort must emit exactly CloseRead then ForceCloseWrite"
         );
-        control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
+        rig.control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
         let msg = sibling_rx.try_recv().expect("sibling data must progress");
         match msg {
             StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
@@ -1749,6 +1735,244 @@ mod reassembly_tests {
         assert!(
             !control.stream_table.contains_key(&13),
             "stream-table entry must be removed after is_closed() becomes true"
+        );
+    }
+
+    struct CentralReadRig {
+        control: MuxControl,
+        close_tx: StreamCloseTxPrototype,
+        stream_init_handle: StreamInitHandle,
+        accept_rx: crate::stream::accepter::StreamAcceptRx,
+        write_control_tx: WriteControlTx,
+        write_control_rx: crate::central_io::writer::WriteControlRx,
+        _open_tx: crate::stream::opener::StreamOpenTx,
+        _drain: tokio::task::JoinHandle<()>,
+    }
+    impl CentralReadRig {
+        fn drop_accepter(&mut self) {
+            let (_dead_tx, dead_rx) = crate::stream::accepter::stream_accept_channel();
+            self.accept_rx = dead_rx;
+        }
+        async fn deliver(&mut self, msg: CentralIoReadMsg) -> Result<(), HandleCentralReadError> {
+            handle_central_read(
+                &mut self.control,
+                &self.close_tx,
+                &mut self.stream_init_handle,
+                &self.write_control_tx,
+                msg,
+            )
+            .await
+        }
+    }
+
+    #[test]
+    fn a_reassembly_protocol_error_is_reported_through_tracing() {
+        use std::sync::atomic::AtomicUsize;
+        static EVENTS: AtomicUsize = AtomicUsize::new(0);
+        struct Counting;
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                EVENTS.fetch_add(1, Ordering::Relaxed);
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+        tracing::subscriber::with_default(Counting, || {
+            tracing_reassembly_error(7, 0x40, &ReassemblyError::Overlap);
+        });
+        assert_eq!(
+            EVENTS.load(Ordering::Relaxed),
+            1,
+            "the protocol error never reached the tracing subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_before_the_start_of_the_stream_is_rejected() {
+        let mut rb = ReorderBuffer::new();
+        let err = rb.ingest(0xFFFF_FFFF, buf(&[1, 2, 3, 4])).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::AmbiguousOffset),
+            "expected the pre-stream offset to be rejected, got {err:?}"
+        );
+        let mut rb = ReorderBuffer::new();
+        let err = rb.set_final_offset(0xFFFF_FFFF).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::AmbiguousOffset),
+            "expected the pre-stream final offset to be rejected, got {err:?}"
+        );
+        assert!(
+            rb.final_offset_abs.is_none(),
+            "a pre-stream final offset must not be recorded - the stream could never reach it and would hang instead of closing"
+        );
+    }
+
+    fn central_read_rig(frame_reassembly: bool) -> CentralReadRig {
+        use crate::stream::accepter::stream_accept_channel;
+        use crate::stream::opener::stream_open_channel;
+        let (control, close_tx, _drain) = make_control(frame_reassembly);
+        let (_open_tx, open_rx) = stream_open_channel();
+        let (accept_tx, accept_rx) = stream_accept_channel();
+        let (write_control_tx, write_control_rx) = write_control_channel();
+        CentralReadRig {
+            control,
+            close_tx,
+            stream_init_handle: StreamInitHandle {
+                stream_open_rx: open_rx,
+                stream_accept_tx: accept_tx,
+            },
+            accept_rx,
+            write_control_tx,
+            write_control_rx,
+            _open_tx,
+            _drain,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_data_frame_is_not_forwarded_as_eof() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        let mut rx = open_test_stream(&mut control, 7).await;
+        control.try_dispatch_data(7, buf(&[])).unwrap();
+        match rx.try_recv() {
+            Err(()) => {}
+            Ok(msg) => panic!("an empty frame reached the reader as a forged EOF: {msg:?}"),
+        }
+        control.try_dispatch_data(7, buf(&[0xCC; 4])).unwrap();
+        match rx
+            .try_recv()
+            .expect("the real frame after it must still arrive")
+        {
+            StreamReadDataMsg::Data(d) => assert_eq!(&d[..], &[0xCC; 4]),
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stray_frame_for_a_local_id_fabricates_no_stream() {
+        for reassembly in [true, false] {
+            let mut rig = central_read_rig(reassembly);
+            let local_id: StreamId = 1 << (StreamId::BITS - 1);
+            assert!(rig.control.is_local_opened_stream(local_id));
+            for msg in [
+                CentralIoReadMsg::Open(local_id),
+                CentralIoReadMsg::Data(local_id, 0, buf(&[0xAA])),
+                CentralIoReadMsg::Close(local_id, Side::Write, 1),
+            ] {
+                let described = format!("{msg:?}");
+                rig.deliver(msg).await.unwrap();
+                assert!(
+                    !rig.control.stream_table.contains_key(&local_id),
+                    "{described} (reassembly={reassembly}) created a stream on an id only our own 'open' allocates"
+                );
+                assert!(
+                    rig.accept_rx.try_recv().is_err(),
+                    "{described} (reassembly={reassembly}) handed the application a phantom accepted stream on an id it opens itself"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_open_cannot_replace_a_live_local_stream() {
+        let mut rig = central_read_rig(false);
+        let (tx, mut local_rx) = stream_read_data_channel();
+        let (local_id, _write_tx) = rig
+            .control
+            .open(tx, WriteBrokenPipe::new(), None)
+            .await
+            .unwrap();
+        assert!(rig.control.is_local_opened_stream(local_id));
+        rig.deliver(CentralIoReadMsg::Open(local_id)).await.unwrap();
+        assert!(
+            rig.accept_rx.try_recv().is_err(),
+            "a peer 'Open' for an id we allocated was accepted as a new inbound stream"
+        );
+        rig.control
+            .try_dispatch_data(local_id, buf(&[0xCC]))
+            .unwrap();
+        let msg = local_rx
+            .try_recv()
+            .expect("the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
+        match msg {
+            StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_peer_open_cannot_replace_a_live_stream() {
+        for reassembly in [false, true] {
+            let mut rig = central_read_rig(reassembly);
+            let peer_id: StreamId = 7;
+            assert!(!rig.control.is_local_opened_stream(peer_id));
+            let mut peer_rx = open_test_stream(&mut rig.control, peer_id).await;
+            rig.deliver(CentralIoReadMsg::Open(peer_id)).await.unwrap();
+            assert!(
+                rig.accept_rx.try_recv().is_err(),
+                "(reassembly={reassembly}) a duplicate peer 'Open' was accepted as a second inbound stream on an id that is already live"
+            );
+            rig.control
+                .try_dispatch_data(peer_id, buf(&[0xCC]))
+                .unwrap();
+            let msg = peer_rx.try_recv().unwrap_or_else(|_| {
+                panic!(
+                    "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"
+                )
+            });
+            match msg {
+                StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+                other => panic!("expected Data, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_accepter_cannot_take_is_not_left_in_the_table() {
+        let peer_id: StreamId = 7;
+        for (reassembly, msg) in [
+            (false, CentralIoReadMsg::Open(peer_id)),
+            (true, CentralIoReadMsg::Open(peer_id)),
+            (true, CentralIoReadMsg::Data(peer_id, 0, buf(&[0xAA; 4]))),
+            (true, CentralIoReadMsg::Close(peer_id, Side::Write, 4)),
+        ] {
+            let described = format!("{msg:?}");
+            let mut rig = central_read_rig(reassembly);
+            rig.drop_accepter();
+            let _ = rig.deliver(msg).await;
+            assert!(
+                !rig.control.stream_table.contains_key(&peer_id),
+                "{described} (reassembly={reassembly}) left a stream in the table that no reader or writer can ever close - the peer leaks one entry per stream it opens"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_reassembly_error_emits_one_close_read() {
+        let mut rig = central_read_rig(true);
+        let _reader_rx = open_test_stream(&mut rig.control, 7).await;
+        for _ in 0..3 {
+            rig.deliver(CentralIoReadMsg::Data(7, 0xFFFF_FFFF, buf(&[0xAA; 4])))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            rig.write_control_rx.recv().await.unwrap(),
+            WriteControlMsg::CloseRead(7)
+        ));
+        assert!(
+            timeout(Duration::from_millis(10), rig.write_control_rx.recv())
+                .await
+                .is_err(),
+            "every stray frame after the teardown amplified into another CloseRead on the session-wide control lane"
         );
     }
 }

@@ -431,9 +431,9 @@ mod tests {
     use std::time::Duration;
     use tokio::io::duplex;
 
-    fn config() -> MuxConfig {
+    fn config(initiation: Initiation) -> MuxConfig {
         MuxConfig {
-            initiation: Initiation::Server,
+            initiation,
             heartbeat_interval: Duration::from_secs(1),
             frame_reassembly: false,
         }
@@ -454,20 +454,35 @@ mod tests {
         let (bulk_cli_r, bulk_cli_w) = tokio::io::split(bulk_s2c);
 
         let mut srv_int = JoinSet::new();
-        let (int_srv_op, _int_srv_acc) =
-            spawn_mux_no_reconnection(int_srv_r, int_srv_w, config(), &mut srv_int);
+        let (int_srv_op, _int_srv_acc) = spawn_mux_no_reconnection(
+            int_srv_r,
+            int_srv_w,
+            config(Initiation::Server),
+            &mut srv_int,
+        );
         let mut srv_bulk = JoinSet::new();
-        let (bulk_srv_op, _bulk_srv_acc) =
-            spawn_mux_no_reconnection(bulk_srv_r, bulk_srv_w, config(), &mut srv_bulk);
+        let (bulk_srv_op, _bulk_srv_acc) = spawn_mux_no_reconnection(
+            bulk_srv_r,
+            bulk_srv_w,
+            config(Initiation::Server),
+            &mut srv_bulk,
+        );
 
         let mut cli_int = JoinSet::new();
-        let (_int_cli_op, int_cli_acc) =
-            spawn_mux_no_reconnection(int_cli_r, int_cli_w, config(), &mut cli_int);
+        let (_int_cli_op, int_cli_acc) = spawn_mux_no_reconnection(
+            int_cli_r,
+            int_cli_w,
+            config(Initiation::Client),
+            &mut cli_int,
+        );
         let mut cli_bulk = JoinSet::new();
-        let (_bulk_cli_op, bulk_cli_acc) =
-            spawn_mux_no_reconnection(bulk_cli_r, bulk_cli_w, config(), &mut cli_bulk);
+        let (_bulk_cli_op, bulk_cli_acc) = spawn_mux_no_reconnection(
+            bulk_cli_r,
+            bulk_cli_w,
+            config(Initiation::Client),
+            &mut cli_bulk,
+        );
 
-        let _liveness = Liveness::new();
         let srv_opener = DualStreamOpener::new(int_srv_op, bulk_srv_op, Liveness::new());
         let cli_accepter = DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
 
@@ -639,7 +654,7 @@ mod tests {
         let (_bulk_peer, bulk_local) = duplex(128);
         let (bulk_r, bulk_w) = tokio::io::split(bulk_local);
 
-        let cfg = config();
+        let cfg = config(Initiation::Server);
         let mut int_spawner = JoinSet::new();
         let (int_opener, _int_acc) =
             spawn_mux_no_reconnection(int_r, int_w, cfg.clone(), &mut int_spawner);
@@ -799,6 +814,107 @@ mod tests {
         assert_eq!(
             got, expected,
             "force-advance must not drop buffered messages"
+        );
+    }
+
+    struct MaxAllocRecorder;
+
+    static MAX_SINGLE_ALLOC: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe impl std::alloc::GlobalAlloc for MaxAllocRecorder {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            MAX_SINGLE_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            MAX_SINGLE_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            MAX_SINGLE_ALLOC.fetch_max(new_size, Ordering::Relaxed);
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static MAX_ALLOC_RECORDER: MaxAllocRecorder = MaxAllocRecorder;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_length_prefix_alone_does_not_allocate_its_payload() {
+        use tokio::io::AsyncWriteExt;
+        const HUGE: usize = 1 << 30;
+        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
+            .with_max_message_len(2 * HUGE);
+        let (_reader, mut writer) = opener.open_auto();
+        MAX_SINGLE_ALLOC.store(0, Ordering::Relaxed);
+        writer
+            .write_all(&(HUGE as u32).to_le_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "recv yielded a message that was never sent",
+        );
+        let peak = MAX_SINGLE_ALLOC.load(Ordering::Relaxed);
+        assert!(
+            peak < HUGE / 2,
+            "a bare length prefix caused a {peak}-byte allocation - a peer sending nothing but \
+             prefixes can exhaust the receiver's memory",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recv_reports_eof_repeatedly_instead_of_panicking() {
+        let (opener, accepter, srv, _cli) = paired_sessions().await;
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+        drop(opener);
+        drop(srv);
+        assert!(rx.recv().await.unwrap().is_none());
+        assert!(rx.recv().await.unwrap().is_none(), "second EOF panicked");
+        assert!(rx.recv().await.unwrap().is_none(), "third EOF panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_buffered_messages_drain_after_lanes_die() {
+        let (opener, accepter, srv, _cli) = paired_sessions().await;
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+        rx.ordered.insert(
+            1,
+            Message {
+                seq: Some(1),
+                payload: b"one".to_vec(),
+            },
+        );
+        rx.ordered.insert(
+            2,
+            Message {
+                seq: Some(2),
+                payload: b"two".to_vec(),
+            },
+        );
+        drop(opener);
+        drop(srv);
+        let mut got = Vec::new();
+        while let Some(payload) = rx.recv().await.unwrap() {
+            got.push(payload);
+        }
+        assert_eq!(
+            got,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "buffered messages were lost at shutdown"
         );
     }
 }

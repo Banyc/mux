@@ -488,4 +488,70 @@ mod tests {
             other => panic!("expected ControlJoin::Stopped, got {other:?}"),
         }
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnection_reports_the_latest_failure() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        struct FailingReader(Option<io::Error>);
+
+        impl AsyncRead for FailingReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(match self.0.take() {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                })
+            }
+        }
+
+        let first = FailingReader(Some(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "first",
+        )));
+        let mut attempts = 0usize;
+        let reconnect = move || {
+            attempts += 1;
+            let first_try = attempts == 1;
+            async move {
+                if first_try {
+                    Some((
+                        FailingReader(Some(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "second",
+                        ))),
+                        tokio::io::sink(),
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+        let mut spawner: JoinSet<MuxError> = JoinSet::new();
+        let (_opener, _accepter) = spawn_mux_with_reconnection(
+            first,
+            tokio::io::sink(),
+            MuxConfig::new(Initiation::Client, Duration::from_secs(5)),
+            reconnect,
+            &mut spawner,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), spawner.join_next())
+            .await
+            .expect("the mux task never finished")
+            .expect("the mux task disappeared")
+            .expect("the mux task panicked");
+        match err {
+            MuxError::IoReader(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied,
+                "the reconnecting mux reported the first connection's failure, not the last"
+            ),
+            other => panic!("expected IoReader, got {other:?}"),
+        }
+    }
 }
