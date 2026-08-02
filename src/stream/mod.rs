@@ -65,5 +65,3 @@ impl StreamCloseRx {
 
 #[derive(Debug, Clone)]
 pub struct DeadStreamInit {}
-#[derive(Debug, Clone)]
-pub struct DeadStream {}

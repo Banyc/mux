@@ -25,9 +25,9 @@ pub use control::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use dual_lane::{
     AUTO_BULK_THRESHOLD, AutoReader, AutoWriteError, AutoWriter, DualAcceptError, DualMuxError,
     DualStreamAccepter, DualStreamOpenError, DualStreamOpener, GroupToken, LaneClass,
-    LaneHelloError, Liveness, PairingNonce, PendingAcceptor, complete_pairing, read_lane_hello,
-    spawn_dual_mux_acceptor, spawn_dual_mux_connector, spawn_dual_mux_paired,
-    spawn_dual_mux_paired_supervised, write_birth_heartbeat, write_lane_hello,
+    LaneHelloError, PairingNonce, PendingAcceptor, complete_pairing, read_lane_hello,
+    spawn_dual_mux_acceptor, spawn_dual_mux_connector, spawn_dual_mux_paired_supervised,
+    write_birth_heartbeat, write_lane_hello,
 };
 pub use dual_message::{
     DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP, DeliveryMode,

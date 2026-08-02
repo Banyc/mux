@@ -229,6 +229,10 @@ struct Message {
     payload: Vec<u8>,
 }
 
+fn advance_past(seq: u64) -> u64 {
+    seq.saturating_add(1)
+}
+
 impl fmt::Debug for DualMessageReceiver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DualMessageReceiver")
@@ -394,20 +398,16 @@ impl DualMessageReceiver {
             let (&seq, _) = self.ordered.first_key_value()?;
             if seq == self.next_seq {
                 let msg = self.ordered.remove(&seq).unwrap();
-                self.next_seq = seq + 1;
+                self.next_seq = advance_past(seq);
                 return Some(msg.payload);
             }
             if seq < self.next_seq {
-                // Stale entry below the cursor — drop and continue.
                 self.ordered.remove(&seq);
                 continue;
             }
-            // seq > next_seq: there is a gap. If the buffer is at/over
-            // the cap, force-advance past the gap by jumping next_seq to
-            // seq and delivering it.
             if self.ordered.len() >= self.reorder_cap {
                 let msg = self.ordered.remove(&seq).unwrap();
-                self.next_seq = seq + 1;
+                self.next_seq = advance_past(seq);
                 return Some(msg.payload);
             }
             return None;
@@ -915,6 +915,28 @@ mod tests {
             got,
             vec![b"one".to_vec(), b"two".to_vec()],
             "buffered messages were lost at shutdown"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_sequence_number_does_not_wrap_the_cursor() {
+        let (_opener, accepter, _srv, _cli) = paired_sessions().await;
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+        rx.next_seq = u64::MAX;
+        rx.insert_ordered(Message {
+            seq: Some(u64::MAX),
+            payload: b"last".to_vec(),
+        });
+        assert_eq!(rx.pop_ordered(), Some(b"last".to_vec()));
+        assert_eq!(rx.next_seq, u64::MAX, "the cursor wrapped past the end");
+        rx.insert_ordered(Message {
+            seq: Some(0),
+            payload: b"replay".to_vec(),
+        });
+        assert_eq!(
+            rx.pop_ordered(),
+            None,
+            "a message from the start of the space was delivered after the end of it, so the cursor no longer rejects anything"
         );
     }
 }

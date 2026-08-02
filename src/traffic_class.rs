@@ -10,6 +10,36 @@ pub(crate) const HISTORY_MIN: usize = 3;
 pub(crate) fn is_bulk_size(size: usize) -> bool {
     size > BULK_THRESHOLD
 }
+impl LaneMigrationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LargeWrite => "large_write",
+            Self::BulkRatio => "bulk_ratio",
+            Self::SmallWriteStreak => "small_write_streak",
+            Self::Forced => "forced",
+            Self::Rebind => "rebind",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneMigrationReason {
+    LargeWrite,
+    BulkRatio,
+    SmallWriteStreak,
+    Forced,
+    Rebind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneMigration {
+    pub target: LaneClass,
+    pub reason: LaneMigrationReason,
+    pub write_size: usize,
+    pub small_writes: u32,
+    pub bulk_writes: u32,
+    pub small_streak: usize,
+}
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Classifier {
     small_count: u32,
@@ -57,15 +87,19 @@ impl LanePolicy {
         size: usize,
         current: Option<LaneClass>,
         now: Instant,
-    ) -> Option<LaneClass> {
+    ) -> Option<LaneMigration> {
         self.classifier.record(size);
         let current = current?;
-        match current {
+        let (target, reason) = match current {
             LaneClass::Interactive => {
-                let promote = size >= PROMOTE_IMMEDIATE_THRESHOLD || self.classifier.is_bulk();
-                if promote && self.cooled(now) {
-                    return Some(LaneClass::Bulk);
-                }
+                let reason = if size >= PROMOTE_IMMEDIATE_THRESHOLD {
+                    LaneMigrationReason::LargeWrite
+                } else if self.classifier.is_bulk() {
+                    LaneMigrationReason::BulkRatio
+                } else {
+                    return None;
+                };
+                (LaneClass::Bulk, reason)
             }
             LaneClass::Bulk => {
                 if is_bulk_size(size) {
@@ -73,15 +107,34 @@ impl LanePolicy {
                 } else {
                     self.small_streak += 1;
                 }
-                if self.small_streak >= DEMOTE_STREAK
-                    && !self.classifier.is_bulk()
-                    && self.cooled(now)
-                {
-                    return Some(LaneClass::Interactive);
+                if self.small_streak < DEMOTE_STREAK || self.classifier.is_bulk() {
+                    return None;
                 }
+                (
+                    LaneClass::Interactive,
+                    LaneMigrationReason::SmallWriteStreak,
+                )
             }
+        };
+        if !self.cooled(now) {
+            return None;
         }
-        None
+        Some(self.decision(target, reason, size))
+    }
+    pub(crate) fn decision(
+        &self,
+        target: LaneClass,
+        reason: LaneMigrationReason,
+        write_size: usize,
+    ) -> LaneMigration {
+        LaneMigration {
+            target,
+            reason,
+            write_size,
+            small_writes: self.classifier.small_count,
+            bulk_writes: self.classifier.bulk_count,
+            small_streak: self.small_streak,
+        }
     }
     pub(crate) fn note_migration(&mut self, now: Instant) {
         self.last_migration = Some(now);
@@ -98,6 +151,15 @@ impl LanePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn on_write(
+        policy: &mut LanePolicy,
+        size: usize,
+        current: Option<LaneClass>,
+        now: Instant,
+    ) -> Option<LaneClass> {
+        policy.on_write(size, current, now).map(|d| d.target)
+    }
 
     #[test]
     fn classifier_tracks_bulk_ratio() {
@@ -139,16 +201,16 @@ mod tests {
     fn single_moderate_write_does_not_promote() {
         let mut p = LanePolicy::new();
         let now = Instant::now();
-        assert_eq!(p.on_write(3000, INT, now), None);
+        assert_eq!(on_write(&mut p, 3000, INT, now), None);
     }
 
     #[test]
     fn ratio_promotes_after_min_observations() {
         let mut p = LanePolicy::new();
         let now = Instant::now();
-        assert_eq!(p.on_write(3000, INT, now), None);
-        assert_eq!(p.on_write(3000, INT, now), None);
-        assert_eq!(p.on_write(3000, INT, now), Some(LaneClass::Bulk));
+        assert_eq!(on_write(&mut p, 3000, INT, now), None);
+        assert_eq!(on_write(&mut p, 3000, INT, now), None);
+        assert_eq!(on_write(&mut p, 3000, INT, now), Some(LaneClass::Bulk));
     }
 
     #[test]
@@ -156,7 +218,7 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         assert_eq!(
-            p.on_write(PROMOTE_IMMEDIATE_THRESHOLD, INT, now),
+            on_write(&mut p, PROMOTE_IMMEDIATE_THRESHOLD, INT, now),
             Some(LaneClass::Bulk)
         );
     }
@@ -167,10 +229,14 @@ mod tests {
         let t0 = Instant::now();
         p.note_migration(t0);
         for _ in 0..HISTORY_MIN {
-            assert_eq!(p.on_write(3000, INT, t0 + Duration::from_millis(10)), None);
+            assert_eq!(
+                on_write(&mut p, 3000, INT, t0 + Duration::from_millis(10)),
+                None
+            );
         }
         assert_eq!(
-            p.on_write(
+            on_write(
+                &mut p,
                 PROMOTE_IMMEDIATE_THRESHOLD,
                 INT,
                 t0 + Duration::from_millis(10)
@@ -178,7 +244,7 @@ mod tests {
             None
         );
         let later = t0 + MIGRATION_COOLDOWN + Duration::from_millis(1);
-        assert_eq!(p.on_write(3000, INT, later), Some(LaneClass::Bulk));
+        assert_eq!(on_write(&mut p, 3000, INT, later), Some(LaneClass::Bulk));
     }
 
     #[test]
@@ -186,7 +252,7 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         for _ in 0..10 {
-            assert_eq!(p.on_write(100, INT, now), None);
+            assert_eq!(on_write(&mut p, 100, INT, now), None);
         }
     }
 
@@ -195,10 +261,10 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         for _ in 0..64 {
-            assert_eq!(p.on_write(300, INT, now), None);
-            assert_eq!(p.on_write(300, INT, now), None);
-            assert_eq!(p.on_write(4096, INT, now), None);
-            assert_eq!(p.on_write(300, INT, now), None);
+            assert_eq!(on_write(&mut p, 300, INT, now), None);
+            assert_eq!(on_write(&mut p, 300, INT, now), None);
+            assert_eq!(on_write(&mut p, 4096, INT, now), None);
+            assert_eq!(on_write(&mut p, 300, INT, now), None);
         }
     }
 
@@ -207,9 +273,12 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         for _ in 0..DEMOTE_STREAK - 1 {
-            assert_eq!(p.on_write(100, BULK, now), None);
+            assert_eq!(on_write(&mut p, 100, BULK, now), None);
         }
-        assert_eq!(p.on_write(100, BULK, now), Some(LaneClass::Interactive));
+        assert_eq!(
+            on_write(&mut p, 100, BULK, now),
+            Some(LaneClass::Interactive)
+        );
     }
 
     #[test]
@@ -218,10 +287,16 @@ mod tests {
         let t0 = Instant::now();
         p.note_migration(t0);
         for _ in 0..DEMOTE_STREAK + 2 {
-            assert_eq!(p.on_write(100, BULK, t0 + Duration::from_millis(10)), None);
+            assert_eq!(
+                on_write(&mut p, 100, BULK, t0 + Duration::from_millis(10)),
+                None
+            );
         }
         let later = t0 + MIGRATION_COOLDOWN + Duration::from_millis(1);
-        assert_eq!(p.on_write(100, BULK, later), Some(LaneClass::Interactive));
+        assert_eq!(
+            on_write(&mut p, 100, BULK, later),
+            Some(LaneClass::Interactive)
+        );
     }
 
     #[test]
@@ -229,14 +304,14 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         for _ in 0..HISTORY_MAX {
-            assert_eq!(p.on_write(3000, BULK, now), None);
+            assert_eq!(on_write(&mut p, 3000, BULK, now), None);
         }
         for _ in 0..DEMOTE_STREAK {
-            assert_eq!(p.on_write(100, BULK, now), None);
+            assert_eq!(on_write(&mut p, 100, BULK, now), None);
         }
         let mut demoted = false;
         for _ in 0..2 * HISTORY_MAX {
-            if p.on_write(100, BULK, now) == Some(LaneClass::Interactive) {
+            if on_write(&mut p, 100, BULK, now) == Some(LaneClass::Interactive) {
                 demoted = true;
                 break;
             }
@@ -248,7 +323,7 @@ mod tests {
     fn migrating_state_records_but_never_decides() {
         let mut p = LanePolicy::new();
         let now = Instant::now();
-        assert_eq!(p.on_write(50_000, None, now), None);
+        assert_eq!(on_write(&mut p, 50_000, None, now), None);
     }
 
     #[test]
@@ -256,11 +331,41 @@ mod tests {
         let mut p = LanePolicy::new();
         let now = Instant::now();
         for _ in 0..DEMOTE_STREAK - 1 {
-            assert_eq!(p.on_write(100, BULK, now), None);
+            assert_eq!(on_write(&mut p, 100, BULK, now), None);
         }
-        assert_eq!(p.on_write(3000, BULK, now), None);
+        assert_eq!(on_write(&mut p, 3000, BULK, now), None);
         for _ in 0..DEMOTE_STREAK - 1 {
-            assert_eq!(p.on_write(100, BULK, now), None);
+            assert_eq!(on_write(&mut p, 100, BULK, now), None);
         }
+    }
+
+    #[test]
+    fn migration_decisions_carry_their_reason() {
+        let now = Instant::now();
+        let mut p = LanePolicy::new();
+        let huge = p
+            .on_write(PROMOTE_IMMEDIATE_THRESHOLD, INT, now)
+            .expect("a huge write promotes at once");
+        assert_eq!(huge.reason, LaneMigrationReason::LargeWrite);
+        assert_eq!(huge.write_size, PROMOTE_IMMEDIATE_THRESHOLD);
+        assert_eq!(huge.bulk_writes, 1);
+        let mut p = LanePolicy::new();
+        for _ in 0..HISTORY_MIN - 1 {
+            assert!(p.on_write(3000, INT, now).is_none());
+        }
+        let ratio = p.on_write(3000, INT, now).expect("the mix reads as bulk");
+        assert_eq!(ratio.reason, LaneMigrationReason::BulkRatio);
+        assert_eq!(ratio.bulk_writes, HISTORY_MIN as u32);
+        assert_eq!(ratio.small_writes, 0);
+        let mut p = LanePolicy::new();
+        for _ in 0..DEMOTE_STREAK - 1 {
+            assert!(p.on_write(100, BULK, now).is_none());
+        }
+        let demote = p.on_write(100, BULK, now).expect("a small-write streak");
+        assert_eq!(demote.reason, LaneMigrationReason::SmallWriteStreak);
+        assert_eq!(demote.small_streak, DEMOTE_STREAK);
+        let forced = p.decision(LaneClass::Bulk, LaneMigrationReason::Forced, 0);
+        assert_eq!(forced.reason.as_str(), "forced");
+        assert_eq!(forced.small_writes, demote.small_writes);
     }
 }

@@ -169,6 +169,7 @@ pub enum DualMuxError {
     Mux(MuxError),
     LaneHello(LaneHelloError),
     NonceMismatch,
+    GroupMismatch,
     HelloDeadline,
 }
 
@@ -203,17 +204,16 @@ pub enum DualAcceptError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct Liveness {
+pub(crate) struct Liveness {
     alive: Arc<AtomicBool>,
 }
 
 impl Liveness {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             alive: Arc::new(AtomicBool::new(true)),
         }
     }
-    #[allow(dead_code)]
     fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
     }
@@ -693,25 +693,6 @@ impl DualStreamAccepter {
 // Spawn helpers
 // ---------------------------------------------------------------------------
 
-/// Pair two already-established mux sessions' openers/accepters into a
-/// dual-lane facade. The caller is responsible for ensuring the two sessions
-/// belong to the same logical peer (e.g. via the lane-hello protocol) AND
-/// for wiring joint-liveness supervision — if either lane dies, the
-/// caller must kill the other lane and drop the [`Liveness`] guard so
-/// extant stream handles error promptly. For a supervised variant that
-/// wires this automatically, see [`spawn_dual_mux_paired_supervised`].
-pub fn spawn_dual_mux_paired(
-    interactive_opener: StreamOpener,
-    interactive_accepter: StreamAccepter,
-    bulk_opener: StreamOpener,
-    bulk_accepter: StreamAccepter,
-) -> (DualStreamOpener, DualStreamAccepter) {
-    let liveness = Liveness::new();
-    let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
-    let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
-    (opener, accepter)
-}
-
 /// Like [`spawn_dual_mux_paired`] but also wires a joint-liveness
 /// supervisor: the two lane spawners are folded into `supervisor`. When
 /// either lane's mux session finishes (or errors), the supervisor
@@ -753,26 +734,23 @@ pub fn spawn_dual_mux_paired_supervised(
     supervisor: &mut JoinSet<MuxError>,
 ) -> (DualStreamOpener, DualStreamAccepter) {
     let liveness = Liveness::new();
-    let alive = liveness.alive.clone();
-
+    let killer = liveness.clone();
     let mut int_s = interactive_spawner;
     let mut bulk_s = bulk_spawner;
-
     supervisor.spawn(async move {
         tokio::select! {
             res = int_s.join_next() => {
                 bulk_s.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_s.join_next() => {
                 int_s.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
         }
     });
-
     let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
     (opener, accepter)
@@ -817,17 +795,17 @@ where
     let (bulk_opener, bulk_accepter) =
         spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
     let liveness = Liveness::new();
-    let alive = liveness.alive.clone();
+    let killer = liveness.clone();
     spawner.spawn(async move {
         tokio::select! {
             res = int_spawner.join_next() => {
                 bulk_spawner.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_spawner.join_next() => {
                 int_spawner.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
         }
@@ -850,7 +828,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (class, nonce, _group) =
+    let (class, nonce, group) =
         match tokio::time::timeout(hello_deadline, read_lane_hello(&mut reader)).await {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => return Err(DualMuxError::LaneHello(e)),
@@ -861,6 +839,7 @@ where
     let pending = PendingAcceptor {
         class,
         nonce,
+        group,
         opener,
         accepter,
         spawner: lane_spawner,
@@ -877,6 +856,7 @@ where
 pub struct PendingAcceptor {
     pub class: LaneClass,
     pub nonce: PairingNonce,
+    pub group: GroupToken,
     pub opener: StreamOpener,
     pub accepter: StreamAccepter,
     pub spawner: JoinSet<MuxError>,
@@ -895,6 +875,7 @@ impl PendingAcceptor {
     pub fn new(
         class: LaneClass,
         nonce: PairingNonce,
+        group: GroupToken,
         opener: StreamOpener,
         accepter: StreamAccepter,
         spawner: JoinSet<MuxError>,
@@ -902,6 +883,7 @@ impl PendingAcceptor {
         Self {
             class,
             nonce,
+            group,
             opener,
             accepter,
             spawner,
@@ -922,36 +904,32 @@ pub fn complete_pairing(
     if pending1.class == pending2.class {
         return Err(DualMuxError::NonceMismatch);
     }
-
+    if pending1.group != pending2.group {
+        return Err(DualMuxError::GroupMismatch);
+    }
     let (int_pending, bulk_pending) = match (pending1.class, pending2.class) {
         (LaneClass::Interactive, LaneClass::Bulk) => (pending1, pending2),
         (LaneClass::Bulk, LaneClass::Interactive) => (pending2, pending1),
         _ => return Err(DualMuxError::NonceMismatch),
     };
-
     let liveness = Liveness::new();
-    let alive = liveness.alive.clone();
-
-    // One supervisor races both lane spawners: when either lane's session
-    // finishes (or errors), it aborts the OTHER lane and kills the liveness
-    // guard so every extant stream handle on the surviving lane errors promptly.
+    let killer = liveness.clone();
     spawner.spawn(async move {
         let mut int_s = int_pending.spawner;
         let mut bulk_s = bulk_pending.spawner;
         tokio::select! {
             res = int_s.join_next() => {
                 bulk_s.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Interactive, res)
             }
             res = bulk_s.join_next() => {
                 int_s.abort_all();
-                alive.store(false, Ordering::SeqCst);
+                killer.kill();
                 aggregate_dual_lane_result(LaneClass::Bulk, res)
             }
         }
     });
-
     let opener = DualStreamOpener::new(int_pending.opener, bulk_pending.opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_pending.accepter, bulk_pending.accepter, liveness);
     Ok((opener, accepter))
@@ -1324,6 +1302,61 @@ mod tests {
 
         let result = complete_pairing(pending_int, pending_bulk, &mut set);
         assert!(matches!(result, Err(DualMuxError::NonceMismatch)));
+    }
+
+    #[tokio::test]
+    async fn group_mismatch_rejected() {
+        let nonce = PairingNonce([0x03u8; PAIRING_NONCE_LEN]);
+        let group_a = GroupToken([0x01u8; GROUP_TOKEN_LEN]);
+        let group_b = GroupToken([0x02u8; GROUP_TOKEN_LEN]);
+        let (c2s, s2c) = duplex(64);
+        let (int_r, mut int_w) = tokio::io::split(c2s);
+        let (bulk_r, mut bulk_w) = tokio::io::split(s2c);
+        write_lane_hello(&mut int_w, LaneClass::Interactive, nonce, group_a)
+            .await
+            .unwrap();
+        write_lane_hello(&mut bulk_w, LaneClass::Bulk, nonce, group_b)
+            .await
+            .unwrap();
+        let mut set = JoinSet::new();
+        let (_, _, pending_int) =
+            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
+        let (_, _, pending_bulk) =
+            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
+        let result = complete_pairing(pending_int, pending_bulk, &mut set);
+        assert!(
+            matches!(result, Err(DualMuxError::GroupMismatch)),
+            "two lanes from different sessions were paired on a shared nonce: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_group_still_pairs() {
+        let nonce = PairingNonce([0x04u8; PAIRING_NONCE_LEN]);
+        let group = GroupToken([0x05u8; GROUP_TOKEN_LEN]);
+        let (c2s, s2c) = duplex(64);
+        let (int_r, mut int_w) = tokio::io::split(c2s);
+        let (bulk_r, mut bulk_w) = tokio::io::split(s2c);
+        write_lane_hello(&mut int_w, LaneClass::Interactive, nonce, group)
+            .await
+            .unwrap();
+        write_lane_hello(&mut bulk_w, LaneClass::Bulk, nonce, group)
+            .await
+            .unwrap();
+        let mut set = JoinSet::new();
+        let (_, _, pending_int) =
+            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
+        let (_, _, pending_bulk) =
+            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert!(complete_pairing(pending_int, pending_bulk, &mut set).is_ok());
     }
 
     // -------------------------------------------------------------------
@@ -1713,7 +1746,7 @@ mod tests {
             .expect("closing before the first write is clean");
         assert!(liveness.is_alive(), "both lanes are still up");
         let mut cx = Context::from_waker(Waker::noop());
-        let error = match writer.poll_write(b"Late", &mut cx) {
+        let error = match writer.poll_write(b"late", &mut cx) {
             Poll::Ready(Err(e)) => e,
             other => panic!("a write after the local close must fail: {other:?}"),
         };
@@ -1724,7 +1757,7 @@ mod tests {
         assert_eq!(
             auto_write_to_io(error).kind(),
             io::ErrorKind::NotConnected,
-            "a locally-closed writer must read the same as StreamWriter's own local close"
+            "a locally-closed writer must read the same as a StreamWriter's own local close"
         );
     }
 }

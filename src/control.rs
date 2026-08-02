@@ -19,7 +19,7 @@ use crate::{
     common::Side,
     protocol::{Offset, StreamId},
     stream::{
-        DeadStream, DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitHandle,
+        DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitHandle,
         accepter::StreamAcceptMsg,
         opener::StreamOpenMsg,
         reader::{StreamReadDataMsg, StreamReadDataTx, stream_read_data_channel},
@@ -180,7 +180,7 @@ async fn handle_central_read(
                         .await;
                 }
             } else {
-                control.peer_close(stream_id, side).await;
+                control.peer_close(stream_id, side);
             }
         }
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
@@ -238,6 +238,18 @@ enum HandleCentralReadError {
 }
 #[derive(Debug)]
 struct StreamReadQueueFull;
+fn try_send_data(
+    dispatcher: &StreamReadDataTx,
+    data: crate::central_io::DataBuf,
+) -> Result<(), StreamReadQueueFull> {
+    if dispatcher.capacity() <= 1 {
+        return Err(StreamReadQueueFull);
+    }
+    match dispatcher.try_send(StreamReadDataMsg::Data(data)) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
+    }
+}
 async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -302,6 +314,12 @@ impl MuxControl {
             Initiation::Client => false,
         }
     }
+    fn wire_stream_id(&self, local_stream_id: StreamId) -> StreamId {
+        match self.should_stream_id_set_first_bit() {
+            true => local_stream_id | (1 << (StreamId::BITS - 1)),
+            false => local_stream_id,
+        }
+    }
     fn next_stream_id(&mut self) -> Result<StreamId, TooManyOpenStreams> {
         let max_local_stream_id = StreamId::MAX >> 1;
         if usize::try_from(max_local_stream_id).unwrap() <= self.local_opened_streams {
@@ -309,18 +327,16 @@ impl MuxControl {
         }
         let mut next_local_stream_id = self.next_possible_local_stream_id;
         let local_stream_id = loop {
-            if !self.stream_table.contains_key(&next_local_stream_id) {
+            if !self
+                .stream_table
+                .contains_key(&self.wire_stream_id(next_local_stream_id))
+            {
                 break next_local_stream_id;
             }
             next_local_stream_id = next_local_stream_id.ring_add(1, max_local_stream_id);
         };
         self.next_possible_local_stream_id = local_stream_id.ring_add(1, max_local_stream_id);
-        let stream_id = if self.should_stream_id_set_first_bit() {
-            local_stream_id | (1 << (StreamId::BITS - 1))
-        } else {
-            local_stream_id
-        };
-        Ok(stream_id)
+        Ok(self.wire_stream_id(local_stream_id))
     }
     pub fn local_close(&mut self, stream_id: StreamId, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
@@ -331,11 +347,11 @@ impl MuxControl {
             self.clean_closed_stream(stream_id);
         }
     }
-    pub async fn peer_close(&mut self, stream_id: StreamId, side: Side) {
+    pub fn peer_close(&mut self, stream_id: StreamId, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return;
         };
-        let _ = stream.peer_close(side).await;
+        stream.peer_close(side);
         if stream.is_closed() {
             self.clean_closed_stream(stream_id);
         }
@@ -360,10 +376,9 @@ impl MuxControl {
         let Some(dispatcher) = self.dispatcher(stream_id) else {
             return Ok(());
         };
-        match dispatcher.try_send(StreamReadDataMsg::Data(data)) {
+        match try_send_data(dispatcher, data) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Err(StreamReadQueueFull) => {
                 self.clean_closed_stream(stream_id);
                 Err(StreamReadQueueFull)
             }
@@ -396,15 +411,6 @@ impl MuxControl {
         ))
     }
 
-    /// Ingest one out-of-order Data frame for `stream_id` into the stream's
-    /// reorder buffer, releasing any newly-contiguous bytes to the reader.
-    /// Returns `Err(())` if the frame is a protocol error on this stream
-    /// (out-of-window offset, or a duplicate/overlapping range that the
-    /// buffer cannot accept); the caller tears down the stream's read side
-    /// but leaves the session alive.
-    ///
-    /// The stream MUST already exist in the stream table; the caller handles
-    /// the Data-before-Open implicit create + route-accept flow.
     async fn ingest_reassembly(
         &mut self,
         stream_id: StreamId,
@@ -423,23 +429,15 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            let _ = dispatcher.send(StreamReadDataMsg::Data(chunk)).await;
+            try_send_data(dispatcher, chunk).map_err(|_| ())?;
         }
-        // If CloseWrite already arrived and this frame filled the final
-        // gap, complete the stream now.
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             stream.is_peer_write_closed = true;
-            let _ = stream.read_dispatcher.send(StreamReadDataMsg::Fin).await;
+            let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
 
-    /// Peer CloseWrite carrying the stream's final byte offset. Pending
-    /// frames below `final_offset` are still released in order; once the
-    /// reorder buffer has delivered every byte up to `final_offset`, the
-    /// reader receives Fin. If `final_offset` is behind the delivered
-    /// cursor or any pending frame would exceed it, the stream is in
-    /// error and the caller closes its read side.
     async fn peer_close_write_with_offset(
         &mut self,
         stream_id: StreamId,
@@ -460,24 +458,15 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            let _ = dispatcher.send(StreamReadDataMsg::Data(chunk)).await;
+            try_send_data(dispatcher, chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            let _ = stream.read_dispatcher.send(StreamReadDataMsg::Fin).await;
+            let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
 
-    /// Tear down the read side of a single stream after a reassembly error.
-    /// Surfaces a sticky `BrokenPipe` error to the local reader, drops the
-    /// reassembly state (so no more frames are ingested for this stream),
-    /// marks the local read side closed, and treats the peer's write
-    /// direction as closed so the stream-table entry can be retired once
-    /// the local write side and broken-pipe also close. The caller must
-    /// also send `CloseRead` to the peer so the other side knows to stop
-    /// sending. Sibling streams keep running — only this one stream is
-    /// affected.
     async fn reassembly_error_teardown(&mut self, stream_id: StreamId) -> bool {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return false;
@@ -485,12 +474,10 @@ impl MuxControl {
         if stream.is_read_closed {
             return false;
         }
-        let _ = stream
-            .read_dispatcher
-            .try_send(StreamReadDataMsg::Error(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "reassembly protocol error - stream read side closed",
-            )));
+        let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Error(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
+        )));
         stream.reassembly = None;
         stream.is_read_closed = true;
         stream.is_peer_write_closed = true;
@@ -538,20 +525,19 @@ impl StreamState {
             Side::Write => self.is_write_closed = true,
         }
     }
-    pub async fn peer_close(&mut self, side: Side) -> Result<(), DeadStream> {
+    pub fn peer_close(&mut self, side: Side) {
         match side {
             Side::Read => {
                 self.write_broken_pipe.close();
             }
             Side::Write => {
                 if self.is_peer_write_closed {
-                    return Ok(());
+                    return;
                 }
                 self.is_peer_write_closed = true;
-                self.read_dispatcher.send(StreamReadDataMsg::Fin).await?;
+                let _ = self.read_dispatcher.try_send(StreamReadDataMsg::Fin);
             }
         }
-        Ok(())
     }
     pub fn dispatcher(&self) -> Option<&StreamReadDataTx> {
         if self.is_peer_write_closed {
@@ -908,12 +894,12 @@ mod reassembly_tests {
     async fn duplicate_mode_off_close_write_is_idempotent() {
         let (mut control, _close_tx, _drain) = make_control(false);
         let mut rx = open_test_stream(&mut control, 19).await;
-        control.peer_close(19, Side::Write).await;
-        control.peer_close(19, Side::Write).await;
+        control.peer_close(19, Side::Write);
+        control.peer_close(19, Side::Write);
         assert!(matches!(rx.try_recv(), Ok(StreamReadDataMsg::Fin)));
         assert!(
             rx.try_recv().is_err(),
-            "duplicate mode-off CloseWrite must not emit a second Local FIN"
+            "duplicate mode-off CloseWrite must not emit a second local FIN"
         );
     }
 
@@ -1046,6 +1032,163 @@ mod reassembly_tests {
         // absolute cursor and is idempotently dropped.
         rb.ingest(0xFFFF_FFF8, buf(&[0; 4])).unwrap();
         assert!(rb.drain_contiguous().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reorder_buffer_reassembles_any_arrival_order() {
+        fn truth(abs: u64) -> u8 {
+            (abs.wrapping_mul(31).wrapping_add(7) & 0xFF) as u8
+        }
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        for start in [0u64, 0xFFFF_FF00, 0x1_0000_0000 - 7] {
+            for trial in 0..200u64 {
+                let mut rng = Lcg(trial.wrapping_mul(0x9E37_79B9) ^ start);
+                let total = 1 + rng.below(300);
+                let mut frames: Vec<(u64, usize)> = Vec::new();
+                let mut at = 0u64;
+                while at < total {
+                    let len = (1 + rng.below(20)).min(total - at);
+                    frames.push((at, len as usize));
+                    at += len;
+                }
+                for i in (1..frames.len()).rev() {
+                    frames.swap(i, rng.below(i as u64 + 1) as usize);
+                }
+                let originals = frames.clone();
+                for _ in 0..rng.below(originals.len() as u64 + 1) {
+                    let pick = originals[rng.below(originals.len() as u64) as usize];
+                    let at = rng.below(frames.len() as u64 + 1) as usize;
+                    frames.insert(at, pick);
+                }
+                let mut rb = ReorderBuffer::new();
+                rb.cursor = start;
+                let mut delivered: Vec<u8> = Vec::new();
+                for (rel, len) in frames {
+                    let abs = start + rel;
+                    let bytes: Vec<u8> = (0..len as u64).map(|i| truth(abs + i)).collect();
+                    rb.ingest(abs as Offset, buf(&bytes)).unwrap_or_else(|e| {
+                        panic!("start={start:#x} trial={trial} rel={rel} len={len}: {e:?}")
+                    });
+                    delivered.extend_from_slice(&collect(rb.drain_contiguous()));
+                    let expected: Vec<u8> = (0..delivered.len() as u64)
+                        .map(|i| truth(start + i))
+                        .collect();
+                    assert_eq!(
+                        delivered, expected,
+                        "start={start:#x} trial={trial}: delivered bytes diverged"
+                    );
+                    assert_eq!(
+                        rb.cursor,
+                        start + delivered.len() as u64,
+                        "start={start:#x} trial={trial}: cursor disagrees with what was released"
+                    );
+                    let pending: usize = rb.pending.values().map(|d| d.len()).sum();
+                    assert_eq!(
+                        rb.buffered_bytes, pending,
+                        "start={start:#x} trial={trial}: buffered_bytes drifted from pending"
+                    );
+                }
+                assert_eq!(
+                    delivered.len() as u64,
+                    total,
+                    "start={start:#x} trial={trial}: stream did not complete"
+                );
+                assert!(rb.pending.is_empty());
+                rb.set_final_offset((start + total) as Offset).unwrap();
+                assert!(rb.is_complete());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reorder_buffer_survives_arbitrary_peer_frames() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        for start in [0u64, 1000, 0xFFFF_FF80, 0x1_0000_0000 + 5] {
+            for trial in 0..300u64 {
+                let mut rng = Lcg(trial.wrapping_mul(0x9E37_79B9) ^ start ^ 0xDEAD_BEEF);
+                let mut rb = ReorderBuffer::new();
+                rb.cursor = start;
+                let mut last_cursor = rb.cursor;
+                for step in 0..60 {
+                    let where_ = |rng: &mut Lcg, rb: &ReorderBuffer| -> Offset {
+                        match rng.below(4) {
+                            0..=1 => {
+                                (rb.cursor as i64 + (rng.below(41) as i64 - 20)) as u64 as Offset
+                            }
+                            2 => rb
+                                .cursor
+                                .wrapping_add(REASSEMBLY_MAX_RANGE_BYTES as u64)
+                                .wrapping_sub(rng.below(3))
+                                as Offset,
+                            _ => rng.next() as Offset,
+                        }
+                    };
+                    match rng.below(10) {
+                        0 => {
+                            let _ = rb.set_final_offset(where_(&mut rng, &rb));
+                        }
+                        1 => {
+                            let _ = rb.drain_contiguous();
+                        }
+                        _ => {
+                            let off = where_(&mut rng, &rb);
+                            let len = rng.below(41) as usize;
+                            let bytes: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5A).collect();
+                            let _ = rb.ingest(off, buf(&bytes));
+                        }
+                    }
+                    let ctx = format!("start={start:#x} trial={trial} step={step}");
+                    assert!(rb.cursor >= last_cursor, "{ctx}: cursor went backwards");
+                    last_cursor = rb.cursor;
+                    let pending: usize = rb.pending.values().map(|d| d.len()).sum();
+                    assert_eq!(rb.buffered_bytes, pending, "{ctx}: buffered_bytes drifted");
+                    assert!(
+                        rb.buffered_bytes <= REASSEMBLY_MAX_BUFFERED_BYTES,
+                        "{ctx}: buffered past the bound"
+                    );
+                    let mut prev_end = rb.cursor;
+                    for (&off, data) in &rb.pending {
+                        assert!(
+                            off >= prev_end,
+                            "{ctx}: pending {off} overlaps or is behind"
+                        );
+                        assert!(!data.is_empty(), "{ctx}: empty frame buffered");
+                        prev_end = off + data.len() as u64;
+                    }
+                    if let Some(fin) = rb.final_offset_abs {
+                        assert!(rb.cursor <= fin, "{ctx}: cursor ran past the final offset");
+                        assert!(
+                            prev_end <= fin,
+                            "{ctx}: a pending frame ends past the final offset"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---- End-to-end reassembly tests via MuxControl ----
@@ -1683,55 +1826,32 @@ mod reassembly_tests {
     async fn stream_retired_after_reassembly_error() {
         let (mut control, _close_tx, _drain) = make_control(true);
         let _rx = open_test_stream(&mut control, 13).await;
-
-        // Buffer a later frame [4,8) (cursor stays at 0, gap at 0).
         control
             .ingest_reassembly(13, 4, buf(&[0; 4]))
             .await
             .unwrap();
-        // Deliver an overlapping earlier frame [2,6) — it overlaps the
-        // buffered [4,8) (successor-overlap check fires) -> Overlap
-        // error -> reassembly_error_teardown.
         let overlap_err = control.ingest_reassembly(13, 2, buf(&[1; 4])).await;
         assert!(overlap_err.is_err(), "overlapping frame must error");
-        // ingest_reassembly returns Err but does not tear down; the
-        // handle_central_read caller does that. Mirror it here.
         control.reassembly_error_teardown(13).await;
-
-        // After teardown, the stream still exists (local write side is
-        // still open), but its read side is closed and — with the fix —
-        // is_peer_write_closed is set so is_closed() can become true
-        // once the local write side and broken-pipe close too.
         assert!(control.stream_table.contains_key(&13));
         {
             let stream = control.stream_table.get(&13).unwrap();
             assert!(stream.is_read_closed, "teardown sets is_read_closed");
             assert!(
                 stream.is_peer_write_closed,
-                "teardown must set is_peer_write_closed (Fix 3) so the \
-                 entry can be retired once the local write side closes"
+                "teardown must set is_peer_write_closed (Fix 3) so the entry can be retired once the local write side closes"
             );
             assert!(!stream.is_write_closed, "local write side still open");
             assert!(
                 !stream.is_closed(),
-                "is_closed() must be false until the local write side \
-                 and broken-pipe also close"
+                "is_closed() must be false until the local write side and broken-pipe also close"
             );
         }
-
-        // Close the local write side (simulates the local end closing
-        // the stream for writing).
         control.local_close(13, Side::Write);
-        // is_closed() is still false: write_broken_pipe isn't closed yet.
         if let Some(stream) = control.stream_table.get(&13) {
             assert!(!stream.is_closed(), "write_broken_pipe still open");
         }
-        // Deliver the peer's CloseRead — this closes write_broken_pipe,
-        // making is_closed() true and retiring the entry.
-        control.peer_close(13, Side::Read).await;
-
-        // The stream-table entry must now be removed (is_closed() became
-        // true inside peer_close, which called clean_closed_stream).
+        control.peer_close(13, Side::Read);
         assert!(
             !control.stream_table.contains_key(&13),
             "stream-table entry must be removed after is_closed() becomes true"
@@ -1815,6 +1935,152 @@ mod reassembly_tests {
         );
     }
 
+    #[test]
+    fn any_reordering_of_a_stream_reassembles_it_exactly() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+        const TOTAL: usize = 4096;
+        let stream: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        for seed in 1..64u64 {
+            for start in [0u64, 0xFFFF_FF00, 0x1_0000_0000, 0x7FFF_FFF0] {
+                let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut rb = ReorderBuffer::new();
+                rb.cursor = start;
+                let mut frames: Vec<(u64, usize, usize)> = Vec::new();
+                let mut off = 0usize;
+                while off < TOTAL {
+                    let len = (1 + rng.below(120)).min(TOTAL - off);
+                    frames.push((start + off as u64, off, len));
+                    off += len;
+                }
+                frames.extend_from_within(..);
+                for i in (1..frames.len()).rev() {
+                    frames.swap(i, rng.below(i + 1));
+                }
+                let final_at = rng.below(frames.len());
+                let mut delivered: Vec<u8> = Vec::new();
+                for (i, &(abs, off, len)) in frames.iter().enumerate() {
+                    if i == final_at {
+                        rb.set_final_offset((start + TOTAL as u64) as Offset)
+                            .unwrap_or_else(|e| {
+                                panic!("seed {seed} start {start:#x} early final offset: {e:?}")
+                            });
+                    }
+                    rb.ingest(abs as Offset, buf(&stream[off..off + len]))
+                        .unwrap_or_else(|e| {
+                            panic!("seed {seed} start {start:#x} frame {abs:#x}+{len}: {e:?}")
+                        });
+                    for chunk in rb.drain_contiguous() {
+                        delivered.extend_from_slice(&chunk);
+                    }
+                    let pending: usize = rb.pending.values().map(|d| d.len()).sum();
+                    assert_eq!(
+                        pending, rb.buffered_bytes,
+                        "seed {seed} start {start:#x}: buffered_bytes drifted from the pending map"
+                    );
+                    assert!(
+                        rb.pending.keys().all(|&k| k >= rb.cursor),
+                        "seed {seed} start {start:#x}: a pending frame sits at or below the cursor"
+                    );
+                }
+                assert_eq!(
+                    delivered, stream,
+                    "seed {seed} start {start:#x}: reassembled stream differs from what was sent"
+                );
+                assert_eq!(rb.cursor, start + TOTAL as u64);
+                assert!(rb.pending.is_empty());
+                rb.set_final_offset((start + TOTAL as u64) as Offset)
+                    .unwrap();
+                assert!(rb.is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn a_peer_that_reframes_the_stream_never_corrupts_it() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+        const TOTAL: usize = 4096;
+        let stream: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        for seed in 1..64u64 {
+            for start in [0u64, 0xFFFF_FF00, 0x1_0000_0000, 0x7FFF_FFF0] {
+                let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+                let mut rb = ReorderBuffer::new();
+                rb.cursor = start;
+                let mut frames: Vec<(usize, usize)> = Vec::new();
+                let mut off = 0usize;
+                while off < TOTAL {
+                    let len = (1 + rng.below(120)).min(TOTAL - off);
+                    frames.push((off, len));
+                    off += len;
+                }
+                let reframed: Vec<(usize, usize)> = (0..frames.len())
+                    .map(|_| {
+                        let lo = rng.below(TOTAL);
+                        let len = (1 + rng.below(200)).min(TOTAL - lo);
+                        (lo, len)
+                    })
+                    .collect();
+                frames.extend_from_slice(&reframed);
+                frames.extend_from_within(..frames.len() / 2);
+                for i in (1..frames.len()).rev() {
+                    frames.swap(i, rng.below(i + 1));
+                }
+                let mut delivered: Vec<u8> = Vec::new();
+                for &(off, len) in &frames {
+                    let abs = start + off as u64;
+                    let _ = rb.ingest(abs as Offset, buf(&stream[off..off + len]));
+                    for chunk in rb.drain_contiguous() {
+                        delivered.extend_from_slice(&chunk);
+                    }
+                    assert_eq!(
+                        delivered.len() as u64,
+                        rb.cursor - start,
+                        "seed {seed} start {start:#x}: delivered length and cursor disagree"
+                    );
+                    assert_eq!(
+                        delivered,
+                        stream[..delivered.len()],
+                        "seed {seed} start {start:#x}: reframing corrupted the delivered stream"
+                    );
+                    let pending: usize = rb.pending.values().map(|d| d.len()).sum();
+                    assert_eq!(
+                        pending, rb.buffered_bytes,
+                        "seed {seed} start {start:#x}: buffered_bytes drifted from the pending map"
+                    );
+                    assert!(
+                        rb.pending.keys().all(|&k| k >= rb.cursor),
+                        "seed {seed} start {start:#x}: a pending frame sits at or below the cursor"
+                    );
+                }
+            }
+        }
+    }
+
     fn central_read_rig(frame_reassembly: bool) -> CentralReadRig {
         use crate::stream::accepter::stream_accept_channel;
         use crate::stream::opener::stream_open_channel;
@@ -1835,6 +2101,110 @@ mod reassembly_tests {
             _open_tx,
             _drain,
         }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_reader_does_not_freeze_the_other_streams() {
+        let mut rig = central_read_rig(true);
+        rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
+        let _stalled = rig.accept_rx.recv().await.unwrap();
+        for i in 0..1100u32 {
+            timeout(
+                Duration::from_secs(3),
+                rig.deliver(CentralIoReadMsg::Data(1, i, buf(&[7]))),
+            )
+            .await
+            .expect("a stalled stream reader blocked the session control loop")
+            .unwrap();
+        }
+        rig.deliver(CentralIoReadMsg::Open(2)).await.unwrap();
+        let live = rig.accept_rx.recv().await.unwrap();
+        timeout(
+            Duration::from_secs(3),
+            rig.deliver(CentralIoReadMsg::Data(2, 0, buf(b"hello"))),
+        )
+        .await
+        .expect("a stalled stream reader blocked a sibling stream")
+        .unwrap();
+        let mut got = [0u8; 5];
+        let n = timeout(
+            Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read(&mut { live }.reader, &mut got),
+        )
+        .await
+        .expect("the sibling stream's reader never woke")
+        .unwrap();
+        assert_eq!(&got[..n], b"hello");
+    }
+
+    async fn drive_until_close(frames: usize) -> (Vec<u8>, io::Result<usize>) {
+        let mut rig = central_read_rig(false);
+        rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
+        let mut reader = rig.accept_rx.recv().await.unwrap().reader;
+        for _ in 0..frames {
+            rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[7])))
+                .await
+                .unwrap();
+        }
+        timeout(
+            Duration::from_secs(3),
+            rig.deliver(CentralIoReadMsg::Close(1, Side::Write, 0)),
+        )
+        .await
+        .expect("CloseWrite waited on a full read queue, freezing the session")
+        .unwrap();
+        let mut got = Vec::new();
+        let res = timeout(
+            Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut got),
+        )
+        .await
+        .expect("the reader never reached the end of its stream - it was told neither");
+        (got, res)
+    }
+
+    #[tokio::test]
+    async fn a_reader_a_queue_behind_still_gets_the_end_of_its_stream() {
+        let frames = crate::stream::reader::CHANNEL_SIZE - 1;
+        let (got, res) = drive_until_close(frames).await;
+        assert!(
+            res.is_ok(),
+            "the end of the stream surfaced as an error instead of EOF"
+        );
+        assert_eq!(got, vec![7; frames]);
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_overruns_its_queue_still_reaches_an_end() {
+        let (_got, res) = drive_until_close(crate::stream::reader::CHANNEL_SIZE).await;
+        assert!(
+            res.is_err(),
+            "the stream outran its read queue, so its reader owes an error, not a clean EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_stream_does_not_reserve_the_server_s_own_id() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        let _peer = open_test_stream(&mut control, 0).await;
+        assert_eq!(
+            control.next_stream_id().unwrap(),
+            1 << (StreamId::BITS - 1),
+            "a stream in the peer's half of the id space blocked a free local id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_allocator_never_hands_out_a_live_stream_s_id() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        let live = control.next_stream_id().unwrap();
+        let _live_rx = open_test_stream(&mut control, live).await;
+        control.next_possible_local_stream_id = 0;
+        let next = control.next_stream_id().unwrap();
+        assert!(
+            !control.stream_table.contains_key(&next),
+            "next_stream_id handed out {next:#x}, which is still live"
+        );
     }
 
     #[tokio::test]
@@ -1871,7 +2241,7 @@ mod reassembly_tests {
                 rig.deliver(msg).await.unwrap();
                 assert!(
                     !rig.control.stream_table.contains_key(&local_id),
-                    "{described} (reassembly={reassembly}) created a stream on an id only our own 'open' allocates"
+                    "{described} (reassembly={reassembly}) created a stream on an id only our own `open` allocates"
                 );
                 assert!(
                     rig.accept_rx.try_recv().is_err(),
@@ -1899,9 +2269,8 @@ mod reassembly_tests {
         rig.control
             .try_dispatch_data(local_id, buf(&[0xCC]))
             .unwrap();
-        let msg = local_rx
-            .try_recv()
-            .expect("the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
+        let msg = local_rx.try_recv().expect(
+            "the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
         match msg {
             StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
             other => panic!("expected Data, got {other:?}"),
@@ -1923,11 +2292,8 @@ mod reassembly_tests {
             rig.control
                 .try_dispatch_data(peer_id, buf(&[0xCC]))
                 .unwrap();
-            let msg = peer_rx.try_recv().unwrap_or_else(|_| {
-                panic!(
-                    "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"
-                )
-            });
+            let msg = peer_rx.try_recv().unwrap_or_else(|_| panic!(
+                "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"));
             match msg {
                 StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
                 other => panic!("expected Data, got {other:?}"),

@@ -53,9 +53,9 @@ pub const DEFAULT_SUCCESSOR_DEADLINE: Duration = Duration::from_secs(30);
 /// rejecting with `InvalidData`.
 pub const MAX_PENDING_GENERATIONS: usize = 256;
 
-/// Maximum orphan generations (unknown logical stream id) before
-/// rejecting.
-pub const MAX_ORPHANS: usize = 32;
+pub const MAX_ORPHANS_PER_STREAM: usize = 32;
+
+pub const MAX_ORPHAN_STREAMS: usize = 32;
 
 /// Time-to-live for orphan entries in the registry.
 pub const ORPHAN_TTL: Duration = Duration::from_millis(1500);
@@ -225,6 +225,10 @@ impl GenerationChain {
 
     pub fn logical_id(&self) -> u64 {
         self.logical_id
+    }
+
+    pub fn generations_started(&self) -> u32 {
+        self.next_generation
     }
 
     /// Whether generation 0 has never been started — the stream was never
@@ -400,18 +404,26 @@ impl SpliceRegistry {
         reader: GenerationReader,
     ) -> Result<(), MigrationError> {
         self.reap_orphans(None);
-        if self.orphan_count >= MAX_ORPHANS {
+        let known = self.orphans.contains_key(&header.logical_id);
+        if !known && self.orphans.len() >= MAX_ORPHAN_STREAMS {
             return Err(MigrationError::TooManyOrphans);
         }
+        let entries = self.orphans.entry(header.logical_id).or_default();
+        if entries.len() >= MAX_ORPHANS_PER_STREAM {
+            return Err(MigrationError::TooManyOrphans);
+        }
+        if entries
+            .iter()
+            .any(|e| e.header.generation == header.generation)
+        {
+            return Err(MigrationError::DuplicateGeneration);
+        }
         let deadline = Instant::now() + ORPHAN_TTL;
-        self.orphans
-            .entry(header.logical_id)
-            .or_default()
-            .push_back(OrphanEntry {
-                header,
-                reader,
-                deadline,
-            });
+        entries.push_back(OrphanEntry {
+            header,
+            reader,
+            deadline,
+        });
         self.orphan_count += 1;
         Ok(())
     }
@@ -723,7 +735,6 @@ pub fn spawn_splice_driver(
         let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
         let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let mut next_incarnation: u64 = 1;
-
         fn flush_contiguous(
             registry: &mut SpliceRegistry,
             logical_id: u64,
@@ -752,7 +763,6 @@ pub fn spawn_splice_driver(
             next_to_flush.insert(logical_id, next);
             false
         }
-
         fn cleanup_all(
             logical_id: u64,
             queues: &mut HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>>,
@@ -765,40 +775,24 @@ pub fn spawn_splice_driver(
             next_to_flush.remove(&logical_id);
             registry.remove_stream(logical_id);
         }
-
         loop {
             tokio::select! {
                 cont = cont_rx.recv() => {
-                    let Some((header, reader)) = cont else {
-                        break;
-                    };
-
+                    let Some((header, reader)) = cont else { break; };
                     let logical_id = header.logical_id;
                     let is_gen0 = header.generation == 0;
                     let is_final = header.is_final;
-
                     let spliced_opt = match registry.dispatch(header, reader) {
                         Ok(opt) => opt,
-                        Err(
-                            MigrationError::DuplicateGeneration
+                        Err(MigrationError::DuplicateGeneration
                             | MigrationError::GenerationAfterFinal
-                            | MigrationError::TooManyOrphans,
-                        ) => {
-                            continue;
-                        }
+                            | MigrationError::TooManyOrphans) => continue,
                         Err(MigrationError::TooManyPendingGenerations) => {
-                            cleanup_all(
-                                logical_id,
-                                &mut queues,
-                                &mut cleanup_tokens,
-                                &mut next_to_flush,
-                                &mut registry,
-                            );
+                            cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
                             continue;
                         }
                         Err(e) => return Err(e),
                     };
-
                     match spliced_opt {
                         Some(spliced) => {
                             if is_gen0 {
@@ -807,13 +801,10 @@ pub fn spawn_splice_driver(
                                     cleanup_tokens.remove(&logical_id);
                                     let _ = gen0_tx.send((logical_id, Some(spliced)));
                                 } else {
-                                    let (queue_tx, queue_rx) =
-                                        tokio::sync::mpsc::unbounded_channel();
+                                    let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
                                     let successor_deadline = registry.successor_deadline;
                                     let token = next_incarnation;
-                                    next_incarnation = next_incarnation
-                                        .checked_add(1)
-                                        .expect("incarnation overflow");
+                                    next_incarnation = next_incarnation.checked_add(1).expect("incarnation overflow");
                                     let spliced = spliced.with_queue_and_cleanup(
                                         queue_rx,
                                         successor_deadline,
@@ -823,22 +814,9 @@ pub fn spawn_splice_driver(
                                     queues.insert(logical_id, queue_tx.clone());
                                     cleanup_tokens.insert(logical_id, token);
                                     next_to_flush.insert(logical_id, 1);
-                                    let reached_final = flush_contiguous(
-                                        &mut registry,
-                                        logical_id,
-                                        &queue_tx,
-                                        &mut next_to_flush,
-                                    );
-                                    if gen0_tx.send((logical_id, Some(spliced))).is_err()
-                                        || reached_final
-                                    {
-                                        cleanup_all(
-                                            logical_id,
-                                            &mut queues,
-                                            &mut cleanup_tokens,
-                                            &mut next_to_flush,
-                                            &mut registry,
-                                        );
+                                    let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
+                                    if gen0_tx.send((logical_id, Some(spliced))).is_err() || reached_final {
+                                        cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
                                     }
                                 }
                             }
@@ -848,20 +826,9 @@ pub fn spawn_splice_driver(
                                 let _ = gen0_tx.send((logical_id, None));
                             }
                             if let Some(queue_tx) = queues.get(&logical_id).cloned() {
-                                let reached_final = flush_contiguous(
-                                    &mut registry,
-                                    logical_id,
-                                    &queue_tx,
-                                    &mut next_to_flush,
-                                );
+                                let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
                                 if reached_final {
-                                    cleanup_all(
-                                        logical_id,
-                                        &mut queues,
-                                        &mut cleanup_tokens,
-                                        &mut next_to_flush,
-                                        &mut registry,
-                                    );
+                                    cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
                                 }
                             }
                         }
@@ -871,13 +838,7 @@ pub fn spawn_splice_driver(
                     if let Some((logical_id, token)) = cleanup {
                         if let Some(&current_token) = cleanup_tokens.get(&logical_id) {
                             if current_token == token {
-                                cleanup_all(
-                                    logical_id,
-                                    &mut queues,
-                                    &mut cleanup_tokens,
-                                    &mut next_to_flush,
-                                    &mut registry,
-                                );
+                                cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
                             }
                         }
                     }
@@ -1398,8 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn too_many_orphans_rejected() {
         let mut registry = SpliceRegistry::new();
-
-        for i in 0..MAX_ORPHANS as u64 {
+        for i in 0..MAX_ORPHAN_STREAMS as u64 {
             let (c, _s) = duplex(1);
             let h = ResumeHeader {
                 logical_id: 100 + i,
@@ -1412,7 +1372,6 @@ mod tests {
                 "orphan {i} should be accepted"
             );
         }
-
         let (c_over, _s_over) = duplex(1);
         let h_over = ResumeHeader {
             logical_id: 200,
@@ -1427,9 +1386,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn orphan_ttl_reaping_frees_capacity() {
         let mut registry = SpliceRegistry::new();
-
-        // Fill with MAX_ORPHANS - 1.
-        for i in 0..(MAX_ORPHANS - 1) as u64 {
+        for i in 0..(MAX_ORPHAN_STREAMS - 1) as u64 {
             let (c, _s) = duplex(1);
             let h = ResumeHeader {
                 logical_id: 200 + i,
@@ -1439,12 +1396,8 @@ mod tests {
             };
             assert!(registry.dispatch(h, c).is_ok());
         }
-
-        // Advance past ORPHAN_TTL.
         tokio::time::advance(ORPHAN_TTL + Duration::from_millis(1)).await;
-
-        // Now we can add MAX_ORPHANS more (the old ones were reaped).
-        for i in 0..MAX_ORPHANS as u64 {
+        for i in 0..MAX_ORPHAN_STREAMS as u64 {
             let (c, _s) = duplex(1);
             let h = ResumeHeader {
                 logical_id: 300 + i,
@@ -1822,7 +1775,6 @@ mod tests {
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
         let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
-
         let (c0, mut s0) = duplex(64);
         let h0 = ResumeHeader {
             logical_id: 77,
@@ -1833,7 +1785,6 @@ mod tests {
         cont_tx.send((h0, Box::pin(c0))).unwrap();
         let (id0, mut reader0) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id0, 77);
-
         let (c1, _s1) = duplex(1);
         let h1 = ResumeHeader {
             logical_id: 77,
@@ -1842,7 +1793,6 @@ mod tests {
             is_response: false,
         };
         cont_tx.send((h1, Box::pin(c1))).unwrap();
-
         drop(_s1);
         s0.write_all(b"hello").await.unwrap();
         drop(s0);
@@ -1850,8 +1800,7 @@ mod tests {
         reader0.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
         let n = reader0.read(&mut buf[..1]).await.unwrap();
-        assert_eq!(n, 0, "reader0 clean EOF after FINAL g2");
-
+        assert_eq!(n, 0, "reader0 clean EOF after FINAL g1");
         let (c_new, mut s_new) = duplex(64);
         let h_new = ResumeHeader {
             logical_id: 77,
@@ -1862,9 +1811,7 @@ mod tests {
         cont_tx.send((h_new, Box::pin(c_new))).unwrap();
         let (id_new, mut reader_new) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id_new, 77);
-
         drop(reader0);
-
         let (c1_new, mut s1_new) = duplex(64);
         let h1_new = ResumeHeader {
             logical_id: 77,
@@ -1873,13 +1820,11 @@ mod tests {
             is_response: false,
         };
         cont_tx.send((h1_new, Box::pin(c1_new))).unwrap();
-
         s_new.write_all(b"y").await.unwrap();
         drop(s_new);
         let mut buf = [0u8; 1];
         reader_new.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"y", "new reader gen0 byte");
-
         s1_new.write_all(b"x").await.unwrap();
         drop(s1_new);
         let mut buf = [0u8; 1];
@@ -2156,6 +2101,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_duplicate_orphan_generation_does_not_replace_the_real_one() {
+        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        let mut real = send_gen(&cont_tx, hdr(1, 1, false));
+        real.write_all(b"real").await.unwrap();
+        real.shutdown().await.unwrap();
+        let mut impostor = send_gen(&cont_tx, hdr(1, 1, false));
+        impostor.write_all(b"fake").await.unwrap();
+        impostor.shutdown().await.unwrap();
+        let mut gen0 = send_gen(&cont_tx, hdr(1, 0, false));
+        gen0.write_all(b"zero").await.unwrap();
+        gen0.shutdown().await.unwrap();
+        let (_, mut spliced) = expect_gen0_reader(gen0_rx.recv().await);
+        let mut fin = send_gen(&cont_tx, hdr(1, 2, true));
+        fin.shutdown().await.unwrap();
+        let mut got = String::new();
+        spliced.read_to_string(&mut got).await.unwrap();
+        assert_eq!(
+            got, "zeroreal",
+            "a second sub-stream claiming generation 1 replaced the first one's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_streams_orphans_do_not_refuse_anothers() {
+        let mut registry = SpliceRegistry::new();
+        for generation in 1..=MAX_ORPHANS_PER_STREAM as u32 {
+            let (c, _s) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(1, generation, false), c).is_ok(),
+                "generation {generation} of the busy stream should be accepted"
+            );
+        }
+        let (c, _s) = duplex(1);
+        assert!(
+            matches!(
+                registry.dispatch(hdr(1, MAX_ORPHANS_PER_STREAM as u32 + 1, false), c),
+                Err(MigrationError::TooManyOrphans)
+            ),
+            "the stream over its own allowance must be the one refused"
+        );
+        let (c, _s) = duplex(1);
+        assert!(
+            registry.dispatch(hdr(2, 1, false), c).is_ok(),
+            "a second stream was refused for what the first one spent"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn orphans_expire_without_another_orphan_to_trigger_the_reap() {
         let mut registry = SpliceRegistry::new();
@@ -2167,7 +2160,7 @@ mod tests {
         registry.dispatch(hdr(8, 0, false), c0).unwrap().unwrap();
         assert_eq!(
             registry.orphan_count, 0,
-            "the expired orphan survived the reaping triggered by a gen-0 dispatch"
+            "an orphan outlived its TTL because no further orphan arrived to reap it"
         );
     }
 
@@ -2214,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_cap_does_not_kill_the_splice_driver() {
         let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
-        for i in 0..=MAX_ORPHANS as u64 {
+        for i in 0..=MAX_ORPHAN_STREAMS as u64 {
             let _s = send_gen(&cont_tx, hdr(1000 + i, 1, false));
         }
         let _s0 = send_gen(&cont_tx, hdr(77, 0, false));

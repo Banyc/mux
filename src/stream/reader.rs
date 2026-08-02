@@ -9,9 +9,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{central_io::DataBuf, control::DeadControl};
 
-use super::{DeadStream, StreamCloseTx};
+use super::StreamCloseTx;
 
-const CHANNEL_SIZE: usize = 1024;
+pub(crate) const CHANNEL_SIZE: usize = 1024;
 
 #[derive(Debug)]
 struct StreamReaderState {
@@ -153,8 +153,8 @@ pub struct StreamReadDataTx {
     tx: tokio::sync::mpsc::Sender<StreamReadDataMsg>,
 }
 impl StreamReadDataTx {
-    pub async fn send(&self, msg: StreamReadDataMsg) -> Result<(), DeadStream> {
-        self.tx.send(msg).await.map_err(|_| DeadStream {})
+    pub fn capacity(&self) -> usize {
+        self.tx.capacity()
     }
     pub fn try_send(
         &self,

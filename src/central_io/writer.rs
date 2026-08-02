@@ -251,8 +251,11 @@ where
     }
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
         let data_buf = match msg.data {
-            StreamWriteData::Open { wire: false } => return Ok(()),
-            StreamWriteData::Open { wire: true } => {
+            StreamWriteData::Open { wire } => {
+                self.next_offset.remove(&msg.stream_id);
+                if !wire {
+                    return Ok(());
+                }
                 return self.send_control_(Header::Open, msg.stream_id).await;
             }
             StreamWriteData::Fin => {
@@ -1844,6 +1847,94 @@ mod tests {
         assert_eq!(
             central.io_writer.0, expected3,
             "mode-on must end in exactly one extended CloseWrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn recycled_stream_id_restarts_at_offset_zero() {
+        struct SinkWriter(Vec<u8>);
+        impl AsyncWrite for SinkWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.0.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+        let body: Vec<u8> = (0u8..50u8).collect::<Vec<u8>>();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        central.io_writer.0.clear();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Open { wire: true },
+            })
+            .await
+            .unwrap();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.push(Header::Open.encode()[0]);
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.push(0x02);
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.extend_from_slice(&50u16.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        expected.extend_from_slice(&body);
+        assert_eq!(
+            central.io_writer.0, expected,
+            "a recycled id must not inherit its predecessor's wire offset"
+        );
+        central.io_writer.0.clear();
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Open { wire: false },
+            })
+            .await
+            .unwrap();
+        assert!(
+            central.io_writer.0.is_empty(),
+            "a non-wire Open must not emit a frame"
+        );
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 7,
+                data: StreamWriteData::Fin,
+            })
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.push(Header::CloseWrite.encode()[0]);
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(
+            central.io_writer.0, expected,
+            "the final offset must count only the recycled stream's own bytes"
         );
     }
 
