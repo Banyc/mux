@@ -9,14 +9,12 @@ use tokio::{
 use crate::{
     StreamAccepter,
     central_io::{
+        encoder::{CentralIoWriter, RunCentralIoWriterError, run_central_io_writer},
         reader::{
             CentralIoReader, RunCentralIoReaderError, central_io_read_channel,
             run_central_io_reader,
         },
-        writer::{
-            CentralIoWriter, RunCentralIoWriterError, run_central_io_writer, write_control_channel,
-            write_data_channel,
-        },
+        scheduler::{write_control_channel, write_data_channel},
     },
     common::Side,
     control::{Initiation, MuxControl, RunControlArgs, RunControlError, run_control},
@@ -58,7 +56,7 @@ pub enum MuxError {
     IoReader(io::Error),
     IoWriter(io::Error),
     DualLane {
-        lane: crate::dual_lane::LaneClass,
+        lane: crate::lane_hello::LaneClass,
         peer_lane_aborted: bool,
         source: Box<MuxError>,
     },

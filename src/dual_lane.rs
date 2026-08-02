@@ -19,6 +19,7 @@ use tokio::{
 
 use crate::{
     StreamAccepter, StreamReader,
+    lane_hello::{GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello},
     protocol::Header,
     serve::{MuxConfig, MuxError, spawn_mux_no_reconnection},
     stream::{
@@ -31,66 +32,10 @@ use crate::{
 // Constants
 // ---------------------------------------------------------------------------
 
-const LANE_HELLO_INTERACTIVE: u8 = 0xD1;
-const LANE_HELLO_BULK: u8 = 0xD2;
-const PAIRING_NONCE_LEN: usize = 16;
-const HELLO_LEN: usize = 1 + PAIRING_NONCE_LEN + GROUP_TOKEN_LEN;
-
 /// Threshold for `open_auto` classification. Writes strictly larger than
 /// this go to the bulk lane; equal-or-smaller go to interactive. Mirrors
 /// `DATA_MEDIUM_CAP` in `central_io::writer`.
 pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
-
-// ---------------------------------------------------------------------------
-// LaneClass
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaneClass {
-    Interactive,
-    Bulk,
-}
-
-impl LaneClass {
-    fn hello_byte(self) -> u8 {
-        match self {
-            LaneClass::Interactive => LANE_HELLO_INTERACTIVE,
-            LaneClass::Bulk => LANE_HELLO_BULK,
-        }
-    }
-    fn from_hello_byte(b: u8) -> Option<Self> {
-        match b {
-            LANE_HELLO_INTERACTIVE => Some(LaneClass::Interactive),
-            LANE_HELLO_BULK => Some(LaneClass::Bulk),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PairingNonce
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PairingNonce([u8; PAIRING_NONCE_LEN]);
-
-impl PairingNonce {
-    pub fn generate() -> Self {
-        let mut buf = [0u8; PAIRING_NONCE_LEN];
-        getrandom::fill(&mut buf).expect("PairingNonce generation failed");
-        Self(buf)
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
-}
-
-impl AsRef<[u8]> for PairingNonce {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Lane hello I/O
@@ -102,62 +47,6 @@ impl AsRef<[u8]> for PairingNonce {
 /// receiver switches off its shorter first-receive deadline.
 pub async fn write_birth_heartbeat<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.write_all(&Header::Heartbeat.encode()).await
-}
-
-#[derive(Debug, Clone)]
-pub enum LaneHelloError {
-    Io(io::ErrorKind),
-    BadLaneClass(u8),
-    ShortRead { expected: usize, got: usize },
-}
-
-impl From<LaneHelloError> for io::Error {
-    fn from(e: LaneHelloError) -> Self {
-        match e {
-            LaneHelloError::Io(kind) => io::Error::from(kind),
-            LaneHelloError::BadLaneClass(_) => {
-                io::Error::new(io::ErrorKind::InvalidData, "bad lane hello class byte")
-            }
-            LaneHelloError::ShortRead { .. } => {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "short lane hello read")
-            }
-        }
-    }
-}
-
-pub async fn write_lane_hello<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    class: LaneClass,
-    nonce: PairingNonce,
-    group: GroupToken,
-) -> Result<(), LaneHelloError> {
-    use tokio::io::AsyncWriteExt;
-    let mut buf = [0u8; HELLO_LEN];
-    buf[0] = class.hello_byte();
-    buf[1..1 + PAIRING_NONCE_LEN].copy_from_slice(nonce.as_ref());
-    buf[1 + PAIRING_NONCE_LEN..].copy_from_slice(group.as_ref());
-    writer
-        .write_all(&buf)
-        .await
-        .map_err(|e| LaneHelloError::Io(e.kind()))?;
-    Ok(())
-}
-
-pub async fn read_lane_hello<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<(LaneClass, PairingNonce, GroupToken), LaneHelloError> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = [0u8; HELLO_LEN];
-    reader
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| LaneHelloError::Io(e.kind()))?;
-    let class = LaneClass::from_hello_byte(buf[0]).ok_or(LaneHelloError::BadLaneClass(buf[0]))?;
-    let mut nonce_bytes = [0u8; PAIRING_NONCE_LEN];
-    nonce_bytes.copy_from_slice(&buf[1..1 + PAIRING_NONCE_LEN]);
-    let mut group_bytes = [0u8; GROUP_TOKEN_LEN];
-    group_bytes.copy_from_slice(&buf[1 + PAIRING_NONCE_LEN..]);
-    Ok((class, PairingNonce(nonce_bytes), GroupToken(group_bytes)))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +108,24 @@ impl Liveness {
     }
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+    async fn watch_dual_lanes(
+        self,
+        mut int_s: JoinSet<MuxError>,
+        mut bulk_s: JoinSet<MuxError>,
+    ) -> MuxError {
+        tokio::select! {
+            res = int_s.join_next() => {
+                bulk_s.abort_all();
+                self.kill();
+                aggregate_dual_lane_result(LaneClass::Interactive, res)
+            }
+            res = bulk_s.join_next() => {
+                int_s.abort_all();
+                self.kill();
+                aggregate_dual_lane_result(LaneClass::Bulk, res)
+            }
+        }
     }
 }
 
@@ -735,21 +642,8 @@ pub fn spawn_dual_mux_paired_supervised(
 ) -> (DualStreamOpener, DualStreamAccepter) {
     let liveness = Liveness::new();
     let killer = liveness.clone();
-    let mut int_s = interactive_spawner;
-    let mut bulk_s = bulk_spawner;
     supervisor.spawn(async move {
-        tokio::select! {
-            res = int_s.join_next() => {
-                bulk_s.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Interactive, res)
-            }
-            res = bulk_s.join_next() => {
-                int_s.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Bulk, res)
-            }
-        }
+        killer.watch_dual_lanes(interactive_spawner, bulk_spawner).await
     });
     let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
@@ -797,18 +691,7 @@ where
     let liveness = Liveness::new();
     let killer = liveness.clone();
     spawner.spawn(async move {
-        tokio::select! {
-            res = int_spawner.join_next() => {
-                bulk_spawner.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Interactive, res)
-            }
-            res = bulk_spawner.join_next() => {
-                int_spawner.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Bulk, res)
-            }
-        }
+        killer.watch_dual_lanes(int_spawner, bulk_spawner).await
     });
     let opener = DualStreamOpener::new(int_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_accepter, bulk_accepter, liveness);
@@ -915,20 +798,9 @@ pub fn complete_pairing(
     let liveness = Liveness::new();
     let killer = liveness.clone();
     spawner.spawn(async move {
-        let mut int_s = int_pending.spawner;
-        let mut bulk_s = bulk_pending.spawner;
-        tokio::select! {
-            res = int_s.join_next() => {
-                bulk_s.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Interactive, res)
-            }
-            res = bulk_s.join_next() => {
-                int_s.abort_all();
-                killer.kill();
-                aggregate_dual_lane_result(LaneClass::Bulk, res)
-            }
-        }
+        killer
+            .watch_dual_lanes(int_pending.spawner, bulk_pending.spawner)
+            .await
     });
     let opener = DualStreamOpener::new(int_pending.opener, bulk_pending.opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_pending.accepter, bulk_pending.accepter, liveness);
@@ -943,6 +815,7 @@ pub fn complete_pairing(
 mod tests {
     use super::*;
     use crate::control::Initiation;
+    use crate::lane_hello::{GROUP_TOKEN_LEN, HELLO_LEN, PAIRING_NONCE_LEN};
     use tokio::io::{AsyncWriteExt, duplex};
 
     fn srv_config() -> MuxConfig {
@@ -1759,24 +1632,5 @@ mod tests {
             io::ErrorKind::NotConnected,
             "a locally-closed writer must read the same as a StreamWriter's own local close"
         );
-    }
-}
-
-const GROUP_TOKEN_LEN: usize = 16;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GroupToken([u8; GROUP_TOKEN_LEN]);
-
-impl GroupToken {
-    pub fn generate() -> Self {
-        let mut buf = [0u8; GROUP_TOKEN_LEN];
-        getrandom::fill(&mut buf).expect("GroupToken generation failed");
-        Self(buf)
-    }
-}
-
-impl AsRef<[u8]> for GroupToken {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
     }
 }

@@ -2,8 +2,9 @@ use primitive::arena::obj_pool::ObjScoped;
 
 use crate::common::Side;
 
+pub mod encoder;
 pub mod reader;
-pub mod writer;
+pub mod scheduler;
 
 pub type DataBuf = ObjScoped<Vec<u8>>;
 

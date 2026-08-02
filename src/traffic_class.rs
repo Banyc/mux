@@ -1,4 +1,6 @@
-use crate::dual_lane::LaneClass;
+use crate::fair_queue;
+use crate::lane_hello::LaneClass;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 pub const BULK_THRESHOLD: usize = 2 * 1024;
@@ -145,6 +147,106 @@ impl LanePolicy {
             None => true,
             Some(last) => now.duration_since(last) >= MIGRATION_COOLDOWN,
         }
+    }
+}
+
+/// A stream is relegated from `MaybeLatencySensitive` (the default, protected)
+/// to `MustBulk` once at least two thirds of its recent sends were under
+/// [`DATA_QUANTUM`] and it has been idle for this long.
+pub(crate) const LATENCY_IDLE: Duration = Duration::from_secs(30);
+
+/// Minimum number of sends before the 2/3-under-QUANTUM ratio is evaluated.
+/// Maximum send history kept per stream. Once the counters reach this size
+/// they are halved before tallying the new observation, so classification
+/// tracks recent behaviour and a MustBulk stream reverts to latency-sensitive
+/// within a bounded number of small sends.
+#[cfg(test)]
+pub(crate) const LATENCY_HISTORY_MAX: usize = crate::traffic_class::HISTORY_MAX;
+
+/// Per-stream traffic class, keyed by fair-queue token.
+///
+/// - `MaybeLatencySensitive` (default): the stream is protected. While any
+///   open stream is in this class, every Data dispatch is capped at
+///   [`DATA_QUANTUM`] so a later-arriving small stream can preempt the tail.
+/// - `MustBulk`: the stream has been relegated. Only when every open stream is
+///   `MustBulk` does a dispatch use [`DATA_BULK_CAP`] for throughput.
+///
+/// The class is computed on demand from per-stream send observations (recent
+/// send sizes and last-sent time); it is not stored as a field. Global
+/// sensitivity is cheap to query in the common case: `bulk_count` and
+/// `next_bulk_transition` are maintained incrementally, and
+/// `any_latency_sensitive` is O(1) except when a time-driven transition is due
+/// (then it recomputes aggregates, O(open_count), and resets the timer).
+#[derive(Debug)]
+pub(crate) struct LatencyControl {
+    /// Send history per open stream token. `Small`/`Bulk` are tallied
+    /// incrementally so the 2/3-under-QUANTUM ratio is a cheap division, and
+    /// `last_sent` lets `MustBulk` revert to latency-sensitive if a stream
+    /// resumes after the idle window.
+    streams: HashMap<fair_queue::Token, Classifier>,
+    /// Number of currently-open streams (`Open` seen, no `Close`/`Fin` yet).
+    open_count: usize,
+    /// Number of open streams currently classified `MustBulk`.
+    bulk_count: usize,
+    /// Earliest time at which some non-bulk stream may transition to `MustBulk`
+    /// (its `last_sent + LATENCY_IDLE`). `None` when no non-bulk stream could
+    /// ever transition (e.g. no history yet). `any_latency_sensitive` is O(1)
+    /// while `now < next_bulk_transition`; once `now` crosses it, aggregates
+    /// are recomputed and this is reset.
+    next_bulk_transition: Option<Instant>,
+}
+
+impl LatencyControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+            open_count: 0,
+            bulk_count: 0,
+            next_bulk_transition: None,
+        }
+    }
+    pub(crate) fn open(&mut self, token: fair_queue::Token, now: Instant) {
+        let obs = Classifier::new();
+        self.open_count += 1;
+        if obs.is_bulk() {
+            self.bulk_count += 1;
+        } else {
+            self.next_bulk_transition = Some(now + LATENCY_IDLE);
+        }
+        self.streams.insert(token, obs);
+    }
+    pub(crate) fn close(&mut self, token: fair_queue::Token) {
+        let Some(obs) = self.streams.remove(&token) else {
+            return;
+        };
+        if obs.is_bulk() {
+            self.bulk_count = self.bulk_count.strict_sub(1);
+        }
+        self.open_count = self.open_count.strict_sub(1);
+    }
+    pub(crate) fn record_send(&mut self, token: fair_queue::Token, size: usize, now: Instant) {
+        let Some(obs) = self.streams.get_mut(&token) else {
+            return;
+        };
+        let was_bulk = obs.is_bulk();
+        obs.record(size);
+        let is_bulk = obs.is_bulk();
+        if was_bulk != is_bulk {
+            if is_bulk {
+                self.bulk_count += 1;
+            } else {
+                self.bulk_count = self.bulk_count.strict_sub(1);
+            }
+        }
+        if !is_bulk {
+            self.next_bulk_transition = Some(now + LATENCY_IDLE);
+        }
+    }
+    pub fn any_latency_sensitive(&self) -> bool {
+        if self.open_count == self.bulk_count {
+            return false;
+        }
+        self.next_bulk_transition.is_none_or(|t| Instant::now() < t)
     }
 }
 

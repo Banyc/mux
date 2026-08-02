@@ -13,7 +13,7 @@ use tokio::io::AsyncWrite;
 use crate::{
     central_io::{
         DeadCentralIo,
-        writer::{DATA_BULK_CAP, PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx},
+        scheduler::{DATA_BULK_CAP, PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx},
     },
     control::WriteBrokenPipe,
 };
@@ -258,7 +258,7 @@ mod tests {
     use super::*;
     use crate::{
         Side,
-        central_io::writer::{StreamWriteData, write_data_channel},
+        central_io::scheduler::{StreamWriteData, write_data_channel},
         control::WriteBrokenPipe,
     };
     use std::io::IoSlice;
@@ -269,7 +269,7 @@ mod tests {
     ) -> (
         StreamWriterState,
         PollStreamWriteDataTx,
-        crate::central_io::writer::WriteDataRx,
+        crate::central_io::scheduler::WriteDataRx,
     ) {
         let (prototype, mut rx) = write_data_channel();
         let derive_fut = prototype.derive(stream_id, false);
