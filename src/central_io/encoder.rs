@@ -99,6 +99,7 @@ where
                     !self.frame_reassembly,
                     "ForceCloseWrite is the legacy mode-off abort path"
                 );
+                self.next_offset.remove(&stream_id);
                 self.send_control_(Header::CloseWrite, stream_id).await
             }
         }
@@ -617,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode_off_force_close_write_uses_stock_frame_without_consuming_offset() {
+    async fn mode_off_force_close_write_uses_stock_frame_and_clears_offset_state() {
         struct SinkWriter(Vec<u8>);
         impl AsyncWrite for SinkWriter {
             fn poll_write(
@@ -651,8 +652,8 @@ mod tests {
         assert_eq!(central.io_writer.0, expected);
         assert_eq!(
             central.next_offset.get(&9),
-            Some(&123),
-            "Legacy abort must not consume FIN offset state"
+            None,
+            "Legacy abort must tear down FIN offset state so an aborted stream leaves no stale entry"
         );
     }
 
