@@ -1255,7 +1255,7 @@ mod tests {
     // surviving lane fail (rather than hanging).
     // -------------------------------------------------------------------
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn paired_supervised_kills_pair_on_lane_death() {
         // Build two lanes with their spawners accessible so we can kill
         // one lane and observe the supervisor propagate the death.
@@ -1307,13 +1307,19 @@ mod tests {
         drop(cli_bulk);
 
         // Wait long enough for the receive deadline to fire on both lanes.
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        // The supervisor kills the shared Liveness once either lane's
+        // spawner observes the deadline error; only then does an open fail
+        // fast instead of hanging. Drive the runtime until that happens.
+        while opener.is_alive() {
+            tokio::task::yield_now().await;
+        }
 
         // Opens on either lane must now fail (LaneDead), not hang.
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), opener.open(LaneClass::Bulk)).await;
+        let result = opener.open(LaneClass::Bulk).await;
         assert!(
-            matches!(result, Ok(Err(DualStreamOpenError::LaneDead))),
+            matches!(result, Err(DualStreamOpenError::LaneDead)),
             "surviving lane must report LaneDead after pair death, got {result:?}"
         );
         let _ = supervisor;
@@ -1333,7 +1339,7 @@ mod tests {
     // immediately.
     // -------------------------------------------------------------------
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn first_receive_deadline_widens_after_birth_heartbeat() {
         use crate::serve::spawn_mux_no_reconnection_with_first_receive_deadline;
 
@@ -1378,12 +1384,16 @@ mod tests {
         // After this, the server must widen to the steady deadline.
         write_birth_heartbeat(&mut injector_w).await.unwrap();
 
+        // Let the server reader consume the heartbeat before time advances;
+        // otherwise the 100 ms first-receive deadline would still be armed.
+        tokio::task::yield_now().await;
+
         // Now send nothing for 250 ms — longer than the 100 ms
         // first-receive deadline, but less than the 1600 ms steady
         // deadline. With the bug, the server's reader would still be on
         // the 100 ms deadline at this point (the heartbeat was
         // swallowed, recv() never returned) and would time out here.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::advance(Duration::from_millis(250)).await;
 
         // At this point the buggy reader would already have produced a
         // "receive deadline" error (100 ms after the birth heartbeat,
@@ -1419,7 +1429,8 @@ mod tests {
         // assert the session is still alive (no completed tasks). A
         // receive-deadline timeout here would mean the reader died
         // before the second heartbeat arrived.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
         while let Some(res) = srv_spawner.try_join_next() {
             if let Ok(MuxError::IoReader(ref e)) = res {
                 if e.to_string().contains("receive deadline") {
