@@ -2416,7 +2416,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::type_complexity)]
     async fn make_counted_dual_session() -> (
         DualStreamOpener,
         DualStreamAccepter,

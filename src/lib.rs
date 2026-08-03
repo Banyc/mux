@@ -9,7 +9,7 @@ mod common;
 mod control;
 mod dual_lane;
 mod dual_message;
-#[allow(unused)]
+#[expect(unused)]
 mod fair_queue;
 mod lane_hello;
 mod migrating;

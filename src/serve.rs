@@ -85,7 +85,7 @@ where
     async fn nah<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
-    #[allow(unused_assignments)]
+    #[expect(unused_assignments)]
     let mut reconnect = Some(nah);
     reconnect = None;
     spawn_mux(io_reader, io_writer, config, reconnect, spawner, None, None)
@@ -110,7 +110,7 @@ where
     async fn nah<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
-    #[allow(unused_assignments)]
+    #[expect(unused_assignments)]
     let mut reconnect = Some(nah);
     reconnect = None;
     spawn_mux(
@@ -141,7 +141,7 @@ where
     async fn nah<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
-    #[allow(unused_assignments)]
+    #[expect(unused_assignments)]
     let mut reconnect = Some(nah);
     reconnect = None;
     let (ready_tx, ready_rx) = oneshot::channel();
