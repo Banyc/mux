@@ -253,6 +253,19 @@ fn try_send_data(
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
     }
 }
+/// Send a terminal Fin/Error. `try_send_data` reserves one headroom slot
+/// (it refuses Data once `capacity() <= 1`), so a terminal message can
+/// only ever fail with `Full` if the headroom invariant is broken — that
+/// is a bug and panics. `Closed` (the reader dropped its receiver) is
+/// benign and ignored, matching `try_send_data`.
+fn try_send_terminal(dispatcher: &StreamReadDataTx, msg: StreamReadDataMsg) {
+    match dispatcher.try_send(msg) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => panic!(
+            "terminal Fin/Error must fit: try_send_data reserves one headroom slot for it"
+        ),
+    }
+}
 async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -436,7 +449,7 @@ impl MuxControl {
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             stream.is_peer_write_closed = true;
-            let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Fin);
+            try_send_terminal(&stream.read_dispatcher, StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -465,7 +478,7 @@ impl MuxControl {
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Fin);
+            try_send_terminal(&stream.read_dispatcher, StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -477,10 +490,13 @@ impl MuxControl {
         if stream.is_read_closed {
             return false;
         }
-        let _ = stream.read_dispatcher.try_send(StreamReadDataMsg::Error(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
-        )));
+        try_send_terminal(
+            &stream.read_dispatcher,
+            StreamReadDataMsg::Error(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
+            )),
+        );
         stream.reassembly = None;
         stream.is_read_closed = true;
         stream.is_peer_write_closed = true;
@@ -538,7 +554,7 @@ impl StreamState {
                     return;
                 }
                 self.is_peer_write_closed = true;
-                let _ = self.read_dispatcher.try_send(StreamReadDataMsg::Fin);
+                try_send_terminal(&self.read_dispatcher, StreamReadDataMsg::Fin);
             }
         }
     }
