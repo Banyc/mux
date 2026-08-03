@@ -60,6 +60,19 @@ pub const MAX_ORPHAN_STREAMS: usize = 32;
 /// Time-to-live for orphan entries in the registry.
 pub const ORPHAN_TTL: Duration = Duration::from_millis(1500);
 
+/// Maximum number of distinct logical stream ids with live splice state in
+/// the registry. When the cap is hit, a new splice is refused with
+/// [`MigrationError::TooManySpliceStreams`].
+pub const MAX_SPLICE_STREAMS: usize = 256;
+
+/// Capacity of the per-logical-stream successor queue feeding a
+/// [`SplicedReader`]. Bounded so a slow reader cannot accumulate
+/// unbounded generations in memory.
+const SPLICE_QUEUE_CAPACITY: usize = MAX_PENDING_GENERATIONS;
+
+/// Capacity of the reader-drop cleanup notification channel.
+const SPLICE_CLEANUP_CAPACITY: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -75,6 +88,9 @@ pub enum MigrationError {
     FinalWithPayload,
     TooManyPendingGenerations,
     TooManyOrphans,
+    /// A new splice was refused because the cap on distinct logical stream
+    /// ids with live splice state was reached.
+    TooManySpliceStreams,
     BrokenPipe,
     TimedOut,
 }
@@ -96,6 +112,9 @@ impl fmt::Display for MigrationError {
                 write!(f, "too many pending generations for one stream")
             }
             MigrationError::TooManyOrphans => write!(f, "too many orphan generations"),
+            MigrationError::TooManySpliceStreams => {
+                write!(f, "too many distinct logical streams being spliced")
+            }
             MigrationError::BrokenPipe => write!(f, "generation chain broken: no successor"),
             MigrationError::TimedOut => {
                 write!(f, "timed out waiting for successor generation")
@@ -365,6 +384,9 @@ impl SpliceRegistry {
             }
             None => {
                 if header.generation == 0 {
+                    if self.streams.len() >= MAX_SPLICE_STREAMS {
+                        return Err(MigrationError::TooManySpliceStreams);
+                    }
                     let mut entry = StreamEntry::new();
                     let is_closed = header.is_final;
                     if let Some(orphans) = self.orphans.remove(&header.logical_id) {
@@ -495,10 +517,10 @@ pub struct SplicedReader {
     logical_id: u64,
     current: Option<GenerationReader>,
     current_is_final: bool,
-    queue_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(bool, GenerationReader)>>,
+    queue_rx: Option<tokio::sync::mpsc::Receiver<(bool, GenerationReader)>>,
     successor_timer: Option<Pin<Box<Sleep>>>,
     successor_deadline: Duration,
-    cleanup_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>,
+    cleanup_tx: Option<tokio::sync::mpsc::Sender<(u64, u64)>>,
     cleanup_token: u64,
     is_closed: bool,
     finished: bool,
@@ -517,7 +539,7 @@ impl fmt::Debug for SplicedReader {
 impl Drop for SplicedReader {
     fn drop(&mut self) {
         if let Some(tx) = &self.cleanup_tx {
-            let _ = tx.send((self.logical_id, self.cleanup_token));
+            let _ = tx.try_send((self.logical_id, self.cleanup_token));
         }
     }
 }
@@ -540,7 +562,7 @@ impl SplicedReader {
 
     pub fn with_queue(
         mut self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<(bool, GenerationReader)>,
+        rx: tokio::sync::mpsc::Receiver<(bool, GenerationReader)>,
         successor_deadline: Duration,
     ) -> Self {
         self.queue_rx = Some(rx);
@@ -550,7 +572,7 @@ impl SplicedReader {
 
     pub fn with_cleanup(
         mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+        tx: tokio::sync::mpsc::Sender<(u64, u64)>,
         token: u64,
     ) -> Self {
         self.cleanup_tx = Some(tx);
@@ -560,9 +582,9 @@ impl SplicedReader {
 
     pub fn with_queue_and_cleanup(
         mut self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<(bool, GenerationReader)>,
+        rx: tokio::sync::mpsc::Receiver<(bool, GenerationReader)>,
         successor_deadline: Duration,
-        cleanup_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+        cleanup_tx: tokio::sync::mpsc::Sender<(u64, u64)>,
         cleanup_token: u64,
     ) -> Self {
         self.queue_rx = Some(rx);
@@ -729,16 +751,16 @@ pub fn spawn_splice_driver(
     gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
 ) -> tokio::task::JoinHandle<Result<(), MigrationError>> {
     tokio::spawn(async move {
-        let mut queues: HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>> =
+        let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
         let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
-        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
         let mut next_incarnation: u64 = 1;
         fn flush_contiguous(
             registry: &mut SpliceRegistry,
             logical_id: u64,
-            queue_tx: &tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>,
+            queue_tx: &tokio::sync::mpsc::Sender<(bool, GenerationReader)>,
             next_to_flush: &mut HashMap<u64, u32>,
         ) -> bool {
             let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
@@ -748,12 +770,20 @@ pub fn spawn_splice_driver(
                     continue;
                 }
                 if genn == next {
-                    if queue_tx.send((is_final, reader)).is_err() {
-                        return true;
-                    }
-                    next = next.checked_add(1).expect("generation overflow");
-                    if is_final {
-                        return true;
+                    match queue_tx.try_send((is_final, reader)) {
+                        Ok(()) => {
+                            next = next.checked_add(1).expect("generation overflow");
+                            if is_final {
+                                return true;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full((is_final, reader))) => {
+                            registry.reinsert_pending(logical_id, genn, is_final, reader);
+                            break;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            return true;
+                        }
                     }
                 } else {
                     registry.reinsert_pending(logical_id, genn, is_final, reader);
@@ -765,7 +795,7 @@ pub fn spawn_splice_driver(
         }
         fn cleanup_all(
             logical_id: u64,
-            queues: &mut HashMap<u64, tokio::sync::mpsc::UnboundedSender<(bool, GenerationReader)>>,
+            queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
             cleanup_tokens: &mut HashMap<u64, u64>,
             next_to_flush: &mut HashMap<u64, u32>,
             registry: &mut SpliceRegistry,
@@ -786,7 +816,8 @@ pub fn spawn_splice_driver(
                         Ok(opt) => opt,
                         Err(MigrationError::DuplicateGeneration
                             | MigrationError::GenerationAfterFinal
-                            | MigrationError::TooManyOrphans) => continue,
+                            | MigrationError::TooManyOrphans
+                            | MigrationError::TooManySpliceStreams) => continue,
                         Err(MigrationError::TooManyPendingGenerations) => {
                             cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
                             continue;
@@ -801,7 +832,7 @@ pub fn spawn_splice_driver(
                                     cleanup_tokens.remove(&logical_id);
                                     let _ = gen0_tx.send((logical_id, Some(spliced)));
                                 } else {
-                                    let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+                                    let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
                                     let successor_deadline = registry.successor_deadline;
                                     let token = next_incarnation;
                                     next_incarnation = next_incarnation.checked_add(1).expect("incarnation overflow");
@@ -1028,10 +1059,10 @@ mod tests {
 
         // Now feed gen1 into the spliced reader's queue (the driver does
         // this when gen0 EOFs).
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_secs(30));
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
-        queue_tx.send((false, gen1_r)).unwrap();
+        queue_tx.send((false, gen1_r)).await.unwrap();
 
         // Next read must be gen1's "BBBB", not EOF.
         let mut buf = [0u8; 4];
@@ -1084,10 +1115,10 @@ mod tests {
         drop(gen1_client);
 
         // Attach the queue and enqueue gen1 now, while gen0 is untouched.
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_secs(30));
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
-        queue_tx.send((false, gen1_r)).unwrap();
+        queue_tx.send((false, gen1_r)).await.unwrap();
 
         // Now write gen0 payload. gen0 is still the active slot.
         let mut gen0_client = gen0_client;
@@ -1135,7 +1166,7 @@ mod tests {
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         // gen2 is FINAL and empty (writer dropped, no payload).
         drop(gen2_client);
-        queue_tx.send((true, gen2_r)).unwrap();
+        queue_tx.send((true, gen2_r)).await.unwrap();
         drop(queue_tx);
 
         let mut tail = [0u8; 1];
@@ -1167,7 +1198,7 @@ mod tests {
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
         // EMPTY queue attached — gen1 not yet enqueued.
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_secs(30));
 
         // Drain gen0 then close it -> gen0 EOF.
@@ -1200,7 +1231,7 @@ mod tests {
         };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
-        queue_tx.send((false, gen1_r)).unwrap();
+        queue_tx.send((false, gen1_r)).await.unwrap();
 
         // gen1's writer is LIVE — push bytes AFTER handoff, no residual.
         let mut gen1_client = gen1_client;
@@ -1225,7 +1256,7 @@ mod tests {
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         drop(gen2_client);
-        queue_tx.send((true, gen2_r)).unwrap();
+        queue_tx.send((true, gen2_r)).await.unwrap();
         drop(queue_tx);
         let n = spliced.read(&mut tail).await.unwrap();
         assert_eq!(n, 0, "clean EOF after empty FINAL gen2");
@@ -1250,7 +1281,7 @@ mod tests {
         };
         let mut spliced = registry.dispatch(h0, gen0_server).unwrap().unwrap();
 
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_secs(30));
 
         // Enqueue gen1 IMMEDIATELY (before gen0 EOF) but with a LIVE
@@ -1264,7 +1295,7 @@ mod tests {
         };
         registry.dispatch(h1, gen1_server).unwrap();
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
-        queue_tx.send((false, gen1_r)).unwrap();
+        queue_tx.send((false, gen1_r)).await.unwrap();
 
         let mut gen1_client = gen1_client;
 
@@ -1298,7 +1329,7 @@ mod tests {
         registry.dispatch(h2, gen2_server).unwrap();
         let (_gen, _is_final, gen2_r) = registry.pop_pending(1).unwrap();
         drop(gen2_client);
-        queue_tx.send((true, gen2_r)).unwrap();
+        queue_tx.send((true, gen2_r)).await.unwrap();
         drop(queue_tx);
         let mut tail = [0u8; 1];
         let n = spliced.read(&mut tail).await.unwrap();
@@ -1446,10 +1477,10 @@ mod tests {
         s1.write_all(b"x").await.unwrap();
         drop(s1);
 
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_secs(30));
         let (_gen, _is_final, gen1_r) = registry.pop_pending(1).unwrap();
-        queue_tx.send((true, gen1_r)).unwrap();
+        queue_tx.send((true, gen1_r)).await.unwrap();
 
         // Reading must error with InvalidData (FINAL with payload).
         let mut buf = [0u8; 1];
@@ -1499,7 +1530,7 @@ mod tests {
         let mut spliced = registry.dispatch(h0, c0).unwrap().unwrap();
 
         // Provide a queue but never send a successor.
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         spliced = spliced.with_queue(queue_rx, Duration::from_millis(100));
         let _ = queue_tx;
 
@@ -1742,7 +1773,7 @@ mod tests {
         };
         let mut spliced = registry.dispatch(h0, c0).unwrap().unwrap();
 
-        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
         let successor_deadline = Duration::from_secs(30);
         spliced = spliced.with_queue(queue_rx, successor_deadline);
 
@@ -2254,5 +2285,25 @@ mod tests {
             .expect("a zero-length read stranded the reader on a successor that never comes")
             .expect("a zero-length read retired the live generation");
         assert_eq!(&buf, b"AAAA");
+    }
+
+    // -------------------------------------------------------------------
+    // Fix: MAX_SPLICE_STREAMS caps the number of distinct logical stream
+    // ids with live splice state; the next gen-0 is refused.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn splice_stream_cap_refuses_new_logical_streams() {
+        let mut registry = SpliceRegistry::new();
+        for i in 0..MAX_SPLICE_STREAMS as u64 {
+            let (c, _s) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(i, 0, false), c).is_ok(),
+                "gen-0 {i} should be accepted below the cap"
+            );
+        }
+        let (c_over, _s_over) = duplex(1);
+        let result = registry.dispatch(hdr(MAX_SPLICE_STREAMS as u64, 0, false), c_over);
+        assert!(matches!(result, Err(MigrationError::TooManySpliceStreams)));
     }
 }
