@@ -83,7 +83,12 @@ pub fn spawn_splice_feed() -> SpliceFeed {
                         }
                         None => {
                             if ready.len() >= MAX_UNCLAIMED_GEN0 {
-                                ready.pop_front();
+                                if let Some((evicted_id, _)) = ready.pop_front() {
+                                    tracing::debug!(
+                                        evicted_id,
+                                        "splice feed evicted an unclaimed gen-0 reader (ready queue full)"
+                                    );
+                                }
                             }
                             ready.push_back((id, spliced));
                         }
