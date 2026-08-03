@@ -133,7 +133,9 @@ async fn handle_central_read(
             let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
                 Ok(x) => x,
                 Err(e) => match e {
-                    ControlOpenError::TooManyOpenStreams(_) => panic!(),
+                    ControlOpenError::TooManyOpenStreams(_) => {
+                        return Ok(());
+                    }
                     ControlOpenError::DeadCentralIo(dead_central_io) => {
                         return Err(HandleCentralReadError::DeadCentralIo(dead_central_io));
                     }
