@@ -124,3 +124,75 @@ impl AsRef<[u8]> for GroupToken {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    /// A fully-valid Interactive hello frame plus the parsed values it must
+    /// round-trip to.
+    fn valid_hello() -> ([u8; HELLO_LEN], LaneClass, PairingNonce, GroupToken) {
+        let class = LaneClass::Interactive;
+        let nonce = PairingNonce([0xAB; PAIRING_NONCE_LEN]);
+        let group = GroupToken([0xCD; GROUP_TOKEN_LEN]);
+        let mut buf = [0u8; HELLO_LEN];
+        buf[0] = class.hello_byte();
+        buf[1..1 + PAIRING_NONCE_LEN].copy_from_slice(nonce.as_ref());
+        buf[1 + PAIRING_NONCE_LEN..].copy_from_slice(group.as_ref());
+        (buf, class, nonce, group)
+    }
+
+    #[tokio::test]
+    async fn truncation_fails_gracefully_at_every_byte_boundary() {
+        let (full, class, nonce, group) = valid_hello();
+        // A full valid packet decodes fine.
+        let (got_class, got_nonce, got_group) =
+            read_lane_hello(&mut Cursor::new(&full[..]))
+                .await
+                .expect("a full valid hello must parse");
+        assert_eq!(got_class, class);
+        assert_eq!(got_nonce, nonce);
+        assert_eq!(got_group, group);
+        // Every truncation 0..33 bytes must fail gracefully, not panic.
+        for len in 0..HELLO_LEN {
+            let truncated = &full[..len];
+            let res = read_lane_hello(&mut Cursor::new(truncated)).await;
+            assert!(
+                res.is_err(),
+                "truncating a valid hello to {len} bytes must fail gracefully, got {res:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_zero_group_token_round_trips() {
+        let group = GroupToken([0u8; GROUP_TOKEN_LEN]);
+        let nonce = PairingNonce([0x42; PAIRING_NONCE_LEN]);
+        let mut buf = Vec::new();
+        write_lane_hello(&mut buf, LaneClass::Bulk, nonce, group)
+            .await
+            .unwrap();
+        let (class, got_nonce, got_group) =
+            read_lane_hello(&mut Cursor::new(&buf)).await.unwrap();
+        assert_eq!(class, LaneClass::Bulk);
+        assert_eq!(got_nonce, nonce);
+        assert_eq!(got_group, group);
+    }
+
+    #[test]
+    fn lane_hello_error_maps_to_io_error() {
+        let short: io::Error = LaneHelloError::ShortRead {
+            expected: HELLO_LEN,
+            got: 5,
+        }
+        .into();
+        assert_eq!(short.kind(), io::ErrorKind::UnexpectedEof);
+
+        let bad_class: io::Error = LaneHelloError::BadLaneClass(0x00).into();
+        assert_eq!(bad_class.kind(), io::ErrorKind::InvalidData);
+
+        let io_kind: io::Error = LaneHelloError::Io(io::ErrorKind::ConnectionReset).into();
+        assert_eq!(io_kind.kind(), io::ErrorKind::ConnectionReset);
+    }
+}
