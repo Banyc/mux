@@ -70,7 +70,7 @@ impl StreamWriterState {
         if data_len == 0 {
             return Ok(0).into();
         }
-        ready!(data.poll_preserve(cx)).map_err(SendError::DeadCentralIo)?;
+        ready!(data.poll_reserve(cx)).map_err(SendError::DeadCentralIo)?;
         let mut data_buf = self.buf_pool.take_scoped();
         for buf in bufs {
             let remaining = data_len - data_buf.len();
@@ -92,13 +92,13 @@ impl StreamWriterState {
         if self.broken_pipe.is_closed() {
             return Err(SendError::PeerClosedStream);
         }
-        // poll_preserve probes the fair queue for capacity: it preserves error
+        // poll_reserve probes the fair queue for capacity: it preserves error
         // reporting (PeerClosedStream surfaces as Err on shutdown) while dropping
         // self.close independently closes the fair queue and emits FIN after
         // accepted data has drained.
         let mut cx = Context::from_waker(Waker::noop());
         let _ = data
-            .poll_preserve(&mut cx)
+            .poll_reserve(&mut cx)
             .map_err(SendError::DeadCentralIo)?;
         drop(self.close.take());
         Ok(())

@@ -102,6 +102,15 @@ pub enum RunControlError {
     DeadCentralIo(DeadCentralIo, StreamInitHandle),
 }
 
+/// Which side allocated a wire stream id: `Local` when this session opened
+/// it, `Peer` when the remote side did.  Classified once from the high bit
+/// and the session initiation role instead of re-deriving it at each guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifiedStreamId {
+    Local,
+    Peer,
+}
+
 async fn handle_local_open(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -124,7 +133,7 @@ async fn handle_central_read(
 ) -> Result<(), HandleCentralReadError> {
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
-            if control.is_local_opened_stream(stream_id) {
+            if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
                 return Ok(());
             }
             if control.stream_table.contains_key(&stream_id) {
@@ -149,7 +158,7 @@ async fn handle_central_read(
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
                 if !control.stream_table.contains_key(&stream_id) {
-                    if control.is_local_opened_stream(stream_id) {
+                    if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
                         return Ok(());
                     }
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
@@ -189,7 +198,7 @@ async fn handle_central_read(
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
             if control.frame_reassembly {
                 if !control.stream_table.contains_key(&stream_id) {
-                    if control.is_local_opened_stream(stream_id) {
+                    if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
                         return Ok(());
                     }
                     let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
@@ -241,29 +250,36 @@ enum HandleCentralReadError {
 }
 #[derive(Debug)]
 struct StreamReadQueueFull;
-fn try_send_data(
-    dispatcher: &StreamReadDataTx,
-    data: crate::central_io::DataBuf,
-) -> Result<(), StreamReadQueueFull> {
-    if dispatcher.capacity() <= 1 {
-        return Err(StreamReadQueueFull);
-    }
-    match dispatcher.try_send(StreamReadDataMsg::Data(data)) {
-        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
-    }
+
+/// A stream read dispatcher that owns the FIN-headroom reservation
+/// structurally. `try_send_data` refuses once only one slot remains, so a
+/// terminal `try_send_terminal` always fits — `Full` there would mean the
+/// reservation was broken, which panics as a backstop rather than as the
+/// normal failure path.
+#[derive(Debug, Clone)]
+pub struct StreamDispatcher {
+    tx: StreamReadDataTx,
 }
-/// Send a terminal Fin/Error. `try_send_data` reserves one headroom slot
-/// (it refuses Data once `capacity() <= 1`), so a terminal message can
-/// only ever fail with `Full` if the headroom invariant is broken — that
-/// is a bug and panics. `Closed` (the reader dropped its receiver) is
-/// benign and ignored, matching `try_send_data`.
-fn try_send_terminal(dispatcher: &StreamReadDataTx, msg: StreamReadDataMsg) {
-    match dispatcher.try_send(msg) {
-        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => panic!(
-            "terminal Fin/Error must fit: try_send_data reserves one headroom slot for it"
-        ),
+impl StreamDispatcher {
+    fn new(tx: StreamReadDataTx) -> Self {
+        Self { tx }
+    }
+    fn try_send_data(&self, data: crate::central_io::DataBuf) -> Result<(), StreamReadQueueFull> {
+        if self.tx.capacity() <= 1 {
+            return Err(StreamReadQueueFull);
+        }
+        match self.tx.try_send(StreamReadDataMsg::Data(data)) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
+        }
+    }
+    fn try_send_terminal(&self, msg: StreamReadDataMsg) {
+        match self.tx.try_send(msg) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => panic!(
+                "terminal Fin/Error must fit: try_send_data reserves one headroom slot for it"
+            ),
+        }
     }
 }
 async fn open_stream(
@@ -274,7 +290,7 @@ async fn open_stream(
     let write_broken_pipe = WriteBrokenPipe::new();
     let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
     let (stream_id, stream_write_data_tx) = control
-        .open(stream_read_data_tx, write_broken_pipe.clone(), stream_id)
+        .open(StreamDispatcher::new(stream_read_data_tx), write_broken_pipe.clone(), stream_id)
         .await?;
     let stream_reader = StreamReader::new(
         stream_read_data_rx,
@@ -317,12 +333,28 @@ impl MuxControl {
             frame_reassembly,
         }
     }
-    fn is_local_opened_stream(&self, stream_id: StreamId) -> bool {
+    fn classify_stream_id(&self, stream_id: StreamId) -> ClassifiedStreamId {
         let is_first_bit_set = stream_id >> (StreamId::BITS - 1) == 1;
         match self.initiation {
-            Initiation::Server => is_first_bit_set,
-            Initiation::Client => !is_first_bit_set,
+            Initiation::Server => {
+                if is_first_bit_set {
+                    ClassifiedStreamId::Local
+                } else {
+                    ClassifiedStreamId::Peer
+                }
+            }
+            Initiation::Client => {
+                if is_first_bit_set {
+                    ClassifiedStreamId::Peer
+                } else {
+                    ClassifiedStreamId::Local
+                }
+            }
         }
+    }
+    #[cfg(test)]
+    fn is_local_opened_stream(&self, stream_id: StreamId) -> bool {
+        self.classify_stream_id(stream_id) == ClassifiedStreamId::Local
     }
     fn should_stream_id_set_first_bit(&self) -> bool {
         match self.initiation {
@@ -373,12 +405,12 @@ impl MuxControl {
         }
     }
     fn clean_closed_stream(&mut self, stream_id: StreamId) {
-        if self.is_local_opened_stream(stream_id) {
+        if self.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
             self.local_opened_streams -= 1;
         }
         self.stream_table.remove(&stream_id);
     }
-    pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamReadDataTx> {
+    pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamDispatcher> {
         self.stream_table.get(&stream_id)?.dispatcher()
     }
     fn try_dispatch_data(
@@ -392,7 +424,7 @@ impl MuxControl {
         let Some(dispatcher) = self.dispatcher(stream_id) else {
             return Ok(());
         };
-        match try_send_data(dispatcher, data) {
+        match dispatcher.try_send_data(data) {
             Ok(()) => Ok(()),
             Err(StreamReadQueueFull) => {
                 self.clean_closed_stream(stream_id);
@@ -402,7 +434,7 @@ impl MuxControl {
     }
     pub async fn open(
         &mut self,
-        dispatcher: StreamReadDataTx,
+        dispatcher: StreamDispatcher,
         broken_pipe: WriteBrokenPipe,
         stream_id: Option<StreamId>,
     ) -> Result<(StreamId, StreamWriteDataTx), ControlOpenError> {
@@ -413,7 +445,7 @@ impl MuxControl {
                 .next_stream_id()
                 .map_err(ControlOpenError::TooManyOpenStreams)?,
         };
-        if self.is_local_opened_stream(stream_id) {
+        if self.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
             self.local_opened_streams += 1;
         }
         let stream = StreamState::new(dispatcher, broken_pipe, self.frame_reassembly);
@@ -445,11 +477,11 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            try_send_data(dispatcher, chunk).map_err(|_| ())?;
+            dispatcher.try_send_data(chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             stream.is_peer_write_closed = true;
-            try_send_terminal(&stream.read_dispatcher, StreamReadDataMsg::Fin);
+            stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -474,11 +506,11 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            try_send_data(dispatcher, chunk).map_err(|_| ())?;
+            dispatcher.try_send_data(chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            try_send_terminal(&stream.read_dispatcher, StreamReadDataMsg::Fin);
+            stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -490,9 +522,7 @@ impl MuxControl {
         if stream.is_read_closed {
             return false;
         }
-        try_send_terminal(
-            &stream.read_dispatcher,
-            StreamReadDataMsg::Error(io::Error::new(
+        stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Error(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
             )),
@@ -513,7 +543,7 @@ pub enum ControlOpenError {
 struct StreamState {
     is_write_closed: bool,
     is_read_closed: bool,
-    read_dispatcher: StreamReadDataTx,
+    read_dispatcher: StreamDispatcher,
     is_peer_write_closed: bool,
     write_broken_pipe: WriteBrokenPipe,
     /// Per-stream reorder buffer, present only when `frame_reassembly` is on.
@@ -521,7 +551,7 @@ struct StreamState {
 }
 impl StreamState {
     pub fn new(
-        read_dispatcher: StreamReadDataTx,
+        read_dispatcher: StreamDispatcher,
         write_broken_pipe: WriteBrokenPipe,
         frame_reassembly: bool,
     ) -> Self {
@@ -554,11 +584,11 @@ impl StreamState {
                     return;
                 }
                 self.is_peer_write_closed = true;
-                try_send_terminal(&self.read_dispatcher, StreamReadDataMsg::Fin);
+                self.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
             }
         }
     }
-    pub fn dispatcher(&self) -> Option<&StreamReadDataTx> {
+    pub fn dispatcher(&self) -> Option<&StreamDispatcher> {
         if self.is_peer_write_closed {
             return None;
         }
@@ -718,7 +748,7 @@ mod reassembly_tests {
     async fn open_test_stream(control: &mut MuxControl, stream_id: StreamId) -> StreamReadDataRx {
         let (tx, rx) = stream_read_data_channel();
         let bp = WriteBrokenPipe::new();
-        control.open(tx, bp, Some(stream_id)).await.unwrap();
+        control.open(StreamDispatcher::new(tx), bp, Some(stream_id)).await.unwrap();
         rx
     }
 
@@ -729,17 +759,10 @@ mod reassembly_tests {
         let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
         let mut queued = 0;
         loop {
-            let result = rig
-                .control
-                .dispatcher(1)
-                .unwrap()
-                .try_send(StreamReadDataMsg::Data(buf(&[0xAA])));
+            let result = rig.control.dispatcher(1).unwrap().try_send_data(buf(&[0xAA]));
             match result {
                 Ok(()) => queued += 1,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    panic!("stream reader unexpectedly closed")
-                }
+                Err(_) => break,
             }
         }
         assert!(queued > 0);
@@ -1474,7 +1497,7 @@ mod reassembly_tests {
         let (tx, mut local_rx) = stream_read_data_channel();
         let (local_id, _write_tx) = rig
             .control
-            .open(tx, WriteBrokenPipe::new(), None)
+            .open(StreamDispatcher::new(tx), WriteBrokenPipe::new(), None)
             .await
             .unwrap();
         assert!(rig.control.is_local_opened_stream(local_id));

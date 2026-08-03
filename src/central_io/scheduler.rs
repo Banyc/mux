@@ -288,7 +288,11 @@ impl From<StreamWriteDataTx> for PollStreamWriteDataTx {
     }
 }
 impl PollStreamWriteDataTx {
-    pub fn poll_preserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), DeadCentralIo>> {
+    /// Reserve capacity on the fair queue before sending.  Probes the queue
+    /// for a free slot without consuming it; the reserved slot is used by the
+    /// subsequent `send_item`.  Preserves the error from the fair queue so the
+    /// caller can distinguish a closed central I/O from a full queue.
+    pub(crate) fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), DeadCentralIo>> {
         self.tx
             .poll_reserve(cx)
             .map_err(|_| DeadCentralIo { side: Side::Write })
