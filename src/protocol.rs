@@ -197,6 +197,14 @@ fn offset_less(a: Offset, b: Offset) -> bool {
 
 #[cfg(test)]
 #[test]
+fn test_header_decode_rejects_reserved_codes() {
+    for b in 5u8..=255 {
+        assert!(Header::decode([b]).is_none(), "reserved header byte {b} must not decode");
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn test_data_header() {
     let h = DataHeader {
         stream_id: 1,
