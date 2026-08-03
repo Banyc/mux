@@ -524,7 +524,7 @@ pub struct Token(pub usize);
 
 #[cfg(test)]
 mod tests {
-    use std::{task::Waker, time::Duration};
+    use std::task::Waker;
 
     use super::*;
 
@@ -537,7 +537,6 @@ mod tests {
                 let sender = opener.open(0).await.unwrap();
                 sender.send(1).await.unwrap();
             });
-            tokio::time::sleep(Duration::from_millis(100)).await;
             let (token_1, res) = receiver.recv().await.unwrap();
             match res {
                 ReceiverRecv::Open(value) => assert_eq!(value, 0),
