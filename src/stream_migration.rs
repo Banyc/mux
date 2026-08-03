@@ -22,7 +22,9 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt, io,
+    future::Future,
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -738,6 +740,37 @@ impl AsyncRead for SplicedReader {
 // spawn_splice_driver — owns the SpliceRegistry + queue feeding
 // ---------------------------------------------------------------------------
 
+static SPLICE_DRIVER_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of times the splice driver task has panicked since process start.
+/// The detached driver is spawned through [`spawn_panic_guarded`], which
+/// increments this counter on panic so a crash is observable instead of
+/// being silently swallowed.
+pub(crate) fn splice_driver_panics() -> usize {
+    SPLICE_DRIVER_PANIC_COUNT.load(Ordering::SeqCst)
+}
+
+/// Spawn a detached background task through a panic-counter guard: if the
+/// inner task panics, the wrapper increments [`SPLICE_DRIVER_PANIC_COUNT`]
+/// and re-raises the panic so it aborts the wrapper task too.
+fn spawn_panic_guarded<F, T>(fut: F) -> tokio::task::JoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let inner = tokio::spawn(fut);
+        match inner.await {
+            Ok(output) => output,
+            Err(join_err) => {
+                SPLICE_DRIVER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(error = ?join_err, "splice driver task panicked");
+                std::panic::resume_unwind(join_err.into_panic())
+            }
+        }
+    })
+}
+
 /// Spawn a background task that reads continuation readers from a
 /// channel and dispatches them into the [`SpliceRegistry`], feeding
 /// successor generations into the matching [`SplicedReader`]'s queue.
@@ -750,7 +783,7 @@ pub fn spawn_splice_driver(
     mut cont_rx: tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
     gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
 ) -> tokio::task::JoinHandle<Result<(), MigrationError>> {
-    tokio::spawn(async move {
+    spawn_panic_guarded(async move {
         let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
@@ -2305,5 +2338,22 @@ mod tests {
         let (c_over, _s_over) = duplex(1);
         let result = registry.dispatch(hdr(MAX_SPLICE_STREAMS as u64, 0, false), c_over);
         assert!(matches!(result, Err(MigrationError::TooManySpliceStreams)));
+    }
+
+    // -------------------------------------------------------------------
+    // Fix: the splice driver's detached spawn is panic-counter guarded, so
+    // a panic is observable through `splice_driver_panics()` instead of
+    // being silently swallowed.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn splice_driver_panic_increments_panic_counter() {
+        let before = splice_driver_panics();
+        let handle = spawn_panic_guarded(async { panic!("intentional splice driver panic") });
+        let err = handle
+            .await
+            .expect_err("the guarded task must re-raise its panic");
+        assert!(err.is_panic(), "the re-raised join error must be a panic");
+        assert_eq!(splice_driver_panics(), before + 1);
     }
 }

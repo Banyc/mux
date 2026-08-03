@@ -2,6 +2,7 @@ use tokio::sync::mpsc;
 
 use crate::stream_migration::{
     GenerationReader, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader, spawn_splice_driver,
+    splice_driver_panics,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,10 @@ impl SpliceFeed {
     }
 
     pub(crate) fn abort(&self) {
+        let panics = splice_driver_panics();
+        if panics != 0 {
+            tracing::warn!(panics, "splice driver has panicked since the feed started");
+        }
         self.driver.abort();
         self.matcher.abort();
     }
