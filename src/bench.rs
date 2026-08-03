@@ -182,7 +182,7 @@ mod benches {
         bench_send_recv(bencher, a, b);
     }
     #[test]
-    #[ignore]
+    #[ignore = "manual profiling loop that never terminates; run explicitly to capture a CPU profile"]
     fn profile_mux_send() {
         let mut spawner = JoinSet::new();
         let (mut a, b) = get_mux_pair(&mut spawner);
