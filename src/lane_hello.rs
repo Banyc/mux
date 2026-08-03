@@ -1,3 +1,4 @@
+//! Lane pairing protocol: Latest-only protocol, stale peer = attacker, lockstep deploy.
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
