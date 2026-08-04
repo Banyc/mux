@@ -147,10 +147,9 @@ mod tests {
     async fn truncation_fails_gracefully_at_every_byte_boundary() {
         let (full, class, nonce, group) = valid_hello();
         // A full valid packet decodes fine.
-        let (got_class, got_nonce, got_group) =
-            read_lane_hello(&mut Cursor::new(&full[..]))
-                .await
-                .expect("a full valid hello must parse");
+        let (got_class, got_nonce, got_group) = read_lane_hello(&mut Cursor::new(&full[..]))
+            .await
+            .expect("a full valid hello must parse");
         assert_eq!(got_class, class);
         assert_eq!(got_nonce, nonce);
         assert_eq!(got_group, group);
@@ -173,8 +172,7 @@ mod tests {
         write_lane_hello(&mut buf, LaneClass::Bulk, nonce, group)
             .await
             .unwrap();
-        let (class, got_nonce, got_group) =
-            read_lane_hello(&mut Cursor::new(&buf)).await.unwrap();
+        let (class, got_nonce, got_group) = read_lane_hello(&mut Cursor::new(&buf)).await.unwrap();
         assert_eq!(class, LaneClass::Bulk);
         assert_eq!(got_nonce, nonce);
         assert_eq!(got_group, group);

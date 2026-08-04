@@ -1,8 +1,8 @@
 use tokio::sync::mpsc;
 
 use crate::stream_migration::{
-    GenerationReader, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader, spawn_splice_driver,
-    splice_driver_panics,
+    GenerationReader, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader,
+    spawn_splice_driver, splice_driver_panics,
 };
 
 #[derive(Debug, Clone)]
@@ -20,7 +20,10 @@ impl SpliceFeedHandle {
         self.cont_tx.send((header, reader)).map_err(|_| ())
     }
 
-    pub(crate) fn expect_gen0(&self, logical_id: u64) -> tokio::sync::oneshot::Receiver<SplicedReader> {
+    pub(crate) fn expect_gen0(
+        &self,
+        logical_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.register_tx.send((logical_id, tx));
         rx

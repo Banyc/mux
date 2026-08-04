@@ -30,13 +30,12 @@ pub use dual_lane::{
     spawn_dual_mux_acceptor, spawn_dual_mux_connector, spawn_dual_mux_paired_supervised,
     write_birth_heartbeat,
 };
-pub use lane_hello::{
-    GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello,
-};
-pub use reassembly::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use dual_message::{
     DEFAULT_MAX_INFLIGHT_MESSAGES, DEFAULT_MAX_MESSAGE_LEN, DEFAULT_REORDER_CAP, DeliveryMode,
     DualMessageReceiver, DualMessageSender, RecvError, SendError,
+};
+pub use lane_hello::{
+    GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello,
 };
 pub use migrating::{
     AUTO_BULK_THRESHOLD as MIGRATING_AUTO_BULK_THRESHOLD, AcceptedStream, ClientSplicedReader,
@@ -44,6 +43,7 @@ pub use migrating::{
     ResponseRouterHandle, StreamName, spawn_response_router,
 };
 pub use protocol::Offset;
+pub use reassembly::{REASSEMBLY_MAX_BUFFERED_BYTES, REASSEMBLY_MAX_RANGE_BYTES};
 pub use serve::{
     MuxConfig, MuxError, spawn_mux_no_reconnection,
     spawn_mux_no_reconnection_with_first_receive_deadline,

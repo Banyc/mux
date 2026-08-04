@@ -7,7 +7,9 @@ use std::{
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    central_io::scheduler::{StreamWriteData, WriteControlMsg, WriteControlRx, WriteDataMsg, WriteDataRx},
+    central_io::scheduler::{
+        StreamWriteData, WriteControlMsg, WriteControlRx, WriteDataMsg, WriteDataRx,
+    },
     control::DeadControl,
     protocol::{
         BodyLen, CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId, StreamIdMsg,

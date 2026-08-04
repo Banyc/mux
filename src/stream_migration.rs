@@ -21,8 +21,9 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    fmt, io,
+    fmt,
     future::Future,
+    io,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, ready},
@@ -572,11 +573,7 @@ impl SplicedReader {
         self
     }
 
-    pub fn with_cleanup(
-        mut self,
-        tx: tokio::sync::mpsc::Sender<(u64, u64)>,
-        token: u64,
-    ) -> Self {
+    pub fn with_cleanup(mut self, tx: tokio::sync::mpsc::Sender<(u64, u64)>, token: u64) -> Self {
         self.cleanup_tx = Some(tx);
         self.cleanup_token = token;
         self
@@ -788,7 +785,8 @@ pub fn spawn_splice_driver(
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
         let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
-        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
+        let (cleanup_tx, mut cleanup_rx) =
+            tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
         let mut next_incarnation: u64 = 1;
         fn flush_contiguous(
             registry: &mut SpliceRegistry,

@@ -11,11 +11,7 @@ use tokio::time::Instant;
 use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
-    central_io::DataBuf,
-    common::Side,
-    control::DeadControl,
-    fair_queue,
-    protocol::StreamId,
+    central_io::DataBuf, common::Side, control::DeadControl, fair_queue, protocol::StreamId,
     traffic_class::LatencyControl,
 };
 

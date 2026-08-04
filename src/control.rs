@@ -290,7 +290,11 @@ async fn open_stream(
     let write_broken_pipe = WriteBrokenPipe::new();
     let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
     let (stream_id, stream_write_data_tx) = control
-        .open(StreamDispatcher::new(stream_read_data_tx), write_broken_pipe.clone(), stream_id)
+        .open(
+            StreamDispatcher::new(stream_read_data_tx),
+            write_broken_pipe.clone(),
+            stream_id,
+        )
         .await?;
     let stream_reader = StreamReader::new(
         stream_read_data_rx,
@@ -481,7 +485,9 @@ impl MuxControl {
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             stream.is_peer_write_closed = true;
-            stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
+            stream
+                .read_dispatcher
+                .try_send_terminal(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -510,7 +516,9 @@ impl MuxControl {
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
+            stream
+                .read_dispatcher
+                .try_send_terminal(StreamReadDataMsg::Fin);
         }
         Ok(())
     }
@@ -584,7 +592,8 @@ impl StreamState {
                     return;
                 }
                 self.is_peer_write_closed = true;
-                self.read_dispatcher.try_send_terminal(StreamReadDataMsg::Fin);
+                self.read_dispatcher
+                    .try_send_terminal(StreamReadDataMsg::Fin);
             }
         }
     }
@@ -748,7 +757,10 @@ mod reassembly_tests {
     async fn open_test_stream(control: &mut MuxControl, stream_id: StreamId) -> StreamReadDataRx {
         let (tx, rx) = stream_read_data_channel();
         let bp = WriteBrokenPipe::new();
-        control.open(StreamDispatcher::new(tx), bp, Some(stream_id)).await.unwrap();
+        control
+            .open(StreamDispatcher::new(tx), bp, Some(stream_id))
+            .await
+            .unwrap();
         rx
     }
 
@@ -759,7 +771,11 @@ mod reassembly_tests {
         let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
         let mut queued = 0;
         loop {
-            let result = rig.control.dispatcher(1).unwrap().try_send_data(buf(&[0xAA]));
+            let result = rig
+                .control
+                .dispatcher(1)
+                .unwrap()
+                .try_send_data(buf(&[0xAA]));
             match result {
                 Ok(()) => queued += 1,
                 Err(_) => break,

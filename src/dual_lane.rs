@@ -19,7 +19,9 @@ use tokio::{
 
 use crate::{
     StreamAccepter, StreamReader,
-    lane_hello::{GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello},
+    lane_hello::{
+        GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello,
+    },
     protocol::Header,
     serve::{MuxConfig, MuxError, spawn_mux_no_reconnection},
     stream::{
@@ -643,7 +645,9 @@ pub fn spawn_dual_mux_paired_supervised(
     let liveness = Liveness::new();
     let killer = liveness.clone();
     supervisor.spawn(async move {
-        killer.watch_dual_lanes(interactive_spawner, bulk_spawner).await
+        killer
+            .watch_dual_lanes(interactive_spawner, bulk_spawner)
+            .await
     });
     let opener = DualStreamOpener::new(interactive_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(interactive_accepter, bulk_accepter, liveness);
@@ -690,9 +694,7 @@ where
         spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
     let liveness = Liveness::new();
     let killer = liveness.clone();
-    spawner.spawn(async move {
-        killer.watch_dual_lanes(int_spawner, bulk_spawner).await
-    });
+    spawner.spawn(async move { killer.watch_dual_lanes(int_spawner, bulk_spawner).await });
     let opener = DualStreamOpener::new(int_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_accepter, bulk_accepter, liveness);
     Ok((opener, accepter))
