@@ -2,6 +2,12 @@ use std::io::{self, Read, Write};
 
 pub type StreamId = u32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    Read,
+    Write,
+}
+
 #[derive(Debug, Clone)]
 pub enum Header {
     Heartbeat,

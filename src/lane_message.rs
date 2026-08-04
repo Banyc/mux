@@ -57,23 +57,25 @@ pub enum DeliveryMode {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub enum SendError {
+pub enum MessageSendError {
     PayloadTooLarge,
     SemaphoreClosed,
     WriteFailed,
 }
 
-impl fmt::Display for SendError {
+impl fmt::Display for MessageSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SendError::PayloadTooLarge => write!(f, "payload exceeds maximum message length"),
-            SendError::SemaphoreClosed => write!(f, "sender has been closed"),
-            SendError::WriteFailed => write!(f, "write to stream failed"),
+            MessageSendError::PayloadTooLarge => {
+                write!(f, "payload exceeds maximum message length")
+            }
+            MessageSendError::SemaphoreClosed => write!(f, "sender has been closed"),
+            MessageSendError::WriteFailed => write!(f, "write to stream failed"),
         }
     }
 }
 
-impl std::error::Error for SendError {}
+impl std::error::Error for MessageSendError {}
 
 #[derive(Debug, Clone)]
 pub enum RecvError {
@@ -133,16 +135,16 @@ impl DualMessageSender {
     /// Send one message. Acquires an in-flight permit (backpressure),
     /// opens a fresh `open_auto` stream, writes the frame, and shuts
     /// the stream.
-    pub async fn send(&self, payload: &[u8]) -> Result<(), SendError> {
+    pub async fn send(&self, payload: &[u8]) -> Result<(), MessageSendError> {
         if payload.len() > self.max_message_len {
-            return Err(SendError::PayloadTooLarge);
+            return Err(MessageSendError::PayloadTooLarge);
         }
 
         let permit = self
             .semaphore
             .acquire()
             .await
-            .map_err(|_| SendError::SemaphoreClosed)?;
+            .map_err(|_| MessageSendError::SemaphoreClosed)?;
 
         let seq = if matches!(self.mode, DeliveryMode::Ordered) {
             Some(self.next_seq.fetch_add(1, Ordering::Relaxed))
@@ -172,9 +174,9 @@ impl DualMessageSender {
             let n = writer
                 .write_vectored(bufs)
                 .await
-                .map_err(|_| SendError::WriteFailed)?;
+                .map_err(|_| MessageSendError::WriteFailed)?;
             if n == 0 {
-                return Err(SendError::WriteFailed);
+                return Err(MessageSendError::WriteFailed);
             }
             if n < header_remaining.len() {
                 header_remaining = &header_remaining[n..];
@@ -266,10 +268,10 @@ impl DualMessageReceiver {
     /// dead and all pending read tasks are drained.
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, RecvError> {
         loop {
-            if matches!(self.mode, DeliveryMode::Ordered) {
-                if let Some(payload) = self.pop_ordered() {
-                    return Ok(Some(payload));
-                }
+            if matches!(self.mode, DeliveryMode::Ordered)
+                && let Some(payload) = self.pop_ordered()
+            {
+                return Ok(Some(payload));
             }
 
             if self.accepter_dead && self.inflight == 0 {
@@ -426,7 +428,7 @@ mod tests {
         DualStreamAccepter, DualStreamOpener,
         control::Initiation,
         dual_lane::Liveness,
-        serve::{MuxConfig, spawn_mux_no_reconnection},
+        session::{MuxConfig, spawn_mux_no_reconnection},
     };
     use std::time::Duration;
     use tokio::io::duplex;
@@ -442,8 +444,8 @@ mod tests {
     async fn paired_sessions() -> (
         DualStreamOpener,
         DualStreamAccepter,
-        JoinSet<crate::serve::MuxError>,
-        JoinSet<crate::serve::MuxError>,
+        JoinSet<crate::session::MuxError>,
+        JoinSet<crate::session::MuxError>,
     ) {
         let (int_c2s, int_s2c) = duplex(32768);
         let (bulk_c2s, bulk_s2c) = duplex(32768);
@@ -490,7 +492,7 @@ mod tests {
         srv_spawner.spawn(async move {
             let _ = srv_int.join_next().await;
             let _ = srv_bulk.join_next().await;
-            crate::serve::MuxError::TaskStopped {
+            crate::session::MuxError::TaskStopped {
                 task: "test_session",
             }
         });
@@ -498,7 +500,7 @@ mod tests {
         cli_spawner.spawn(async move {
             let _ = cli_int.join_next().await;
             let _ = cli_bulk.join_next().await;
-            crate::serve::MuxError::TaskStopped {
+            crate::session::MuxError::TaskStopped {
                 task: "test_session",
             }
         });
@@ -626,7 +628,7 @@ mod tests {
 
         let too_big = vec![0u8; 2048];
         let result = tx.send(&too_big).await;
-        assert!(matches!(result, Err(SendError::PayloadTooLarge)));
+        assert!(matches!(result, Err(MessageSendError::PayloadTooLarge)));
     }
 
     // -------------------------------------------------------------------

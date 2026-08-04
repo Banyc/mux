@@ -4,10 +4,9 @@ use primitive::arena::obj_pool::ArcObjPool;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use crate::{
-    common::Side,
     control::DeadControl,
     protocol::{
-        CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, StreamId, StreamIdMsg,
+        CloseWriteExtMsg, DataHeader, DataHeaderExt, Header, Offset, Side, StreamId, StreamIdMsg,
     },
 };
 

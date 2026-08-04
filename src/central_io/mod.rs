@@ -1,6 +1,6 @@
 use primitive::arena::obj_pool::ObjScoped;
 
-use crate::common::Side;
+use crate::protocol::Side;
 
 pub mod encoder;
 pub mod reader;

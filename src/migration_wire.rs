@@ -255,7 +255,7 @@ impl GenerationChain {
 
     /// Whether generation 0 has never been started — the stream was never
     /// announced to the peer.
-    pub fn is_unannounced(&self) -> bool {
+    pub fn never_opened(&self) -> bool {
         self.next_generation == 0
     }
 
@@ -309,12 +309,14 @@ impl StreamEntry {
     }
 }
 
+/// orphan = successor generation that arrived before its gen-0.
 struct OrphanEntry {
     header: ResumeHeader,
     reader: GenerationReader,
     deadline: Instant,
 }
 
+/// splice = concatenate generations, unrelated to splice (2).
 pub struct SpliceRegistry {
     streams: HashMap<u64, StreamEntry>,
     successor_deadline: Duration,
@@ -524,7 +526,7 @@ pub struct SplicedReader {
     successor_timer: Option<Pin<Box<Sleep>>>,
     successor_deadline: Duration,
     cleanup_tx: Option<tokio::sync::mpsc::Sender<(u64, u64)>>,
-    cleanup_token: u64,
+    incarnation: u64,
     is_closed: bool,
     finished: bool,
 }
@@ -542,7 +544,7 @@ impl fmt::Debug for SplicedReader {
 impl Drop for SplicedReader {
     fn drop(&mut self) {
         if let Some(tx) = &self.cleanup_tx {
-            let _ = tx.try_send((self.logical_id, self.cleanup_token));
+            let _ = tx.try_send((self.logical_id, self.incarnation));
         }
     }
 }
@@ -557,7 +559,7 @@ impl SplicedReader {
             successor_timer: None,
             successor_deadline: DEFAULT_SUCCESSOR_DEADLINE,
             cleanup_tx: None,
-            cleanup_token: 0,
+            incarnation: 0,
             is_closed,
             finished: false,
         }
@@ -573,9 +575,13 @@ impl SplicedReader {
         self
     }
 
-    pub fn with_cleanup(mut self, tx: tokio::sync::mpsc::Sender<(u64, u64)>, token: u64) -> Self {
+    pub fn with_cleanup(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<(u64, u64)>,
+        incarnation: u64,
+    ) -> Self {
         self.cleanup_tx = Some(tx);
-        self.cleanup_token = token;
+        self.incarnation = incarnation;
         self
     }
 
@@ -584,17 +590,17 @@ impl SplicedReader {
         rx: tokio::sync::mpsc::Receiver<(bool, GenerationReader)>,
         successor_deadline: Duration,
         cleanup_tx: tokio::sync::mpsc::Sender<(u64, u64)>,
-        cleanup_token: u64,
+        incarnation: u64,
     ) -> Self {
         self.queue_rx = Some(rx);
         self.successor_deadline = successor_deadline;
         self.cleanup_tx = Some(cleanup_tx);
-        self.cleanup_token = cleanup_token;
+        self.incarnation = incarnation;
         self
     }
 
     /// Whether a FINAL marker has been received for this stream.
-    pub fn is_closed(&self) -> bool {
+    pub fn has_final_marker(&self) -> bool {
         self.is_closed
     }
 
@@ -784,7 +790,7 @@ pub fn spawn_splice_driver(
         let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
-        let mut cleanup_tokens: HashMap<u64, u64> = HashMap::new();
+        let mut incarnations: HashMap<u64, u64> = HashMap::new();
         let (cleanup_tx, mut cleanup_rx) =
             tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
         let mut next_incarnation: u64 = 1;
@@ -827,12 +833,12 @@ pub fn spawn_splice_driver(
         fn cleanup_all(
             logical_id: u64,
             queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
-            cleanup_tokens: &mut HashMap<u64, u64>,
+            incarnations: &mut HashMap<u64, u64>,
             next_to_flush: &mut HashMap<u64, u32>,
             registry: &mut SpliceRegistry,
         ) {
             queues.remove(&logical_id);
-            cleanup_tokens.remove(&logical_id);
+            incarnations.remove(&logical_id);
             next_to_flush.remove(&logical_id);
             registry.remove_stream(logical_id);
         }
@@ -850,7 +856,7 @@ pub fn spawn_splice_driver(
                             | MigrationError::TooManyOrphans
                             | MigrationError::TooManySpliceStreams) => continue,
                         Err(MigrationError::TooManyPendingGenerations) => {
-                            cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
+                            cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -860,7 +866,7 @@ pub fn spawn_splice_driver(
                             if is_gen0 {
                                 if is_final {
                                     registry.remove_stream(logical_id);
-                                    cleanup_tokens.remove(&logical_id);
+                                    incarnations.remove(&logical_id);
                                     let _ = gen0_tx.send((logical_id, Some(spliced)));
                                 } else {
                                     let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
@@ -874,11 +880,11 @@ pub fn spawn_splice_driver(
                                         token,
                                     );
                                     queues.insert(logical_id, queue_tx.clone());
-                                    cleanup_tokens.insert(logical_id, token);
+                                    incarnations.insert(logical_id, token);
                                     next_to_flush.insert(logical_id, 1);
                                     let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
                                     if gen0_tx.send((logical_id, Some(spliced))).is_err() || reached_final {
-                                        cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
+                                        cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                                     }
                                 }
                             }
@@ -890,20 +896,18 @@ pub fn spawn_splice_driver(
                             if let Some(queue_tx) = queues.get(&logical_id).cloned() {
                                 let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
                                 if reached_final {
-                                    cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
+                                    cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                                 }
                             }
                         }
                     }
                 }
                 cleanup = cleanup_rx.recv() => {
-                    if let Some((logical_id, token)) = cleanup {
-                        if let Some(&current_token) = cleanup_tokens.get(&logical_id) {
-                            if current_token == token {
-                                cleanup_all(logical_id, &mut queues, &mut cleanup_tokens, &mut next_to_flush, &mut registry);
+                    if let Some((logical_id, token)) = cleanup
+                        && let Some(&current_token) = incarnations.get(&logical_id)
+                            && current_token == token {
+                                cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                             }
-                        }
-                    }
                 }
             }
         }
@@ -1921,7 +1925,10 @@ mod tests {
         cont_tx.send((h_final, Box::pin(c_final))).unwrap();
 
         let (_, old_reader) = expect_gen0_reader(gen0_rx.recv().await);
-        assert!(old_reader.is_closed(), "gen0 FINAL reader must be closed");
+        assert!(
+            old_reader.has_final_marker(),
+            "gen0 FINAL reader must be closed"
+        );
 
         let (c_reuse, mut s_reuse) = duplex(64);
         let h_reuse = ResumeHeader {

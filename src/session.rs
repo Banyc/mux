@@ -9,17 +9,17 @@ use tokio::{
 use crate::{
     StreamAccepter,
     central_io::{
-        encoder::{CentralIoWriter, RunCentralIoWriterError, run_central_io_writer},
+        encoder::{CentralIoEncoder, RunCentralIoWriterError, run_central_io_writer},
         reader::{
             CentralIoReader, RunCentralIoReaderError, central_io_read_channel,
             run_central_io_reader,
         },
         scheduler::{write_control_channel, write_data_channel},
     },
-    common::Side,
     control::{Initiation, MuxControl, RunControlArgs, RunControlError, run_control},
+    protocol::Side,
     stream::{
-        StreamInitHandle,
+        StreamInitChannels,
         accepter::stream_accept_channel,
         opener::{StreamOpener, stream_open_channel},
     },
@@ -56,7 +56,7 @@ pub enum MuxError {
     IoReader(io::Error),
     IoWriter(io::Error),
     DualLane {
-        lane: crate::lane_hello::LaneClass,
+        lane: crate::traffic_class::LaneClass,
         peer_lane_aborted: bool,
         source: Box<MuxError>,
     },
@@ -76,49 +76,49 @@ pub fn spawn_mux_no_reconnection<R, W>(
     io_reader: R,
     io_writer: W,
     config: MuxConfig,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    async fn nah<R, W>() -> Option<(R, W)> {
+    async fn never_reconnect<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
     #[expect(unused_assignments)]
-    let mut reconnect = Some(nah);
+    let mut reconnect = Some(never_reconnect);
     reconnect = None;
-    spawn_mux(io_reader, io_writer, config, reconnect, spawner, None, None)
+    spawn_mux(io_reader, io_writer, config, reconnect, tasks, None, None)
 }
 
 /// Like [`spawn_mux_no_reconnection`] but enforces a shorter
 /// `first_receive_deadline` until the first frame arrives, then
 /// switches to the steady receive deadline derived from the
-/// heartbeat interval. Use [`crate::write_birth_heartbeat`] on the
+/// heartbeat interval. Use [`crate::write_liveness_heartbeat`] on the
 /// paired transport to prove lane liveness before any app data flows.
 pub fn spawn_mux_no_reconnection_with_first_receive_deadline<R, W>(
     io_reader: R,
     io_writer: W,
     config: MuxConfig,
     first_receive_deadline: Duration,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    async fn nah<R, W>() -> Option<(R, W)> {
+    async fn never_reconnect<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
     #[expect(unused_assignments)]
-    let mut reconnect = Some(nah);
+    let mut reconnect = Some(never_reconnect);
     reconnect = None;
     spawn_mux(
         io_reader,
         io_writer,
         config,
         reconnect,
-        spawner,
+        tasks,
         Some(first_receive_deadline),
         None,
     )
@@ -132,17 +132,17 @@ pub fn spawn_mux_no_reconnection_with_first_receive_deadline_and_ready<R, W>(
     io_writer: W,
     config: MuxConfig,
     deadline: Duration,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter, oneshot::Receiver<()>)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    async fn nah<R, W>() -> Option<(R, W)> {
+    async fn never_reconnect<R, W>() -> Option<(R, W)> {
         unreachable!()
     }
     #[expect(unused_assignments)]
-    let mut reconnect = Some(nah);
+    let mut reconnect = Some(never_reconnect);
     reconnect = None;
     let (ready_tx, ready_rx) = oneshot::channel();
     let (opener, accepter) = spawn_mux(
@@ -150,7 +150,7 @@ where
         io_writer,
         config,
         reconnect,
-        spawner,
+        tasks,
         Some(deadline),
         Some(ready_tx),
     );
@@ -161,7 +161,7 @@ pub fn spawn_mux_with_reconnection<R, W, ReconnectFut>(
     io_writer: W,
     config: MuxConfig,
     reconnect: impl FnMut() -> ReconnectFut + Send + 'static,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
 ) -> (StreamOpener, StreamAccepter)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -173,7 +173,7 @@ where
         io_writer,
         config,
         Some(reconnect),
-        spawner,
+        tasks,
         None,
         None,
     )
@@ -183,7 +183,7 @@ fn spawn_mux<R, W, ReconnectFut>(
     io_writer: W,
     config: MuxConfig,
     reconnect: Option<impl FnMut() -> ReconnectFut + Send + 'static>,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
     first_receive_deadline: Option<Duration>,
     ready_tx: Option<oneshot::Sender<()>>,
 ) -> (StreamOpener, StreamAccepter)
@@ -196,12 +196,12 @@ where
     let (stream_accept_tx, stream_accept_rx) = stream_accept_channel();
     let stream_opener = StreamOpener::new(stream_open_tx);
     let stream_accepter = StreamAccepter::new(stream_accept_rx);
-    let stream_init_handle = StreamInitHandle {
+    let stream_init_handle = StreamInitChannels {
         stream_open_rx,
         stream_accept_tx,
     };
-    spawner.spawn(async move {
-        let (stream_init_handle, err) = run_services(
+    tasks.spawn(async move {
+        let (stream_init_handle, err) = run_session_tasks(
             io_reader,
             io_writer,
             &config,
@@ -221,7 +221,7 @@ where
             let Some((io_reader, io_writer)) = reconnect().await else {
                 return last_err;
             };
-            let (stream_init_handle, err) = run_services(
+            let (stream_init_handle, err) = run_session_tasks(
                 io_reader,
                 io_writer,
                 &config,
@@ -240,14 +240,14 @@ where
     (stream_opener, stream_accepter)
 }
 
-async fn run_services<R, W>(
+async fn run_session_tasks<R, W>(
     io_reader: R,
     io_writer: W,
     config: &MuxConfig,
-    stream_init_handle: StreamInitHandle,
+    stream_init_handle: StreamInitChannels,
     first_receive_deadline: Option<Duration>,
     ready_tx: Option<oneshot::Sender<()>>,
-) -> (Option<StreamInitHandle>, MuxError)
+) -> (Option<StreamInitChannels>, MuxError)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -286,7 +286,7 @@ where
     });
     let mut central_io_writer_spawner = JoinSet::new();
     central_io_writer_spawner.spawn(async move {
-        let central_io_writer = CentralIoWriter::new(io_writer, frame_reassembly);
+        let central_io_writer = CentralIoEncoder::new(io_writer, frame_reassembly);
         run_central_io_writer(
             central_io_writer,
             heartbeat_interval,
@@ -424,7 +424,7 @@ mod tests {
 
     // Regression test for the supervision panic on cancellation.
     //
-    // Before the fix, `run_services` (and `build_opener` in the proxy)
+    // Before the fix, `run_session_tasks` (and `build_opener` in the proxy)
     // unwrapped the `JoinSet::join_next` result, which is an `Err` of kind
     // `JoinError::Cancelled` when the task is aborted via `abort_all`.
     // A normal shutdown/reset cancels child tasks, so the old supervisor
@@ -530,15 +530,15 @@ mod tests {
                 }
             }
         };
-        let mut spawner: JoinSet<MuxError> = JoinSet::new();
+        let mut tasks: JoinSet<MuxError> = JoinSet::new();
         let (_opener, _accepter) = spawn_mux_with_reconnection(
             first,
             tokio::io::sink(),
             MuxConfig::new(Initiation::Client, Duration::from_secs(5)),
             reconnect,
-            &mut spawner,
+            &mut tasks,
         );
-        let err = tokio::time::timeout(Duration::from_secs(10), spawner.join_next())
+        let err = tokio::time::timeout(Duration::from_secs(10), tasks.join_next())
             .await
             .expect("the mux task never finished")
             .expect("the mux task disappeared")

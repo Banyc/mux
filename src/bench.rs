@@ -79,7 +79,7 @@ mod benches {
         (a, b)
     }
     fn get_mux_pair(
-        spawner: &mut JoinSet<MuxError>,
+        tasks: &mut JoinSet<MuxError>,
     ) -> (
         DuplexStream<StreamReader, StreamWriter>,
         DuplexStream<StreamReader, StreamWriter>,
@@ -92,14 +92,14 @@ mod benches {
                 heartbeat_interval: Duration::from_secs(5),
                 frame_reassembly: false,
             };
-            let (opener, _) = spawn_mux_no_reconnection(a_r, a_w, config, spawner);
+            let (opener, _) = spawn_mux_no_reconnection(a_r, a_w, config, tasks);
             let (b_r, b_w) = b.into_split();
             let config = MuxConfig {
                 initiation: Initiation::Client,
                 heartbeat_interval: Duration::from_secs(5),
                 frame_reassembly: false,
             };
-            let (_, mut accepter) = spawn_mux_no_reconnection(b_r, b_w, config, spawner);
+            let (_, mut accepter) = spawn_mux_no_reconnection(b_r, b_w, config, tasks);
             let a = opener.open().await.unwrap();
             let b = accepter.accept().await.unwrap();
             let a = DuplexStream::new(a.0, a.1);
@@ -177,15 +177,15 @@ mod benches {
     }
     #[bench]
     fn bench_mux_send(bencher: &mut Bencher) {
-        let mut spawner = JoinSet::new();
-        let (a, b) = get_mux_pair(&mut spawner);
+        let mut tasks = JoinSet::new();
+        let (a, b) = get_mux_pair(&mut tasks);
         bench_send_recv(bencher, a, b);
     }
     #[test]
     #[ignore = "manual profiling loop that never terminates; run explicitly to capture a CPU profile"]
     fn profile_mux_send() {
-        let mut spawner = JoinSet::new();
-        let (mut a, b) = get_mux_pair(&mut spawner);
+        let mut tasks = JoinSet::new();
+        let (mut a, b) = get_mux_pair(&mut tasks);
         let mut b = Some(b);
         loop {
             send_recv(&mut a, &mut b);

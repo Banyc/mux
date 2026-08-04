@@ -11,7 +11,10 @@ use tokio::time::Instant;
 use primitive::arena::obj_pool::ArcObjPool;
 
 use crate::{
-    central_io::DataBuf, common::Side, control::DeadControl, fair_queue, protocol::StreamId,
+    central_io::DataBuf,
+    control::DeadControl,
+    fair_queue,
+    protocol::{Side, StreamId},
     traffic_class::LatencyControl,
 };
 
@@ -20,7 +23,7 @@ use super::DeadCentralIo;
 const CONTROL_CHANNEL_SIZE: usize = 1024;
 const SPLIT_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
-const DATA_EXTREME_CAP: usize = 1200;
+const DATA_CONTENDED_CAP: usize = 1200;
 const DATA_MEDIUM_CAP: usize = crate::traffic_class::BULK_THRESHOLD;
 pub(crate) const DATA_BULK_CAP: usize = 32 * 1024;
 
@@ -35,14 +38,14 @@ pub enum StreamWriteData {
     Fin,
     Data(DataBuf),
 }
-pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
+pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
     let (tx, rx) = fair_queue::channel();
-    let tx = WriteDataTxPrototype { opener: tx };
+    let tx = WriteDataTxFactory { opener: tx };
     let rx = WriteDataRx {
         rx,
         token_to_stream: HashMap::new(),
         heads: BTreeMap::new(),
-        head_pick_start: fair_queue::Token(0),
+        head_pick_start: fair_queue::QueueToken(0),
         rx_closed: false,
         split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
         latency: LatencyControl::new(),
@@ -52,13 +55,13 @@ pub fn write_data_channel() -> (WriteDataTxPrototype, WriteDataRx) {
 #[derive(Debug)]
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
-    token_to_stream: HashMap<fair_queue::Token, StreamId>,
+    token_to_stream: HashMap<fair_queue::QueueToken, StreamId>,
     /// At most one cached message per stream/token. The token maps to a
     /// `HeadEntry` (the logical stream message plus a read offset into its
     /// Data payload) ready to be dispatched.
-    heads: BTreeMap<fair_queue::Token, HeadEntry>,
+    heads: BTreeMap<fair_queue::QueueToken, HeadEntry>,
     /// Round-robin cursor for selecting among cached heads.
-    head_pick_start: fair_queue::Token,
+    head_pick_start: fair_queue::QueueToken,
     /// Set once the underlying fair-queue receiver reports closure.
     rx_closed: bool,
     /// Pool for prefix buffers produced by splitting a large Data head.
@@ -139,13 +142,13 @@ impl WriteDataRx {
         }
         let chosen = self.pick_head();
         let (_, mut entry) = self.heads.remove_entry(&chosen).unwrap();
-        self.head_pick_start = fair_queue::Token(chosen.0.wrapping_add(1));
+        self.head_pick_start = fair_queue::QueueToken(chosen.0.wrapping_add(1));
         if let StreamWriteData::Data(ref data) = entry.msg.data {
             let cap = if self.latency.any_latency_sensitive() {
                 if self.heads.is_empty() {
                     DATA_MEDIUM_CAP
                 } else {
-                    DATA_EXTREME_CAP
+                    DATA_CONTENDED_CAP
                 }
             } else {
                 DATA_BULK_CAP
@@ -154,7 +157,7 @@ impl WriteDataRx {
                 // Record once at first dispatch, and additionally on every
                 // dispatch for heads whose original length is at least
                 // DATA_BULK_CAP so a sustained bulk transfer accumulates
-                // LATENCY_HISTORY_MIN observations and escapes the small caps
+                // HISTORY_MIN observations and escapes the small caps
                 // mid-transfer. Always use the original message length, never
                 // the capped emit size. (offset == 0 prevents double-counting
                 // a head whose original size is exactly DATA_BULK_CAP; the
@@ -198,9 +201,9 @@ impl WriteDataRx {
     /// `priority_size`: Open = 0, Fin = 0, Data = remaining data length.
     /// Equal-size tie-breaking is round-robin by distance from
     /// `head_pick_start` (with wraparound), not lowest-token-first.
-    fn pick_head(&self) -> fair_queue::Token {
+    fn pick_head(&self) -> fair_queue::QueueToken {
         let start = self.head_pick_start;
-        let mut best: Option<(fair_queue::Token, (usize, usize))> = None;
+        let mut best: Option<(fair_queue::QueueToken, (usize, usize))> = None;
         for (&token, entry) in &self.heads {
             let priority = priority_size(entry);
             let distance = round_robin_distance(start, token);
@@ -225,17 +228,17 @@ fn priority_size(entry: &HeadEntry) -> usize {
 /// Forward cyclic distance from `start` to `token` in a `usize` wraparound
 /// space. Used only as a tie-breaker, so the exact modulus doesn't matter as
 /// long as it is consistent and monotonic in round-robin order.
-fn round_robin_distance(start: fair_queue::Token, token: fair_queue::Token) -> usize {
+fn round_robin_distance(start: fair_queue::QueueToken, token: fair_queue::QueueToken) -> usize {
     let start = start.0;
     let token = token.0;
     token.wrapping_sub(start)
 }
 #[derive(Debug, Clone)]
-pub struct WriteDataTxPrototype {
-    opener: fair_queue::Opener<WriteDataMsg>,
+pub struct WriteDataTxFactory {
+    opener: fair_queue::QueueRegistrar<WriteDataMsg>,
 }
-impl WriteDataTxPrototype {
-    pub async fn derive(
+impl WriteDataTxFactory {
+    pub async fn for_stream(
         &self,
         stream: StreamId,
         wire_open: bool,
@@ -349,8 +352,8 @@ mod tests {
     use primitive::arena::obj_pool::arc_buf_pool;
 
     use super::{
-        DATA_BULK_CAP, DATA_EXTREME_CAP, DATA_MEDIUM_CAP, HeadEntry, StreamWriteData,
-        StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxPrototype, priority_size,
+        DATA_BULK_CAP, DATA_CONTENDED_CAP, DATA_MEDIUM_CAP, HeadEntry, StreamWriteData,
+        StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxFactory, priority_size,
         round_robin_distance, write_data_channel,
     };
     use crate::fair_queue;
@@ -372,7 +375,7 @@ mod tests {
     /// response which is only produced when the receiver is polled, so the
     /// two are driven concurrently.
     async fn open_stream(
-        tx: &WriteDataTxPrototype,
+        tx: &WriteDataTxFactory,
         rx: &mut WriteDataRx,
         stream_id: StreamId,
     ) -> StreamWriteDataTx {
@@ -380,7 +383,7 @@ mod tests {
         let mut got_open = false;
         tokio::join!(
             async {
-                stream = Some(tx.derive(stream_id, false).await.unwrap());
+                stream = Some(tx.for_stream(stream_id, false).await.unwrap());
             },
             async {
                 while !got_open {
@@ -533,13 +536,13 @@ mod tests {
 
     #[test]
     fn round_robin_distance_monotonic_from_start() {
-        let start = fair_queue::Token(5);
-        assert_eq!(round_robin_distance(start, fair_queue::Token(5)), 0);
-        assert_eq!(round_robin_distance(start, fair_queue::Token(6)), 1);
-        assert_eq!(round_robin_distance(start, fair_queue::Token(7)), 2);
+        let start = fair_queue::QueueToken(5);
+        assert_eq!(round_robin_distance(start, fair_queue::QueueToken(5)), 0);
+        assert_eq!(round_robin_distance(start, fair_queue::QueueToken(6)), 1);
+        assert_eq!(round_robin_distance(start, fair_queue::QueueToken(7)), 2);
         assert!(
-            round_robin_distance(start, fair_queue::Token(6))
-                < round_robin_distance(start, fair_queue::Token(7))
+            round_robin_distance(start, fair_queue::QueueToken(6))
+                < round_robin_distance(start, fair_queue::QueueToken(7))
         );
     }
 
@@ -555,7 +558,7 @@ mod tests {
         // Larger than DATA_BULK_CAP so the head is split across multiple
         // dispatches. With a single freshly-opened stream the stream is
         // latency-sensitive by default, so each dispatch is capped at
-        // DATA_QUANTUM.
+        // DATA_MEDIUM_CAP.
         let big_len = DATA_BULK_CAP * 4 + 7;
         let body: Vec<u8> = (0u8..big_len as u8).cycle().take(big_len).collect();
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, body.clone()).await;
@@ -589,7 +592,7 @@ mod tests {
         let stream_b = open_stream(&tx, &mut rx, 2).await;
 
         // A's large head arrives first. A is latency-sensitive (freshly opened,
-        // default class), so the dispatch is capped at DATA_QUANTUM and leaves
+        // default class), so the dispatch is capped at DATA_MEDIUM_CAP and leaves
         // a tail cached under A's token.
         let big_len = DATA_BULK_CAP * 3;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
@@ -662,7 +665,7 @@ mod tests {
     }
 
     /// A freshly opened stream is latency-sensitive by default: a large head
-    /// is split at DATA_QUANTUM (not DATA_BULK_CAP) because no stream has met
+    /// is split at DATA_MEDIUM_CAP (not DATA_BULK_CAP) because no stream has met
     /// the bulk transition condition.
     #[tokio::test]
     async fn fresh_stream_is_latency_sensitive_caps_at_quantum() {
@@ -670,10 +673,10 @@ mod tests {
         let stream_a = open_stream(&tx, &mut rx, 1).await;
 
         // Two sends under QUANTUM so the stream has history but is not idle.
-        send_and_drain(&stream_a, &mut rx, 2, DATA_EXTREME_CAP - 1).await;
+        send_and_drain(&stream_a, &mut rx, 2, DATA_CONTENDED_CAP - 1).await;
 
-        // A large head is split at DATA_QUANTUM (latency-sensitive cap), not
-        // DATA_BULK_CAP, because the stream is not yet MustBulk (idle window
+        // A large head is split at DATA_MEDIUM_CAP (latency-sensitive cap), not
+        // DATA_BULK_CAP, because the stream is not yet bulk (idle window
         // has not elapsed).
         let big_len = DATA_BULK_CAP * 2;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
@@ -682,11 +685,11 @@ mod tests {
         assert_eq!(
             data_len(&first.data),
             DATA_MEDIUM_CAP,
-            "fresh stream should be latency-sensitive and cap at DATA_QUANTUM"
+            "fresh stream should be latency-sensitive and cap at DATA_MEDIUM_CAP"
         );
     }
 
-    /// If the only open stream is `MustBulk` (enough small sends + idle for
+    /// If the only open stream is `bulk` (enough small sends + idle for
     /// LATENCY_IDLE), a large head is split at DATA_BULK_CAP for throughput.
     ///
     /// Uses `tokio::time::pause` so the 30s idle window elapses quickly.
@@ -696,13 +699,13 @@ mod tests {
         let stream_a = open_stream(&tx, &mut rx, 1).await;
 
         // 3 small sends: enough history, and >= 2/3 under QUANTUM.
-        send_and_drain(&stream_a, &mut rx, 3, DATA_EXTREME_CAP - 1).await;
+        send_and_drain(&stream_a, &mut rx, 3, DATA_CONTENDED_CAP - 1).await;
 
-        // Advance past the idle window so the stream transitions to MustBulk.
+        // Advance past the idle window so the stream transitions to bulk.
         tokio::time::advance(LATENCY_IDLE + Duration::from_millis(10)).await;
 
-        // A large head should now split at DATA_BULK_CAP, not DATA_QUANTUM,
-        // because the only open stream is MustBulk (any_latency_sensitive is
+        // A large head should now split at DATA_BULK_CAP, not DATA_MEDIUM_CAP,
+        // because the only open stream is bulk (any_latency_sensitive is
         // false).
         let big_len = DATA_BULK_CAP * 2 + 5;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
@@ -715,7 +718,7 @@ mod tests {
         );
     }
 
-    /// Closing the only sensitive stream lets the remaining MustBulk stream
+    /// Closing the only sensitive stream lets the remaining bulk stream
     /// drain at DATA_BULK_CAP. This exercises the close bookkeeping and the
     /// aggregate recompute path.
     #[tokio::test(start_paused = true)]
@@ -724,8 +727,8 @@ mod tests {
         let stream_a = open_stream(&tx, &mut rx, 1).await;
         let _stream_b = open_stream(&tx, &mut rx, 2).await;
 
-        // A -> MustBulk.
-        send_and_drain(&stream_a, &mut rx, 3, DATA_EXTREME_CAP - 1).await;
+        // A -> bulk.
+        send_and_drain(&stream_a, &mut rx, 3, DATA_CONTENDED_CAP - 1).await;
         tokio::time::advance(LATENCY_IDLE + Duration::from_millis(10)).await;
 
         // Close B (the only sensitive stream) by dropping its sender.
@@ -739,7 +742,7 @@ mod tests {
             }
         }
 
-        // Now only A (MustBulk) is open: large head should cap at DATA_BULK_CAP.
+        // Now only A (bulk) is open: large head should cap at DATA_BULK_CAP.
         let big_len = DATA_BULK_CAP * 2 + 5;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
         let first = rx.recv().await.unwrap();
@@ -819,9 +822,9 @@ mod tests {
 
     // ---- Latency ramp tests ----
 
-    /// A head of exactly DATA_BULK_CAP bytes ramps to MustBulk mid-transfer
+    /// A head of exactly DATA_BULK_CAP bytes ramps to bulk mid-transfer
     /// and emits the tail under DATA_BULK_CAP. The first three dispatches are
-    /// capped at DATA_MEDIUM_CAP (accumulating LATENCY_HISTORY_MIN bulk
+    /// capped at DATA_MEDIUM_CAP (accumulating HISTORY_MIN bulk
     /// observations), and the fourth is the remaining tail.
     /// Regression for the record condition: exactly-capped heads used to skip
     /// recording after the first dispatch and therefore never ramped.
@@ -833,7 +836,7 @@ mod tests {
         // One head of exactly DATA_BULK_CAP bytes. The original length is
         // >= DATA_BULK_CAP, so every dispatch records an observation. After
         // three DATA_MEDIUM_CAP dispatches the stream has reached
-        // LATENCY_HISTORY_MIN bulk observations and ramps to MustBulk, so the
+        // HISTORY_MIN bulk observations and ramps to bulk, so the
         // fourth dispatch emits the rest of the head.
         let big_len = DATA_BULK_CAP;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
@@ -864,7 +867,7 @@ mod tests {
         );
     }
 
-    /// A single sustained bulk transfer ramps to MustBulk mid-transfer and
+    /// A single sustained bulk transfer ramps to bulk mid-transfer and
     /// starts using DATA_BULK_CAP for dispatch 4. The first three dispatches
     /// are capped at DATA_MEDIUM_CAP; the fourth is capped at DATA_BULK_CAP.
     #[tokio::test]
@@ -875,7 +878,7 @@ mod tests {
         // One head larger than DATA_BULK_CAP so every dispatch records an
         // observation. With DATA_MEDIUM_CAP = 2 KiB, the first three emits are
         // 2 KiB each, producing 3 bulk observations. The fourth dispatch is
-        // computed after the third record_send, when the stream is MustBulk.
+        // computed after the third record_send, when the stream is bulk.
         let big_len = DATA_BULK_CAP * 2;
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
 
@@ -906,13 +909,13 @@ mod tests {
     }
 
     /// A new latency-sensitive stream restores small caps over a ramped
-    /// MustBulk stream.
+    /// bulk stream.
     #[tokio::test]
     async fn new_stream_restores_small_caps_over_ramped_bulk_stream() {
         let (tx, mut rx) = write_data_channel();
         let stream_a = open_stream(&tx, &mut rx, 1).await;
 
-        // Ramp A to MustBulk with a large head. The first three dispatches are
+        // Ramp A to bulk with a large head. The first three dispatches are
         // DATA_MEDIUM_CAP, then the fourth (computed after the third bulk
         // observation) uses DATA_BULK_CAP. Drain until that ramped dispatch is
         // observed.
@@ -957,7 +960,7 @@ mod tests {
         );
     }
 
-    /// MustBulk reverts to latency-sensitive within a bounded number of small
+    /// bulk reverts to latency-sensitive within a bounded number of small
     /// record_send calls thanks to LATENCY_HISTORY_MAX.
     #[tokio::test]
     async fn must_bulk_reverts_after_bounded_small_sends() {
@@ -982,14 +985,14 @@ mod tests {
             calls += 1;
             assert!(
                 calls <= 2 * LATENCY_HISTORY_MAX,
-                "MustBulk should revert within 2 * LATENCY_HISTORY_MAX small record_send calls"
+                "bulk should revert within 2 * LATENCY_HISTORY_MAX small record_send calls"
             );
         }
     }
 
     /// Mixed small and medium streams keep a truly bulk stream capped so the
     /// interactive-preemption guarantee holds. B's 4096 B message is split
-    /// into DATA_EXTREME_CAP slices and still counts as one observation, so
+    /// into DATA_CONTENDED_CAP slices and still counts as one observation, so
     /// B remains sensitive and A never dispatches more than DATA_MEDIUM_CAP.
     #[tokio::test(flavor = "multi_thread")]
     async fn mixed_small_and_medium_stream_keeps_bulk_capped() {

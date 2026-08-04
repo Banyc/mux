@@ -3,7 +3,7 @@ use crate::{
     control::{ControlOpenError, DeadControl},
 };
 
-use super::{DeadStreamInit, accepter::StreamAcceptMsg};
+use super::{DeadStreamInit, accepter::StreamPair};
 
 const CHANNEL_SIZE: usize = 1024;
 
@@ -16,14 +16,14 @@ impl StreamOpener {
         Self { tx }
     }
     pub async fn open(&self) -> Result<(StreamReader, StreamWriter), StreamOpenError> {
-        let msg = self.tx.send().await?;
+        let msg = self.tx.request_stream().await?;
         Ok((msg.reader, msg.writer))
     }
 }
 
 #[derive(Debug)]
 pub struct StreamOpenMsg {
-    pub stream: tokio::sync::oneshot::Sender<Result<StreamAcceptMsg, ControlOpenError>>,
+    pub stream: tokio::sync::oneshot::Sender<Result<StreamPair, ControlOpenError>>,
 }
 pub fn stream_open_channel() -> (StreamOpenTx, StreamOpenRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
@@ -36,7 +36,7 @@ pub struct StreamOpenTx {
     tx: tokio::sync::mpsc::Sender<StreamOpenMsg>,
 }
 impl StreamOpenTx {
-    pub async fn send(&self) -> Result<StreamAcceptMsg, StreamOpenError> {
+    pub async fn request_stream(&self) -> Result<StreamPair, StreamOpenError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(StreamOpenMsg { stream: tx })

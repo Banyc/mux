@@ -1,7 +1,10 @@
 use accepter::StreamAcceptTx;
 use opener::StreamOpenRx;
 
-use crate::{common::Side, control::DeadControl, protocol::StreamId};
+use crate::{
+    control::DeadControl,
+    protocol::{Side, StreamId},
+};
 
 pub mod accepter;
 pub mod opener;
@@ -9,7 +12,7 @@ pub mod reader;
 pub mod writer;
 
 #[derive(Debug)]
-pub struct StreamInitHandle {
+pub struct StreamInitChannels {
     pub stream_open_rx: StreamOpenRx,
     pub stream_accept_tx: StreamAcceptTx,
 }

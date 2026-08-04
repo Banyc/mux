@@ -15,7 +15,7 @@ use crate::{
         DeadCentralIo,
         scheduler::{DATA_BULK_CAP, PollStreamWriteDataTx, StreamWriteData, StreamWriteDataTx},
     },
-    control::WriteBrokenPipe,
+    control::PeerReadClosedFlag,
 };
 
 use super::StreamCloseTx;
@@ -31,12 +31,12 @@ const DATA_STAGING_CAP: usize = 4 * DATA_BULK_CAP;
 
 #[derive(Debug)]
 struct StreamWriterState {
-    broken_pipe: WriteBrokenPipe,
+    broken_pipe: PeerReadClosedFlag,
     close: Option<StreamCloseTx>,
     buf_pool: ArcObjPool<Vec<u8>>,
 }
 impl StreamWriterState {
-    pub fn new(broken_pipe: WriteBrokenPipe, close: StreamCloseTx) -> Self {
+    pub fn new(broken_pipe: PeerReadClosedFlag, close: StreamCloseTx) -> Self {
         Self {
             broken_pipe,
             close: Some(close),
@@ -119,7 +119,7 @@ pub(crate) struct LiveStreamWriter {
 impl LiveStreamWriter {
     pub(crate) fn new(
         data: StreamWriteDataTx,
-        broken_pipe: WriteBrokenPipe,
+        broken_pipe: PeerReadClosedFlag,
         close: StreamCloseTx,
     ) -> Self {
         let state = StreamWriterState::new(broken_pipe, close);
@@ -259,7 +259,7 @@ mod tests {
     use crate::{
         Side,
         central_io::scheduler::{StreamWriteData, write_data_channel},
-        control::WriteBrokenPipe,
+        control::PeerReadClosedFlag,
     };
     use std::io::IoSlice;
     use std::task::{Context, Waker};
@@ -272,7 +272,7 @@ mod tests {
         crate::central_io::scheduler::WriteDataRx,
     ) {
         let (prototype, mut rx) = write_data_channel();
-        let derive_fut = prototype.derive(stream_id, false);
+        let derive_fut = prototype.for_stream(stream_id, false);
         let drive_open = async {
             loop {
                 let msg = rx.recv().await.unwrap();
@@ -282,7 +282,7 @@ mod tests {
             }
         };
         let (tx, ()) = tokio::join!(derive_fut, drive_open);
-        let broken_pipe = WriteBrokenPipe::new();
+        let broken_pipe = PeerReadClosedFlag::new();
         let (close_tx, _close_rx) = crate::stream::stream_close_channel();
         let close = close_tx.derive(Side::Write, stream_id);
         (

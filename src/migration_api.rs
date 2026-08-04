@@ -14,19 +14,19 @@ use tokio::task::JoinSet;
 use crate::{
     StreamReader,
     dual_lane::{DualStreamAccepter, DualStreamOpener},
-    lane_hello::LaneClass,
-    splice_feed::{SpliceFeed, SpliceFeedHandle, spawn_splice_feed},
-    stream::writer::StreamWriter,
-    stream_migration::{
+    migration_wire::{
         GenerationChain, GenerationReader, MigrationError, ResumeHeader, SplicedReader,
     },
+    splice_feed::{SpliceRouter, SpliceRouterHandle, spawn_splice_router},
+    stream::writer::StreamWriter,
+    traffic_class::LaneClass,
 };
 
 // ---------------------------------------------------------------------------
-// Constants (mirror central_io::writer's LatencyControl)
+// Constants (mirror central_io::scheduler's LatencyControl)
 // ---------------------------------------------------------------------------
 
-/// Cross-reference: `DATA_MEDIUM_CAP` in `central_io::writer`.
+/// Cross-reference: `DATA_MEDIUM_CAP` in `central_io::scheduler`.
 pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 
 #[cfg(not(test))]
@@ -54,7 +54,7 @@ impl StreamName {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum MigratingError {
+pub enum MigratingStreamError {
     Migration(MigrationError),
     OpenFailed,
     OpenUnderlying(String),
@@ -62,9 +62,9 @@ pub enum MigratingError {
     LaneDead,
 }
 
-impl From<MigrationError> for MigratingError {
+impl From<MigrationError> for MigratingStreamError {
     fn from(e: MigrationError) -> Self {
-        MigratingError::Migration(e)
+        MigratingStreamError::Migration(e)
     }
 }
 
@@ -96,18 +96,19 @@ pub struct MigratingStreamWriter {
     state: WriterState,
     policy: crate::traffic_class::LanePolicy,
     name: StreamName,
-    auto: bool,
+    auto_migrate: bool,
     gen0_reader_tx: Option<tokio::sync::oneshot::Sender<StreamReader>>,
-    /// When set, successor generation readers are held alive here so
-    /// their sub-streams don't close on the peer; gen 0 is delivered via
-    /// [`gen0_reader_tx`]. `None` for write-only mode.
-    held_readers: Option<Vec<StreamReader>>,
+    /// When set, the most recent successor generation reader is held
+    /// alive here so its sub-stream doesn't close on the peer; gen 0 is
+    /// delivered via [`gen0_reader_tx`]. `None` while no successor is
+    /// open.
+    latest_held_reader: Option<StreamReader>,
 }
 
 impl std::fmt::Debug for MigratingStreamWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MigratingStreamWriter")
-            .field("auto", &self.auto)
+            .field("auto_migrate", &self.auto_migrate)
             .finish_non_exhaustive()
     }
 }
@@ -117,7 +118,7 @@ impl MigratingStreamWriter {
         opener: DualStreamOpener,
         logical_id: u64,
         initial_lane: LaneClass,
-        auto: bool,
+        auto_migrate: bool,
     ) -> Self {
         Self {
             opener,
@@ -125,9 +126,9 @@ impl MigratingStreamWriter {
             state: WriterState::PendingOpen { lane: initial_lane },
             policy: crate::traffic_class::LanePolicy::new(),
             name: StreamName::default(),
-            auto,
+            auto_migrate,
             gen0_reader_tx: None,
-            held_readers: None,
+            latest_held_reader: None,
         }
     }
 
@@ -135,7 +136,7 @@ impl MigratingStreamWriter {
         opener: DualStreamOpener,
         logical_id: u64,
         initial_lane: LaneClass,
-        auto: bool,
+        auto_migrate: bool,
         gen0_reader_tx: tokio::sync::oneshot::Sender<StreamReader>,
     ) -> Self {
         Self {
@@ -144,20 +145,20 @@ impl MigratingStreamWriter {
             state: WriterState::PendingOpen { lane: initial_lane },
             policy: crate::traffic_class::LanePolicy::new(),
             name: StreamName::default(),
-            auto,
+            auto_migrate,
             gen0_reader_tx: Some(gen0_reader_tx),
-            held_readers: Some(Vec::new()),
+            latest_held_reader: None,
         }
     }
 
-    pub async fn force_migrate(&mut self, target: LaneClass) -> Result<(), MigratingError> {
+    pub async fn force_migrate(&mut self, target: LaneClass) -> Result<(), MigratingStreamError> {
         let decision =
             self.policy
                 .decision(target, crate::traffic_class::LaneMigrationReason::Forced, 0);
         self.migrate_to(decision).await
     }
 
-    pub fn name_handle(&self) -> StreamName {
+    pub fn name(&self) -> StreamName {
         self.name.clone()
     }
 
@@ -176,26 +177,26 @@ impl MigratingStreamWriter {
             },
             policy: crate::traffic_class::LanePolicy::new(),
             name: StreamName::default(),
-            auto: true,
+            auto_migrate: true,
             gen0_reader_tx: None,
-            held_readers: None,
+            latest_held_reader: None,
         }
     }
 
-    async fn ensure_open(&mut self) -> Result<(), MigratingError> {
+    async fn ensure_open(&mut self) -> Result<(), MigratingStreamError> {
         let lane = match &self.state {
             WriterState::Active { .. } => return Ok(()),
             WriterState::PendingOpen { lane } => *lane,
             WriterState::Migrating { target_lane } => *target_lane,
-            WriterState::Closed => return Err(MigratingError::LaneDead),
+            WriterState::Closed => return Err(MigratingStreamError::LaneDead),
         };
         let (reader, mut writer) = match self.opener.open(lane).await {
             Ok(x) => x,
-            Err(e) => return Err(MigratingError::OpenUnderlying(format!("{e:?}"))),
+            Err(e) => return Err(MigratingStreamError::OpenUnderlying(format!("{e:?}"))),
         };
         let genn = self
             .chain
-            .start_generation(&mut tokio_util_writer(&mut writer), false)
+            .start_generation(&mut as_async_write(&mut writer), false)
             .await?;
         self.route_opened_reader(genn, reader);
         self.state = WriterState::Active { writer, lane };
@@ -205,7 +206,7 @@ impl MigratingStreamWriter {
     async fn migrate_to(
         &mut self,
         decision: crate::traffic_class::LaneMigration,
-    ) -> Result<(), MigratingError> {
+    ) -> Result<(), MigratingStreamError> {
         let target = decision.target;
         let from = match &self.state {
             WriterState::Active { lane, .. } | WriterState::PendingOpen { lane } => Some(*lane),
@@ -232,8 +233,8 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), MigratingError> {
-        if self.auto {
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), MigratingStreamError> {
+        if self.auto_migrate {
             self.classify_and_maybe_migrate(buf.len()).await?;
         }
         self.ensure_open().await?;
@@ -241,50 +242,50 @@ impl MigratingStreamWriter {
         // Safe to access because ensure_open left us in Active state
         let writer = match &mut self.state {
             WriterState::Active { writer, .. } => writer,
-            _ => return Err(MigratingError::LaneDead),
+            _ => return Err(MigratingStreamError::LaneDead),
         };
 
         use tokio::io::AsyncWriteExt;
         writer
             .write_all(buf)
             .await
-            .map_err(|_| MigratingError::WriteFailed)?;
+            .map_err(|_| MigratingStreamError::WriteFailed)?;
         Ok(())
     }
 
-    pub async fn flush(&mut self) -> Result<(), MigratingError> {
+    pub async fn flush(&mut self) -> Result<(), MigratingStreamError> {
         use tokio::io::AsyncWriteExt;
         match &mut self.state {
             WriterState::Active { writer, .. } => writer
                 .flush()
                 .await
-                .map_err(|_| MigratingError::WriteFailed),
+                .map_err(|_| MigratingStreamError::WriteFailed),
             WriterState::Migrating { .. } => {
                 self.ensure_open().await?;
                 Ok(())
             }
             WriterState::PendingOpen { .. } => Ok(()),
-            WriterState::Closed => Err(MigratingError::LaneDead),
+            WriterState::Closed => Err(MigratingStreamError::LaneDead),
         }
     }
 
     fn route_opened_reader(&mut self, generation: u32, reader: StreamReader) {
         let mut reader = reader;
-        if generation == 0 {
-            if let Some(tx) = self.gen0_reader_tx.take() {
-                match tx.send(reader) {
-                    Ok(()) => return,
-                    Err(r) => reader = r,
-                }
+        if generation == 0
+            && let Some(tx) = self.gen0_reader_tx.take()
+        {
+            match tx.send(reader) {
+                Ok(()) => return,
+                Err(r) => reader = r,
             }
         }
-        if let Some(held) = &mut self.held_readers {
-            held.clear();
-            held.push(reader);
-        }
+        self.latest_held_reader = Some(reader);
     }
 
-    async fn classify_and_maybe_migrate(&mut self, size: usize) -> Result<(), MigratingError> {
+    async fn classify_and_maybe_migrate(
+        &mut self,
+        size: usize,
+    ) -> Result<(), MigratingStreamError> {
         let current = match &self.state {
             WriterState::Active { lane, .. } | WriterState::PendingOpen { lane } => Some(*lane),
             _ => None,
@@ -298,14 +299,14 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    /// Graceful shutdown — closes the active writer (if any) and emits a
+    /// Best-effort close: closes the active writer (if any) and emits a
     /// FINAL-marker generation so the peer receives a clean EOF. The
     /// FINAL generation is written by a detached background task (the
     /// [`GenerationChain`] and an owned [`DualStreamOpener`] clone move
     /// into it), so this method stays synchronous. If the stream was
     /// never announced to the peer (still unopened), this is a no-op — no
     /// FINAL is emitted for a stream the peer never saw.
-    pub fn shutdown(&mut self) -> Result<(), MigratingError> {
+    pub fn finalize_detached(&mut self) -> Result<(), MigratingStreamError> {
         if self.nothing_to_close() {
             self.state = WriterState::Closed;
             return Ok(());
@@ -319,7 +320,7 @@ impl MigratingStreamWriter {
             runtime.spawn(async move {
                 if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
                     let _ = chain
-                        .start_generation(&mut tokio_util_writer(&mut final_writer), true)
+                        .start_generation(&mut as_async_write(&mut final_writer), true)
                         .await;
                     let _ = final_writer.shutdown();
                 }
@@ -329,12 +330,12 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    /// Clean close: opens a new substream for a FINAL-marker generation,
+    /// Confirmed close: opens a new substream for a FINAL-marker generation,
     /// writes the FINAL resume header, and closes. The peer receives a
-    /// clean EOF (the [`SplicedReader`] sees `is_closed = true`). If the
+    /// clean EOF (the [`SplicedReader`] sees `has_final_marker`). If the
     /// stream was never announced to the peer (still unopened), this is
     /// a no-op — no FINAL is emitted for a stream the peer never saw.
-    pub async fn finalize(&mut self) -> Result<(), MigratingError> {
+    pub async fn finalize(&mut self) -> Result<(), MigratingStreamError> {
         if self.nothing_to_close() {
             self.state = WriterState::Closed;
             return Ok(());
@@ -347,9 +348,9 @@ impl MigratingStreamWriter {
             .opener
             .open(LaneClass::Interactive)
             .await
-            .map_err(|_| MigratingError::OpenFailed)?;
+            .map_err(|_| MigratingStreamError::OpenFailed)?;
         self.chain
-            .start_generation(&mut tokio_util_writer(&mut final_writer), true)
+            .start_generation(&mut as_async_write(&mut final_writer), true)
             .await?;
         let _ = final_writer.shutdown();
         Ok(())
@@ -358,10 +359,10 @@ impl MigratingStreamWriter {
     /// A stream with nothing left to close is either already closed or
     /// was never announced to the peer (generation 0 never opened).
     fn nothing_to_close(&self) -> bool {
-        matches!(self.state, WriterState::Closed) || self.chain.is_unannounced()
+        matches!(self.state, WriterState::Closed) || self.chain.never_opened()
     }
 
-    pub async fn rebind(&mut self, opener: DualStreamOpener) -> Result<(), MigratingError> {
+    pub async fn rebind(&mut self, opener: DualStreamOpener) -> Result<(), MigratingStreamError> {
         self.opener = opener;
         match &self.state {
             WriterState::Active { lane, .. } => {
@@ -381,7 +382,7 @@ impl MigratingStreamWriter {
 
 impl Drop for MigratingStreamWriter {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        let _ = self.finalize_detached();
     }
 }
 
@@ -389,11 +390,11 @@ impl Drop for MigratingStreamWriter {
 // Adapter to use StreamWriter with GenerationChain::start_generation
 // ---------------------------------------------------------------------------
 
-struct TokioUtilWriter<'a> {
+struct StreamWriterRef<'a> {
     inner: &'a mut StreamWriter,
 }
 
-impl<'a> AsyncWrite for TokioUtilWriter<'a> {
+impl<'a> AsyncWrite for StreamWriterRef<'a> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -423,8 +424,8 @@ impl<'a> AsyncWrite for TokioUtilWriter<'a> {
     }
 }
 
-fn tokio_util_writer(w: &mut StreamWriter) -> TokioUtilWriter<'_> {
-    TokioUtilWriter { inner: w }
+fn as_async_write(w: &mut StreamWriter) -> StreamWriterRef<'_> {
+    StreamWriterRef { inner: w }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +439,7 @@ impl DualStreamOpener {
     /// Auto-policy: a single write larger than [`AUTO_BULK_THRESHOLD`]
     /// migrates to the bulk lane **before** that write is sent. Demotion
     /// back to interactive requires [`DEMOTE_STREAK`] (4) consecutive
-    /// small writes and a cool-down of [`DEMOTE_COOLDOWN`] (150 ms) since
+    /// small writes and a cool-down of [`MIGRATION_COOLDOWN`] (150 ms) since
     /// the last migration.
     pub fn open_migrating(
         &self,
@@ -485,7 +486,7 @@ impl DualStreamOpener {
 
     /// Open a bidirectional migrating stream on `initial_lane`. The
     /// returned [`MigratingStreamWriter`] handles the write side; the
-    /// returned [`ClientSplicedReader`] handles the read side.
+    /// returned [`PendingResponseReader`] handles the read side.
     ///
     /// RESPONSE-direction traffic stays pinned to the lane where
     /// generation 0 opened; only the REQUEST direction migrates. True
@@ -495,7 +496,7 @@ impl DualStreamOpener {
         &self,
         logical_id: u64,
         initial_lane: LaneClass,
-    ) -> (ClientSplicedReader, MigratingStreamWriter) {
+    ) -> (PendingResponseReader, MigratingStreamWriter) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let writer = MigratingStreamWriter::new_with_reader_tx(
             self.clone(),
@@ -504,7 +505,7 @@ impl DualStreamOpener {
             true,
             tx,
         );
-        let reader = ClientSplicedReader {
+        let reader = PendingResponseReader {
             logical_id,
             inner: None,
             gen0_rx: Some(rx),
@@ -528,8 +529,8 @@ pub struct MigratingCapableAccepter {
     inner: DualStreamAccepter,
     pass_plain_streams: bool,
     response_opener: Option<DualStreamOpener>,
-    feed: SpliceFeedHandle,
-    _own_feed: Option<SpliceFeed>,
+    feed: SpliceRouterHandle,
+    _own_feed: Option<SpliceRouter>,
     peeks: JoinSet<PeekedStream>,
 }
 
@@ -543,12 +544,12 @@ enum PeekOutcome {
     Plain {
         reader: StreamReader,
     },
-    Nothing,
+    Consumed,
     FeedDead,
 }
 
 struct PeekedStream {
-    outcome: Result<PeekOutcome, MigratingError>,
+    outcome: Result<PeekOutcome, MigratingStreamError>,
     writer: StreamWriter,
     lane: LaneClass,
 }
@@ -564,7 +565,7 @@ impl MigratingCapableAccepter {
     }
 
     fn new_with_plain_streams(inner: DualStreamAccepter, pass_plain_streams: bool) -> Self {
-        let feed = spawn_splice_feed();
+        let feed = spawn_splice_router();
         Self {
             inner,
             pass_plain_streams,
@@ -575,7 +576,7 @@ impl MigratingCapableAccepter {
         }
     }
 
-    fn new_shared(inner: DualStreamAccepter, feed: SpliceFeedHandle) -> Self {
+    fn new_shared(inner: DualStreamAccepter, feed: SpliceRouterHandle) -> Self {
         Self {
             inner,
             pass_plain_streams: false,
@@ -612,7 +613,7 @@ impl MigratingCapableAccepter {
         }
     }
 
-    pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingError> {
+    pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingStreamError> {
         loop {
             let can_accept = self.peeks.len() < MAX_CONCURRENT_PEEKS;
             let has_peeks = !self.peeks.is_empty();
@@ -622,7 +623,8 @@ impl MigratingCapableAccepter {
             };
             let peek = match step {
                 AcceptStep::Accepted(accepted) => {
-                    let (reader, writer, lane) = accepted.map_err(|_| MigratingError::LaneDead)?;
+                    let (reader, writer, lane) =
+                        accepted.map_err(|_| MigratingStreamError::LaneDead)?;
                     let feed = self.feed.clone();
                     self.peeks.spawn(async move {
                         PeekedStream {
@@ -658,36 +660,36 @@ impl MigratingCapableAccepter {
                         source_lane: lane,
                     });
                 }
-                PeekOutcome::Nothing => continue,
-                PeekOutcome::FeedDead => return Err(MigratingError::LaneDead),
+                PeekOutcome::Consumed => continue,
+                PeekOutcome::FeedDead => return Err(MigratingStreamError::LaneDead),
             }
         }
     }
 
     async fn peek_and_dispatch(
         reader: StreamReader,
-        feed: SpliceFeedHandle,
-    ) -> Result<PeekOutcome, MigratingError> {
+        feed: SpliceRouterHandle,
+    ) -> Result<PeekOutcome, MigratingStreamError> {
         let Some((is_migrating, header_opt, reader)) = Self::peek_resume_header(reader).await?
         else {
-            return Ok(PeekOutcome::Nothing);
+            return Ok(PeekOutcome::Consumed);
         };
         let (Some(header), true) = (header_opt, is_migrating) else {
             return Ok(PeekOutcome::Plain { reader });
         };
         if header.is_response {
-            return Ok(PeekOutcome::Nothing);
+            return Ok(PeekOutcome::Consumed);
         }
         let logical_id = header.logical_id;
         let is_gen0 = header.generation == 0;
         let gen_reader: GenerationReader = Box::pin(reader);
         if !is_gen0 {
             return match feed.send_continuation(header, gen_reader) {
-                Ok(()) => Ok(PeekOutcome::Nothing),
+                Ok(()) => Ok(PeekOutcome::Consumed),
                 Err(()) => Ok(PeekOutcome::FeedDead),
             };
         }
-        let spliced_rx = feed.expect_gen0(logical_id);
+        let spliced_rx = feed.await_gene(logical_id);
         if feed.send_continuation(header, gen_reader).is_err() {
             return Ok(PeekOutcome::FeedDead);
         }
@@ -696,14 +698,14 @@ impl MigratingCapableAccepter {
                 spliced,
                 logical_id,
             }),
-            Err(_) => Ok(PeekOutcome::Nothing),
+            Err(_) => Ok(PeekOutcome::Consumed),
         }
     }
 
     pub(crate) async fn peek_resume_header(
         mut reader: StreamReader,
-    ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingError> {
-        use crate::stream_migration::{RESUME_HEADER_LEN, ResumeHeader};
+    ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingStreamError> {
+        use crate::migration_wire::{RESUME_HEADER_LEN, ResumeHeader};
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; RESUME_HEADER_LEN];
         let mut filled = 0;
@@ -759,7 +761,7 @@ pub enum AcceptedStream {
 }
 
 // ---------------------------------------------------------------------------
-// ClientSplicedReader — opener-side reader for duplex migrating
+// PendingResponseReader — opener-side reader for duplex migrating
 // ---------------------------------------------------------------------------
 
 /// Client-side reader for a duplex migrating stream. The gen-0
@@ -772,22 +774,22 @@ pub enum AcceptedStream {
 /// If the writer is dropped before any write, the oneshot sender drops
 /// → the reader gets [`BrokenPipe`](io::ErrorKind::BrokenPipe) (the
 /// stream never materialised).
-pub struct ClientSplicedReader {
+pub struct PendingResponseReader {
     logical_id: u64,
     inner: Option<StreamReader>,
     gen0_rx: Option<tokio::sync::oneshot::Receiver<StreamReader>>,
 }
 
-impl std::fmt::Debug for ClientSplicedReader {
+impl std::fmt::Debug for PendingResponseReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientSplicedReader")
+        f.debug_struct("PendingResponseReader")
             .field("logical_id", &self.logical_id)
             .field("has_inner", &self.inner.is_some())
             .finish()
     }
 }
 
-impl AsyncRead for ClientSplicedReader {
+impl AsyncRead for PendingResponseReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -845,14 +847,17 @@ impl DualStreamAccepter {
         mac
     }
 
-    pub fn into_migrating_only_shared(self, feed: SpliceFeedHandle) -> MigratingCapableAccepter {
+    pub fn into_migrating_only_with_feed(
+        self,
+        feed: SpliceRouterHandle,
+    ) -> MigratingCapableAccepter {
         MigratingCapableAccepter::new_shared(self, feed)
     }
 
-    pub fn into_migrating_duplex_shared(
+    pub fn into_migrating_duplex_with_feed(
         self,
         opener: DualStreamOpener,
-        feed: SpliceFeedHandle,
+        feed: SpliceRouterHandle,
     ) -> MigratingCapableAccepter {
         let mut mac = MigratingCapableAccepter::new_shared(self, feed);
         mac.response_opener = Some(opener);
@@ -862,7 +867,7 @@ impl DualStreamAccepter {
 
 #[derive(Debug)]
 pub struct ResponseRouter {
-    feed: SpliceFeed,
+    feed: SpliceRouter,
     tasks: tokio::task::JoinSet<()>,
 }
 impl Drop for ResponseRouter {
@@ -919,15 +924,15 @@ impl ResponseRouter {
 }
 #[derive(Debug, Clone)]
 pub struct ResponseRouterHandle {
-    feed: SpliceFeedHandle,
+    feed: SpliceRouterHandle,
 }
 impl ResponseRouterHandle {
-    pub fn expect_response(
+    pub fn inject_response_gene(
         &self,
         logical_id: u64,
         gen0_reader: StreamReader,
     ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
-        let rx = self.feed.expect_gen0(logical_id);
+        let rx = self.feed.await_gene(logical_id);
         let header = ResumeHeader {
             logical_id,
             generation: 0,
@@ -942,7 +947,7 @@ impl ResponseRouterHandle {
 }
 pub fn spawn_response_router(accepter: DualStreamAccepter) -> ResponseRouter {
     let mut router = ResponseRouter {
-        feed: spawn_splice_feed(),
+        feed: spawn_splice_router(),
         tasks: tokio::task::JoinSet::new(),
     };
     router.add_accepter(accepter);
@@ -960,7 +965,7 @@ mod tests {
         DualStreamAccepter, DualStreamOpener,
         control::Initiation,
         dual_lane::Liveness,
-        serve::{MuxConfig, spawn_mux_no_reconnection},
+        session::{MuxConfig, spawn_mux_no_reconnection},
         splice_feed::MAX_UNCLAIMED_GEN0,
     };
     use std::time::Duration;
@@ -969,10 +974,10 @@ mod tests {
     async fn make_dual_session() -> (
         DualStreamOpener,
         DualStreamAccepter,
-        tokio::task::JoinSet<crate::serve::MuxError>,
-        tokio::task::JoinSet<crate::serve::MuxError>,
-        tokio::task::JoinSet<crate::serve::MuxError>,
-        tokio::task::JoinSet<crate::serve::MuxError>,
+        tokio::task::JoinSet<crate::session::MuxError>,
+        tokio::task::JoinSet<crate::session::MuxError>,
+        tokio::task::JoinSet<crate::session::MuxError>,
+        tokio::task::JoinSet<crate::session::MuxError>,
     ) {
         // Large duplex buffers so writes don't block when the receiver
         // hasn't started accepting yet.
@@ -1021,7 +1026,7 @@ mod tests {
         DualStreamAccepter,
         DualStreamOpener,
         DualStreamAccepter,
-        Vec<tokio::task::JoinSet<crate::serve::MuxError>>,
+        Vec<tokio::task::JoinSet<crate::session::MuxError>>,
     ) {
         let buf_size = 4 * 1024 * 1024;
         let (int_c2s, int_s2c) = duplex(buf_size);
@@ -1077,7 +1082,7 @@ mod tests {
             .unwrap();
         assert_eq!(&req, b"request");
         let gen0_reader = gen0_rx.await.unwrap();
-        let spliced_rx = router.handle().expect_response(42, gen0_reader);
+        let spliced_rx = router.handle().inject_response_gene(42, gen0_reader);
         let mut resp_reader = spliced_rx.await.unwrap();
         resp_writer.write_all(b"head-").await.unwrap();
         resp_writer.write_all(&vec![0xEE; 40_000]).await.unwrap();
@@ -1091,7 +1096,7 @@ mod tests {
         assert_eq!(&resp[..5], b"head-");
         assert!(resp[5..5 + 40_000].iter().all(|b| *b == 0xEE));
         assert_eq!(&resp[5 + 40_000..], b"-tail");
-        req_writer.shutdown().unwrap();
+        req_writer.finalize_detached().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1105,7 +1110,7 @@ mod tests {
         let gen0_reader = gen0_rx.await.unwrap();
         let mut resp_reader = router
             .handle()
-            .expect_response(7, gen0_reader)
+            .inject_response_gene(7, gen0_reader)
             .await
             .unwrap();
         resp_writer.write_all(b"pong").await.unwrap();
@@ -1115,7 +1120,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp, "pong");
-        req_writer.shutdown().unwrap();
+        req_writer.finalize_detached().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1150,7 +1155,7 @@ mod tests {
         let gen0_reader = gen0_rx.await.unwrap();
         let mut resp_reader = router
             .handle()
-            .expect_response(9, gen0_reader)
+            .inject_response_gene(9, gen0_reader)
             .await
             .unwrap();
         let (up, down) = tokio::join!(
@@ -1192,7 +1197,7 @@ mod tests {
         writer.write_all(&[0u8; 3000]).await.unwrap();
 
         // The write was sent on the bulk lane. Just verify it didn't error.
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1211,7 +1216,7 @@ mod tests {
         }
 
         // After demotion, the writer should be on interactive lane.
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1230,7 +1235,7 @@ mod tests {
         writer.force_migrate(LaneClass::Bulk).await.unwrap();
 
         writer.write_all(&[0u8; 5000]).await.unwrap();
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1244,7 +1249,7 @@ mod tests {
         let mut writer = opener.open_migrating(1, LaneClass::Interactive);
 
         writer.write_all(&[0u8; 3000]).await.unwrap(); // triggers promote to bulk
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1260,7 +1265,7 @@ mod tests {
         // Two large writes back-to-back — both should promote immediately
         writer.write_all(&[0u8; 3000]).await.unwrap();
         writer.write_all(&[0u8; 4000]).await.unwrap();
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1269,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn mirrored_classifier_tracks_bulk_ratio() {
-        let mut c = crate::traffic_class::Classifier::new();
+        let mut c = crate::traffic_class::SizeMix::new();
 
         // Small writes → interactive
         for _ in 0..10 {
@@ -1386,7 +1391,7 @@ mod tests {
         let send = tokio::spawn(async move {
             let mut writer = opener.open_migrating(42, LaneClass::Interactive);
             writer.write_all(b"hello-world").await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         // Accept gen0
@@ -1436,7 +1441,7 @@ mod tests {
                 };
                 writer.force_migrate(target).await.unwrap();
             }
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1474,7 +1479,7 @@ mod tests {
             writer.write_all(second).await.unwrap();
             writer.force_migrate(LaneClass::Interactive).await.unwrap();
             writer.write_all(third).await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1576,7 +1581,7 @@ mod tests {
             w.write_all(b"stream-A-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Bulk).await.unwrap();
             w.write_all(b"stream-A-chunk-2").await.unwrap();
-            w.shutdown().unwrap();
+            w.finalize_detached().unwrap();
         });
 
         let opener3 = opener2.clone();
@@ -1585,7 +1590,7 @@ mod tests {
             w.write_all(b"stream-B-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Interactive).await.unwrap();
             w.write_all(b"stream-B-chunk-2").await.unwrap();
-            w.shutdown().unwrap();
+            w.finalize_detached().unwrap();
         });
 
         // Accept first gen0
@@ -1654,7 +1659,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1701,7 +1706,7 @@ mod tests {
         for _ in 0..4 {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1720,7 +1725,7 @@ mod tests {
         for _ in 0..20 {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.shutdown().unwrap();
+        writer.finalize_detached().unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1748,7 +1753,7 @@ mod tests {
             let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
             writer.write_all(b"data-on-bulk").await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1781,7 +1786,7 @@ mod tests {
         let write = tokio::spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"hello-from-c2s  ").await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1825,7 +1830,7 @@ mod tests {
             writer.write_all(b"c2s-1").await.unwrap();
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
             writer.write_all(b"c2s-2").await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1874,7 +1879,7 @@ mod tests {
                     writer.force_migrate(LaneClass::Interactive).await.unwrap();
                 }
             }
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         // Accept gen0
@@ -1939,7 +1944,7 @@ mod tests {
         let write = tokio::spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"write-only-data").await.unwrap();
-            writer.shutdown().unwrap();
+            writer.finalize_detached().unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1963,9 +1968,9 @@ mod tests {
     async fn shared_feed_second_accepter_splices_byte_exact() {
         let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
-        let feed = spawn_splice_feed();
-        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
-        let mut mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let feed = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
+        let mut mac2 = acc2.into_migrating_only_with_feed(feed.handle());
         let send = tokio::spawn(async move {
             let mut w = op1.open_migrating_manual(42, LaneClass::Interactive);
             w.write_all(b"born-on-session-one|").await.unwrap();
@@ -2003,9 +2008,9 @@ mod tests {
     async fn rebind_mid_stream_is_lossless() {
         let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
-        let feed = spawn_splice_feed();
-        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
-        let mut mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let feed = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
+        let mut mac2 = acc2.into_migrating_only_with_feed(feed.handle());
         let half = 200 * 1024;
         let pattern: Vec<u8> = (0..2 * half).map(|i| (i % 251) as u8).collect();
         let expected = pattern.clone();
@@ -2060,7 +2065,7 @@ mod tests {
         let gen0_reader = gen0_rx.await.unwrap();
         let mut resp_reader = router
             .handle()
-            .expect_response(7, gen0_reader)
+            .inject_response_gene(7, gen0_reader)
             .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
@@ -2076,7 +2081,7 @@ mod tests {
         .expect("RESPONSE|FINAL did not cross the shared feed")
         .unwrap();
         assert_eq!(resp, "pong-across");
-        req_writer.shutdown().unwrap();
+        req_writer.finalize_detached().unwrap();
     }
 
     fn migrating(accepted: AcceptedStream) -> (SplicedReader, StreamWriter) {
@@ -2173,7 +2178,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeated_gen0_releases_its_waiter_instead_of_parking_the_accepter() {
-        let feed = spawn_splice_feed();
+        let feed = spawn_splice_router();
         let handle = feed.handle();
         let gen0 = |logical_id| ResumeHeader {
             logical_id,
@@ -2181,12 +2186,12 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        let first = handle.expect_gen0(7);
+        let first = handle.await_gene(7);
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
             .expect("the feed is alive");
         let _live = first.await.expect("the first gen-0 is spliced");
-        let second = handle.expect_gen0(7);
+        let second = handle.await_gene(7);
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
             .expect("the feed is alive");
@@ -2250,7 +2255,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&got, b"payload");
-        req_writer.shutdown().unwrap();
+        req_writer.finalize_detached().unwrap();
         drop(silent);
     }
 
@@ -2267,7 +2272,7 @@ mod tests {
         let gen0_reader = gen0_rx.await.unwrap();
         let mut resp_reader = router
             .handle()
-            .expect_response(21, gen0_reader)
+            .inject_response_gene(21, gen0_reader)
             .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
@@ -2293,7 +2298,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resp, "pong-across");
-        req_writer.shutdown().unwrap();
+        req_writer.finalize_detached().unwrap();
         drop(silent);
     }
 
@@ -2316,7 +2321,7 @@ mod tests {
             req_writer.force_migrate(target).await.unwrap();
             req_writer.write_all(b"genn").await.unwrap();
         }
-        let held = req_writer.held_readers.as_ref().unwrap().len();
+        let held = usize::from(req_writer.latest_held_reader.is_some());
         assert!(
             held <= 1,
             "held {held} readers after {MIGRATIONS} migrations; a superseded generation is write-shut on both sides, so holding its reader pins a stream-table entry on both peers - and a 1024-slot read channel - per migration, for the life of the stream"
@@ -2420,7 +2425,7 @@ mod tests {
         DualStreamOpener,
         DualStreamAccepter,
         Arc<std::sync::atomic::AtomicUsize>,
-        Vec<tokio::task::JoinSet<crate::serve::MuxError>>,
+        Vec<tokio::task::JoinSet<crate::session::MuxError>>,
     ) {
         let buf_size = 4 * 1024 * 1024;
         let (int_c2s, int_s2c) = duplex(buf_size);
@@ -2479,9 +2484,9 @@ mod tests {
         }
         let (op1, acc1, _c1, _t1) = make_counted_dual_session().await;
         let (op2, acc2, session2_bytes, _t2) = make_counted_dual_session().await;
-        let feed = spawn_splice_feed();
-        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
-        let mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let feed = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
+        let mac2 = acc2.into_migrating_only_with_feed(feed.handle());
         let mut writers = JoinSet::new();
         for id in 0..STREAMS {
             let op1 = op1.clone();
@@ -2610,7 +2615,7 @@ mod tests {
                 });
                 let gen0_reader = gen0_rx.await.expect("the request never opened");
                 let mut resp_reader = handle
-                    .expect_response(id, gen0_reader)
+                    .inject_response_gene(id, gen0_reader)
                     .await
                     .expect("no response reader");
                 let mut got = Vec::new();
@@ -2684,10 +2689,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_registration_for_a_gen0_owns_it() {
-        let feed = spawn_splice_feed();
+        let feed = spawn_splice_router();
         let handle = feed.handle();
-        let first = handle.expect_gen0(3);
-        let second = handle.expect_gen0(3);
+        let first = handle.await_gene(3);
+        let second = handle.await_gene(3);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (theirs, _ours) = tokio::io::duplex(64);
         handle
@@ -2719,7 +2724,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unclaimed_gen0_is_eventually_let_go() {
-        let feed = spawn_splice_feed();
+        let feed = spawn_splice_router();
         let handle = feed.handle();
         let mut peer_halves = Vec::new();
         for logical_id in 0..(MAX_UNCLAIMED_GEN0 as u64 + 8) {
@@ -2767,9 +2772,9 @@ mod tests {
         }
         let (op1, acc1, s1a, s1b, s1c, s1d) = make_dual_session().await;
         let (op2, acc2, _s2a, _s2b, _s2c, _s2d) = make_dual_session().await;
-        let feed = spawn_splice_feed();
-        let mut mac1 = acc1.into_migrating_only_shared(feed.handle());
-        let mac2 = acc2.into_migrating_only_shared(feed.handle());
+        let feed = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
+        let mac2 = acc2.into_migrating_only_with_feed(feed.handle());
         let drain2 = spawn_drain(mac2);
         let (killed_tx, killed_rx) = tokio::sync::watch::channel(false);
         let (past_rebind_tx, mut past_rebind_rx) = tokio::sync::mpsc::channel(STREAMS as usize);

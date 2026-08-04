@@ -19,15 +19,14 @@ use tokio::{
 
 use crate::{
     StreamAccepter, StreamReader,
-    lane_hello::{
-        GroupToken, LaneClass, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello,
-    },
+    lane_hello::{GroupToken, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello},
     protocol::Header,
-    serve::{MuxConfig, MuxError, spawn_mux_no_reconnection},
+    session::{MuxConfig, MuxError, spawn_mux_no_reconnection},
     stream::{
         opener::{StreamOpenError, StreamOpener},
         writer::StreamWriter,
     },
+    traffic_class::LaneClass,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,7 +35,7 @@ use crate::{
 
 /// Threshold for `open_auto` classification. Writes strictly larger than
 /// this go to the bulk lane; equal-or-smaller go to interactive. Mirrors
-/// `DATA_MEDIUM_CAP` in `central_io::writer`.
+/// `DATA_MEDIUM_CAP` in `central_io::scheduler`.
 pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +46,7 @@ pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 /// alive before any application data flows. Use with
 /// [`spawn_mux_no_reconnection_with_first_receive_deadline`] so the
 /// receiver switches off its shorter first-receive deadline.
-pub async fn write_birth_heartbeat<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
+pub async fn write_liveness_heartbeat<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
     writer.write_all(&Header::Heartbeat.encode()).await
 }
 
@@ -60,6 +59,7 @@ pub enum DualMuxError {
     Mux(MuxError),
     LaneHello(LaneHelloError),
     NonceMismatch,
+    LaneClassConflict,
     GroupMismatch,
     HelloDeadline,
 }
@@ -176,12 +176,12 @@ impl DualStreamOpener {
     }
 
     /// Returns a lazy writer/reader pair. The actual stream is opened on the
-    /// first write to [`AutoWriter`]. The first write's total length
+    /// first write to [`AutoLaneWriter`]. The first write's total length
     /// determines the lane: strictly larger than [`AUTO_BULK_THRESHOLD`]
     /// (2048) → bulk lane, else interactive. The decision is **sticky** —
     /// the stream never migrates lanes.
     ///
-    /// The [`AutoReader`] blocks until the first write classifies and opens
+    /// The [`AutoLaneReader`] blocks until the first write classifies and opens
     /// the real stream.
     ///
     /// # Pitfalls
@@ -195,32 +195,32 @@ impl DualStreamOpener {
     /// - **Buffered combinators** (`write_all_buf`): the first poll_write
     ///   may carry multiple buffered chunks concatenated; classification on
     ///   that full length is correct. Vectored writes sum all slices.
-    pub fn open_auto(&self) -> (AutoReader, AutoWriter) {
+    pub fn open_auto(&self) -> (AutoLaneReader, AutoLaneWriter) {
         let (reader_tx, reader_rx) = oneshot::channel();
-        let writer = AutoWriter::new(
+        let writer = AutoLaneWriter::new(
             self.interactive.clone(),
             self.bulk.clone(),
             reader_tx,
             self.liveness.clone(),
         );
-        let reader = AutoReader::new(reader_rx);
+        let reader = AutoLaneReader::new(reader_rx);
         (reader, writer)
     }
 }
 
 // ---------------------------------------------------------------------------
-// AutoWriter
+// AutoLaneWriter
 // ---------------------------------------------------------------------------
 
-pub struct AutoWriter {
-    state: AutoWriterState,
+pub struct AutoLaneWriter {
+    state: AutoLaneWriterState,
     liveness: Liveness,
 }
 
 type OpenFuture =
     Pin<Box<dyn Future<Output = Result<(StreamReader, StreamWriter), StreamOpenError>> + Send>>;
 
-enum AutoWriterState {
+enum AutoLaneWriterState {
     Pending {
         interactive: StreamOpener,
         bulk: StreamOpener,
@@ -236,13 +236,13 @@ enum AutoWriterState {
     Failed,
 }
 
-impl std::fmt::Debug for AutoWriter {
+impl std::fmt::Debug for AutoLaneWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AutoWriter").finish_non_exhaustive()
+        f.debug_struct("AutoLaneWriter").finish_non_exhaustive()
     }
 }
 
-impl AutoWriter {
+impl AutoLaneWriter {
     fn new(
         interactive: StreamOpener,
         bulk: StreamOpener,
@@ -250,7 +250,7 @@ impl AutoWriter {
         liveness: Liveness,
     ) -> Self {
         Self {
-            state: AutoWriterState::Pending {
+            state: AutoLaneWriterState::Pending {
                 interactive,
                 bulk,
                 reader_tx: Some(reader_tx),
@@ -271,8 +271,8 @@ impl AutoWriter {
     /// (inside an async runtime context).
     fn try_open(&mut self, total_len: usize) {
         let (class, interactive, bulk, reader_tx) =
-            match std::mem::replace(&mut self.state, AutoWriterState::Failed) {
-                AutoWriterState::Pending {
+            match std::mem::replace(&mut self.state, AutoLaneWriterState::Failed) {
+                AutoLaneWriterState::Pending {
                     interactive,
                     bulk,
                     reader_tx,
@@ -297,7 +297,7 @@ impl AutoWriter {
             let opener = opener.clone();
             Box::pin(async move { opener.open().await })
         };
-        self.state = AutoWriterState::Opening {
+        self.state = AutoLaneWriterState::Opening {
             open_fut,
             reader_tx,
         };
@@ -308,7 +308,7 @@ impl AutoWriter {
             return Err(AutoWriteError::LaneDead);
         }
         match &mut self.state {
-            AutoWriterState::Active { writer } => Ok(writer),
+            AutoLaneWriterState::Active { writer } => Ok(writer),
             _ => Err(AutoWriteError::SendFailed(
                 crate::stream::writer::SendError::LocalClosedStream,
             )),
@@ -316,9 +316,9 @@ impl AutoWriter {
     }
 
     fn poll_open(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), AutoWriteError>> {
-        let state = std::mem::replace(&mut self.state, AutoWriterState::Failed);
+        let state = std::mem::replace(&mut self.state, AutoLaneWriterState::Failed);
         let (mut open_fut, reader_tx) = match state {
-            AutoWriterState::Opening {
+            AutoLaneWriterState::Opening {
                 open_fut,
                 reader_tx,
             } => (open_fut, reader_tx),
@@ -332,20 +332,20 @@ impl AutoWriter {
                 if let Some(tx) = reader_tx {
                     let _ = tx.send(Ok(reader));
                 }
-                self.state = AutoWriterState::Active { writer };
+                self.state = AutoLaneWriterState::Active { writer };
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => {
                 if let Some(tx) = reader_tx {
                     let _ = tx.send(Err(DualStreamOpenError::StreamOpen(e.clone())));
                 }
-                self.state = AutoWriterState::Failed;
+                self.state = AutoLaneWriterState::Failed;
                 Poll::Ready(Err(AutoWriteError::OpenFailed(
                     DualStreamOpenError::StreamOpen(e),
                 )))
             }
             Poll::Pending => {
-                self.state = AutoWriterState::Opening {
+                self.state = AutoLaneWriterState::Opening {
                     open_fut,
                     reader_tx,
                 };
@@ -362,10 +362,10 @@ impl AutoWriter {
         if !self.liveness.is_alive() {
             return Poll::Ready(Err(AutoWriteError::LaneDead));
         }
-        if matches!(self.state, AutoWriterState::Pending { .. }) {
+        if matches!(self.state, AutoLaneWriterState::Pending { .. }) {
             self.try_open(buf.len());
         }
-        if matches!(self.state, AutoWriterState::Opening { .. }) {
+        if matches!(self.state, AutoLaneWriterState::Opening { .. }) {
             ready!(self.poll_open(cx))?;
         }
         let writer = match self.active_writer() {
@@ -385,13 +385,13 @@ impl AutoWriter {
         if !self.liveness.is_alive() {
             return Poll::Ready(Err(AutoWriteError::LaneDead));
         }
-        if matches!(self.state, AutoWriterState::Pending { .. }) {
+        if matches!(self.state, AutoLaneWriterState::Pending { .. }) {
             let total_len = bufs
                 .iter()
                 .fold(0usize, |len, buf| len.saturating_add(buf.len()));
             self.try_open(total_len);
         }
-        if matches!(self.state, AutoWriterState::Opening { .. }) {
+        if matches!(self.state, AutoLaneWriterState::Opening { .. }) {
             ready!(self.poll_open(cx))?;
         }
         let writer = match self.active_writer() {
@@ -405,29 +405,29 @@ impl AutoWriter {
 
     pub fn shutdown(&mut self) -> Result<(), AutoWriteError> {
         match &mut self.state {
-            AutoWriterState::Active { writer } => {
+            AutoLaneWriterState::Active { writer } => {
                 writer.shutdown().map_err(AutoWriteError::SendFailed)
             }
-            AutoWriterState::Pending { reader_tx, .. } => {
+            AutoLaneWriterState::Pending { reader_tx, .. } => {
                 if let Some(tx) = reader_tx.take() {
                     let _ = tx.send(Err(DualStreamOpenError::CleanClose));
                 }
-                self.state = AutoWriterState::Failed;
+                self.state = AutoLaneWriterState::Failed;
                 Ok(())
             }
-            AutoWriterState::Opening { reader_tx, .. } => {
+            AutoLaneWriterState::Opening { reader_tx, .. } => {
                 if let Some(tx) = reader_tx.take() {
                     let _ = tx.send(Err(DualStreamOpenError::CleanClose));
                 }
-                self.state = AutoWriterState::Failed;
+                self.state = AutoLaneWriterState::Failed;
                 Ok(())
             }
-            AutoWriterState::Failed => Ok(()),
+            AutoLaneWriterState::Failed => Ok(()),
         }
     }
 }
 
-impl AsyncWrite for AutoWriter {
+impl AsyncWrite for AutoLaneWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -463,7 +463,7 @@ impl AsyncWrite for AutoWriter {
     }
 }
 
-impl Drop for AutoWriter {
+impl Drop for AutoLaneWriter {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -486,14 +486,14 @@ fn auto_write_to_io(e: AutoWriteError) -> io::Error {
 }
 
 // ---------------------------------------------------------------------------
-// AutoReader
+// AutoLaneReader
 // ---------------------------------------------------------------------------
 
-pub struct AutoReader {
-    state: AutoReaderState,
+pub struct AutoLaneReader {
+    state: AutoLaneReaderState,
 }
 
-enum AutoReaderState {
+enum AutoLaneReaderState {
     Pending {
         rx: oneshot::Receiver<Result<StreamReader, DualStreamOpenError>>,
     },
@@ -504,21 +504,21 @@ enum AutoReaderState {
     Failed,
 }
 
-impl std::fmt::Debug for AutoReader {
+impl std::fmt::Debug for AutoLaneReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AutoReader").finish_non_exhaustive()
+        f.debug_struct("AutoLaneReader").finish_non_exhaustive()
     }
 }
 
-impl AutoReader {
+impl AutoLaneReader {
     fn new(rx: oneshot::Receiver<Result<StreamReader, DualStreamOpenError>>) -> Self {
         Self {
-            state: AutoReaderState::Pending { rx },
+            state: AutoLaneReaderState::Pending { rx },
         }
     }
 }
 
-impl AsyncRead for AutoReader {
+impl AsyncRead for AutoLaneReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -527,25 +527,25 @@ impl AsyncRead for AutoReader {
         loop {
             let this = self.deref_mut();
             match &mut this.state {
-                AutoReaderState::Pending { rx } => match ready!(Pin::new(rx).poll(cx)) {
+                AutoLaneReaderState::Pending { rx } => match ready!(Pin::new(rx).poll(cx)) {
                     Ok(Ok(reader)) => {
-                        this.state = AutoReaderState::Ready { reader };
+                        this.state = AutoLaneReaderState::Ready { reader };
                         continue;
                     }
                     Ok(Err(DualStreamOpenError::CleanClose)) => {
-                        this.state = AutoReaderState::Eof;
+                        this.state = AutoLaneReaderState::Eof;
                         return Poll::Ready(Ok(()));
                     }
                     Ok(Err(_)) | Err(_) => {
-                        this.state = AutoReaderState::Failed;
+                        this.state = AutoLaneReaderState::Failed;
                         return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
                     }
                 },
-                AutoReaderState::Ready { reader } => {
+                AutoLaneReaderState::Ready { reader } => {
                     return Pin::new(reader).poll_read(cx, buf);
                 }
-                AutoReaderState::Eof => return Poll::Ready(Ok(())),
-                AutoReaderState::Failed => {
+                AutoLaneReaderState::Eof => return Poll::Ready(Ok(())),
+                AutoLaneReaderState::Failed => {
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
                 }
             }
@@ -602,12 +602,11 @@ impl DualStreamAccepter {
 // Spawn helpers
 // ---------------------------------------------------------------------------
 
-/// Like [`spawn_dual_mux_paired`] but also wires a joint-liveness
-/// supervisor: the two lane spawners are folded into `supervisor`. When
-/// either lane's mux session finishes (or errors), the supervisor
-/// aborts the other lane and kills the shared [`Liveness`] guard so
-/// every extant stream handle on the surviving lane errors (rather
-/// than hanging) — the two lanes are one session.
+/// Wires a joint-liveness supervisor: the two lane spawners are folded
+/// into `supervisor`. When either lane's mux session finishes (or
+/// errors), the supervisor aborts the other lane and kills the shared
+/// [`Liveness`] guard so every extant stream handle on the surviving
+/// lane errors (rather than hanging) — the two lanes are one session.
 ///
 /// The lane sessions already enforce a receive deadline derived from
 /// the heartbeat interval (`RECEIVE_DEADLINE_INTERVALS` in
@@ -660,7 +659,7 @@ pub async fn spawn_dual_mux_connector<F, Fut, R, W>(
     mut connect_interactive: F,
     mut connect_bulk: impl FnMut() -> Fut,
     config: MuxConfig,
-    spawner: &mut JoinSet<MuxError>,
+    tasks: &mut JoinSet<MuxError>,
 ) -> Result<(DualStreamOpener, DualStreamAccepter), DualMuxError>
 where
     F: FnMut() -> Fut,
@@ -694,21 +693,21 @@ where
         spawn_mux_no_reconnection(bulk_reader, bulk_writer, config.clone(), &mut bulk_spawner);
     let liveness = Liveness::new();
     let killer = liveness.clone();
-    spawner.spawn(async move { killer.watch_dual_lanes(int_spawner, bulk_spawner).await });
+    tasks.spawn(async move { killer.watch_dual_lanes(int_spawner, bulk_spawner).await });
     let opener = DualStreamOpener::new(int_opener, bulk_opener, liveness.clone());
     let accepter = DualStreamAccepter::new(int_accepter, bulk_accepter, liveness);
     Ok((opener, accepter))
 }
 
 /// Read one lane hello from a freshly-connected transport with a deadline.
-/// Returns the lane class, nonce, and a [`PendingAcceptor`] that can be
+/// Returns the lane class, nonce, and a [`UnpairedLane`] that can be
 /// paired with its partner later via [`complete_pairing`].
-pub async fn spawn_dual_mux_acceptor<R, W>(
+pub async fn begin_lane_pairing<R, W>(
     mut reader: R,
     writer: W,
     config: MuxConfig,
     hello_deadline: Duration,
-) -> Result<(LaneClass, PairingNonce, PendingAcceptor), DualMuxError>
+) -> Result<(LaneClass, PairingNonce, UnpairedLane), DualMuxError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -721,13 +720,13 @@ where
         };
     let mut lane_spawner = JoinSet::new();
     let (opener, accepter) = spawn_mux_no_reconnection(reader, writer, config, &mut lane_spawner);
-    let pending = PendingAcceptor {
+    let pending = UnpairedLane {
         class,
         nonce,
         group,
         opener,
         accepter,
-        spawner: lane_spawner,
+        tasks: lane_spawner,
     };
     Ok((class, nonce, pending))
 }
@@ -738,32 +737,32 @@ where
 /// construct a pending acceptor by spawning the mux session themselves
 /// (e.g. to send a kill packet on the raw transport before the mux is
 /// started when the hello is rejected).
-pub struct PendingAcceptor {
+pub struct UnpairedLane {
     pub class: LaneClass,
     pub nonce: PairingNonce,
     pub group: GroupToken,
     pub opener: StreamOpener,
     pub accepter: StreamAccepter,
-    pub spawner: JoinSet<MuxError>,
+    pub tasks: JoinSet<MuxError>,
 }
 
-impl std::fmt::Debug for PendingAcceptor {
+impl std::fmt::Debug for UnpairedLane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingAcceptor")
+        f.debug_struct("UnpairedLane")
             .field("class", &self.class)
             .field("nonce", &self.nonce)
             .finish_non_exhaustive()
     }
 }
 
-impl PendingAcceptor {
+impl UnpairedLane {
     pub fn new(
         class: LaneClass,
         nonce: PairingNonce,
         group: GroupToken,
         opener: StreamOpener,
         accepter: StreamAccepter,
-        spawner: JoinSet<MuxError>,
+        tasks: JoinSet<MuxError>,
     ) -> Self {
         Self {
             class,
@@ -771,23 +770,23 @@ impl PendingAcceptor {
             group,
             opener,
             accepter,
-            spawner,
+            tasks,
         }
     }
 }
 
 /// Combine two pending acceptors with matching nonces into a dual-lane
-/// facade. Both lane spawners are folded into `spawner`.
+/// facade. Both lane spawners are folded into `tasks`.
 pub fn complete_pairing(
-    pending1: PendingAcceptor,
-    pending2: PendingAcceptor,
-    spawner: &mut JoinSet<MuxError>,
+    pending1: UnpairedLane,
+    pending2: UnpairedLane,
+    tasks: &mut JoinSet<MuxError>,
 ) -> Result<(DualStreamOpener, DualStreamAccepter), DualMuxError> {
     if pending1.nonce != pending2.nonce {
         return Err(DualMuxError::NonceMismatch);
     }
     if pending1.class == pending2.class {
-        return Err(DualMuxError::NonceMismatch);
+        return Err(DualMuxError::LaneClassConflict);
     }
     if pending1.group != pending2.group {
         return Err(DualMuxError::GroupMismatch);
@@ -795,13 +794,13 @@ pub fn complete_pairing(
     let (int_pending, bulk_pending) = match (pending1.class, pending2.class) {
         (LaneClass::Interactive, LaneClass::Bulk) => (pending1, pending2),
         (LaneClass::Bulk, LaneClass::Interactive) => (pending2, pending1),
-        _ => return Err(DualMuxError::NonceMismatch),
+        _ => return Err(DualMuxError::LaneClassConflict),
     };
     let liveness = Liveness::new();
     let killer = liveness.clone();
-    spawner.spawn(async move {
+    tasks.spawn(async move {
         killer
-            .watch_dual_lanes(int_pending.spawner, bulk_pending.spawner)
+            .watch_dual_lanes(int_pending.tasks, bulk_pending.tasks)
             .await
     });
     let opener = DualStreamOpener::new(int_pending.opener, bulk_pending.opener, liveness.clone());
@@ -1141,7 +1140,7 @@ mod tests {
         let (srv_r, srv_w) = tokio::io::split(c2s);
 
         let result =
-            spawn_dual_mux_acceptor(srv_r, srv_w, srv_config(), Duration::from_millis(10)).await;
+            begin_lane_pairing(srv_r, srv_w, srv_config(), Duration::from_millis(10)).await;
         assert!(matches!(result, Err(DualMuxError::HelloDeadline)));
     }
 
@@ -1167,11 +1166,11 @@ mod tests {
 
         let mut set = JoinSet::new();
         let (_, _, pending_int) =
-            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
         let (_, _, pending_bulk) =
-            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
 
@@ -1195,11 +1194,11 @@ mod tests {
             .unwrap();
         let mut set = JoinSet::new();
         let (_, _, pending_int) =
-            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
         let (_, _, pending_bulk) =
-            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
         let result = complete_pairing(pending_int, pending_bulk, &mut set);
@@ -1224,11 +1223,11 @@ mod tests {
             .unwrap();
         let mut set = JoinSet::new();
         let (_, _, pending_int) =
-            spawn_dual_mux_acceptor(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(int_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
         let (_, _, pending_bulk) =
-            spawn_dual_mux_acceptor(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
+            begin_lane_pairing(bulk_r, duplex(1).1, srv_config(), Duration::from_secs(1))
                 .await
                 .unwrap();
         assert!(complete_pairing(pending_int, pending_bulk, &mut set).is_ok());
@@ -1343,7 +1342,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_receive_deadline_widens_after_birth_heartbeat() {
-        use crate::serve::spawn_mux_no_reconnection_with_first_receive_deadline;
+        use crate::session::spawn_mux_no_reconnection_with_first_receive_deadline;
 
         // Server side: short first-receive deadline (100 ms) but a
         // heartbeat_interval (400 ms) longer than it. The steady
@@ -1384,7 +1383,7 @@ mod tests {
 
         // Write the birth heartbeat — the first frame the server sees.
         // After this, the server must widen to the steady deadline.
-        write_birth_heartbeat(&mut injector_w).await.unwrap();
+        write_liveness_heartbeat(&mut injector_w).await.unwrap();
 
         // Let the server reader consume the heartbeat before time advances;
         // otherwise the 100 ms first-receive deadline would still be armed.
@@ -1408,10 +1407,10 @@ mod tests {
         // sleep past the point where the bug would be visible.
         let mut saw_timeout = false;
         while let Some(res) = srv_spawner.try_join_next() {
-            if let Ok(MuxError::IoReader(ref e)) = res {
-                if e.to_string().contains("receive deadline") {
-                    saw_timeout = true;
-                }
+            if let Ok(MuxError::IoReader(ref e)) = res
+                && e.to_string().contains("receive deadline")
+            {
+                saw_timeout = true;
             }
         }
         assert!(
@@ -1425,7 +1424,7 @@ mod tests {
         // alive on the widened (steady) deadline. This frame is only
         // delivered if the reader is still running (i.e. it did not time
         // out during the gap).
-        write_birth_heartbeat(&mut injector_w).await.unwrap();
+        write_liveness_heartbeat(&mut injector_w).await.unwrap();
 
         // Give the reader a moment to process the second heartbeat, then
         // assert the session is still alive (no completed tasks). A
@@ -1434,10 +1433,10 @@ mod tests {
         tokio::time::advance(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
         while let Some(res) = srv_spawner.try_join_next() {
-            if let Ok(MuxError::IoReader(ref e)) = res {
-                if e.to_string().contains("receive deadline") {
-                    saw_timeout = true;
-                }
+            if let Ok(MuxError::IoReader(ref e)) = res
+                && e.to_string().contains("receive deadline")
+            {
+                saw_timeout = true;
             }
         }
         assert!(
@@ -1451,7 +1450,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // spawn_dual_mux_acceptor: hello_deadline returns despite a writer
+    // begin_lane_pairing: hello_deadline returns despite a writer
     // whose poll_shutdown never readies.
     //
     // Regression: the old rejection arms ran
@@ -1507,7 +1506,7 @@ mod tests {
         let hello_deadline = Duration::from_millis(50);
 
         let start = std::time::Instant::now();
-        let result = spawn_dual_mux_acceptor(
+        let result = begin_lane_pairing(
             NeverReader,
             PendingShutdownWriter,
             srv_config(),

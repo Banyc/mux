@@ -52,7 +52,8 @@ pub(crate) enum ReassemblyError {
     OutOfWindow,
     BufferOverflow,
     RangeOverflow,
-    FinalOffsetBeforeCursor,
+    BeyondFinalOffset,
+    FinalOffsetConflict,
     AmbiguousOffset,
 }
 
@@ -103,10 +104,10 @@ impl ReorderBuffer {
         // [.. final_offset_abs).
         if let Some(fin) = self.final_offset_abs {
             if abs >= fin {
-                return Err(ReassemblyError::FinalOffsetBeforeCursor);
+                return Err(ReassemblyError::BeyondFinalOffset);
             }
             if end_abs > fin {
-                return Err(ReassemblyError::FinalOffsetBeforeCursor);
+                return Err(ReassemblyError::BeyondFinalOffset);
             }
         }
         // Out-of-window: offset too far ahead of cursor.
@@ -146,10 +147,10 @@ impl ReorderBuffer {
         // following buffered frame? (Missing in the old u32-keyed BTreeMap
         // — a predecessor-only check falsely rejects a valid frame that
         // wraps past u32::MAX while a near-0 frame is buffered.)
-        if let Some((&succ_abs, _succ_data)) = self.pending.range(abs + 1..).next() {
-            if end_abs > succ_abs {
-                return Err(ReassemblyError::Overlap);
-            }
+        if let Some((&succ_abs, _succ_data)) = self.pending.range(abs + 1..).next()
+            && end_abs > succ_abs
+        {
+            return Err(ReassemblyError::Overlap);
         }
         // Bounds: buffered bytes and range.
         let new_buffered = self
@@ -200,15 +201,15 @@ impl ReorderBuffer {
             return if fin_abs == existing {
                 Ok(())
             } else {
-                Err(ReassemblyError::FinalOffsetBeforeCursor)
+                Err(ReassemblyError::FinalOffsetConflict)
             };
         }
         if fin_abs < self.cursor {
-            return Err(ReassemblyError::FinalOffsetBeforeCursor);
+            return Err(ReassemblyError::FinalOffsetConflict);
         }
         for (&off, data) in &self.pending {
             if off + data.len() as u64 > fin_abs {
-                return Err(ReassemblyError::FinalOffsetBeforeCursor);
+                return Err(ReassemblyError::BeyondFinalOffset);
             }
         }
         self.final_offset_abs = Some(fin_abs);

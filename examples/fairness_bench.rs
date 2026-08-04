@@ -40,7 +40,7 @@ struct Cli {
 
 /// Maximum bytes the rate-limited writer hands to the underlying socket in a
 /// single `write` call. Matches the mux writer's
-/// `DATA_HEAD_EXTREME_CONTENDED_CAP` (1200 bytes): the QUIC-like packet
+/// `DATA_CONTENDED_CAP` (1200 bytes): the QUIC-like packet
 /// quantum for latency-sensitive/protected sends.
 const MAX_QUANTUM: usize = 1200;
 

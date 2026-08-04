@@ -22,7 +22,7 @@ use crate::{
 const REASSEMBLY_MAX_BODY: usize = 64 * 1024 - Header::SIZE - DataHeaderExt::SIZE;
 
 pub async fn run_central_io_writer<W>(
-    mut io_writer: CentralIoWriter<W>,
+    mut io_writer: CentralIoEncoder<W>,
     heartbeat_interval: Duration,
     mut control: WriteControlRx,
     mut data: WriteDataRx,
@@ -54,7 +54,7 @@ pub enum RunCentralIoWriterError {
 }
 
 #[derive(Debug)]
-pub struct CentralIoWriter<W> {
+pub struct CentralIoEncoder<W> {
     io_writer: W,
     /// Reused staging buffer for coalescing a non-vectored Data frame's fixed
     /// header and body into a single transport write. Grows to at most
@@ -71,7 +71,7 @@ pub struct CentralIoWriter<W> {
     /// `frame_reassembly` is true.
     next_offset: HashMap<StreamId, u64>,
 }
-impl<W> CentralIoWriter<W> {
+impl<W> CentralIoEncoder<W> {
     pub fn new(io_writer: W, frame_reassembly: bool) -> Self {
         Self {
             io_writer,
@@ -81,7 +81,7 @@ impl<W> CentralIoWriter<W> {
         }
     }
 }
-impl<W> CentralIoWriter<W>
+impl<W> CentralIoEncoder<W>
 where
     W: AsyncWrite + Unpin,
 {
@@ -258,7 +258,7 @@ mod tests {
     use primitive::arena::obj_pool::arc_buf_pool;
     use tokio::io::AsyncWrite;
 
-    use super::{CentralIoWriter, REASSEMBLY_MAX_BODY};
+    use super::{CentralIoEncoder, REASSEMBLY_MAX_BODY};
     use crate::central_io::scheduler::{StreamWriteData, WriteControlMsg, WriteDataMsg};
     use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header};
 
@@ -354,7 +354,7 @@ mod tests {
             vectored: true,
             write_vectored_calls: Arc::clone(&calls),
         };
-        let mut central = CentralIoWriter::new(writer, false);
+        let mut central = CentralIoEncoder::new(writer, false);
         let body = (0u8..200u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -376,7 +376,7 @@ mod tests {
             vectored: false,
             write_vectored_calls: Arc::new(Mutex::new(0)),
         };
-        let mut central = CentralIoWriter::new(writer, false);
+        let mut central = CentralIoEncoder::new(writer, false);
         let body = (0u8..200u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -436,7 +436,7 @@ mod tests {
             out: Vec::new(),
             write_calls: Arc::clone(&calls),
         };
-        let mut central = CentralIoWriter::new(writer, false);
+        let mut central = CentralIoEncoder::new(writer, false);
 
         let body: Vec<u8> = (0u8..=255).cycle().take(1234).collect();
         central
@@ -469,7 +469,7 @@ mod tests {
             vectored: true,
             write_vectored_calls: Arc::new(Mutex::new(0)),
         };
-        let mut central = CentralIoWriter::new(writer, false);
+        let mut central = CentralIoEncoder::new(writer, false);
         let big_len = usize::from(BodyLen::MAX) * 2 + 10;
         let body = (0u8..big_len as u8)
             .cycle()
@@ -523,7 +523,7 @@ mod tests {
         let b = tokio::net::TcpStream::connect(addr).await.unwrap();
         let a = accept.await.unwrap().0;
 
-        let mut spawner = tokio::task::JoinSet::new();
+        let mut tasks = tokio::task::JoinSet::new();
         let (a_r, a_w) = a.into_split();
         let (opener, _) = spawn_mux_no_reconnection(
             a_r,
@@ -533,7 +533,7 @@ mod tests {
                 heartbeat_interval: Duration::from_secs(5),
                 frame_reassembly: false,
             },
-            &mut spawner,
+            &mut tasks,
         );
         let (b_r, b_w) = b.into_split();
         let (_, mut accepter) = spawn_mux_no_reconnection(
@@ -544,7 +544,7 @@ mod tests {
                 heartbeat_interval: Duration::from_secs(5),
                 frame_reassembly: false,
             },
-            &mut spawner,
+            &mut tasks,
         );
 
         let (a_stream, b_stream) = tokio::join!(opener.open(), accepter.accept());
@@ -599,7 +599,7 @@ mod tests {
                 false
             }
         }
-        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), false);
+        let mut central = CentralIoEncoder::new(SinkWriter(Vec::new()), false);
         let body = (0u8..100u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -642,7 +642,7 @@ mod tests {
                 false
             }
         }
-        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), false);
+        let mut central = CentralIoEncoder::new(SinkWriter(Vec::new()), false);
         central.next_offset.insert(9, 123);
         central
             .send_control(WriteControlMsg::ForceCloseWrite(9))
@@ -684,7 +684,7 @@ mod tests {
                 false
             }
         }
-        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+        let mut central = CentralIoEncoder::new(SinkWriter(Vec::new()), true);
         let body: Vec<u8> = (0u8..50u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -754,7 +754,7 @@ mod tests {
                 false
             }
         }
-        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+        let mut central = CentralIoEncoder::new(SinkWriter(Vec::new()), true);
         let body: Vec<u8> = (0u8..50u8).collect::<Vec<u8>>();
         central
             .send_data(WriteDataMsg {
@@ -847,7 +847,7 @@ mod tests {
             }
         }
 
-        let mut central = CentralIoWriter::new(SinkWriter(Vec::new()), true);
+        let mut central = CentralIoEncoder::new(SinkWriter(Vec::new()), true);
 
         // Two chunks: REASSEMBLY_MAX_BODY + 1 forces the writer to split.
         let payload_len = REASSEMBLY_MAX_BODY + 7890;

@@ -19,7 +19,7 @@ impl StreamAccepter {
 }
 
 #[derive(Debug)]
-pub struct StreamAcceptMsg {
+pub struct StreamPair {
     pub reader: StreamReader,
     pub writer: StreamWriter,
 }
@@ -31,23 +31,23 @@ pub fn stream_accept_channel() -> (StreamAcceptTx, StreamAcceptRx) {
 }
 #[derive(Debug, Clone)]
 pub struct StreamAcceptTx {
-    tx: tokio::sync::mpsc::Sender<StreamAcceptMsg>,
+    tx: tokio::sync::mpsc::Sender<StreamPair>,
 }
 impl StreamAcceptTx {
-    pub fn try_send(&self, msg: StreamAcceptMsg) -> Result<(), DeadStreamInit> {
+    pub fn try_send(&self, msg: StreamPair) -> Result<(), DeadStreamInit> {
         self.tx.try_send(msg).map_err(|_| DeadStreamInit {})
     }
 }
 #[derive(Debug)]
 pub struct StreamAcceptRx {
-    rx: tokio::sync::mpsc::Receiver<StreamAcceptMsg>,
+    rx: tokio::sync::mpsc::Receiver<StreamPair>,
 }
 impl StreamAcceptRx {
-    pub async fn recv(&mut self) -> Result<StreamAcceptMsg, DeadControl> {
+    pub async fn recv(&mut self) -> Result<StreamPair, DeadControl> {
         self.rx.recv().await.ok_or(DeadControl {})
     }
     #[cfg(test)]
-    pub fn try_recv(&mut self) -> Result<StreamAcceptMsg, ()> {
+    pub fn try_recv(&mut self) -> Result<StreamPair, ()> {
         self.rx.try_recv().map_err(|_| ())
     }
 }

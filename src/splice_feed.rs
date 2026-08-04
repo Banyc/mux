@@ -1,17 +1,17 @@
 use tokio::sync::mpsc;
 
-use crate::stream_migration::{
+use crate::migration_wire::{
     GenerationReader, MigrationError, ResumeHeader, SpliceRegistry, SplicedReader,
     spawn_splice_driver, splice_driver_panics,
 };
 
 #[derive(Debug, Clone)]
-pub struct SpliceFeedHandle {
+pub struct SpliceRouterHandle {
     cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
     register_tx: mpsc::UnboundedSender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
 }
 
-impl SpliceFeedHandle {
+impl SpliceRouterHandle {
     pub(crate) fn send_continuation(
         &self,
         header: ResumeHeader,
@@ -20,7 +20,7 @@ impl SpliceFeedHandle {
         self.cont_tx.send((header, reader)).map_err(|_| ())
     }
 
-    pub(crate) fn expect_gen0(
+    pub(crate) fn await_gene(
         &self,
         logical_id: u64,
     ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
@@ -31,16 +31,16 @@ impl SpliceFeedHandle {
 }
 
 #[derive(Debug)]
-pub struct SpliceFeed {
-    handle: SpliceFeedHandle,
+pub struct SpliceRouter {
+    handle: SpliceRouterHandle,
     matcher: tokio::task::JoinHandle<()>,
     driver: tokio::task::JoinHandle<Result<(), MigrationError>>,
 }
 
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
 
-impl SpliceFeed {
-    pub fn handle(&self) -> SpliceFeedHandle {
+impl SpliceRouter {
+    pub fn handle(&self) -> SpliceRouterHandle {
         self.handle.clone()
     }
 
@@ -54,7 +54,7 @@ impl SpliceFeed {
     }
 }
 
-pub fn spawn_splice_feed() -> SpliceFeed {
+pub fn spawn_splice_router() -> SpliceRouter {
     let (cont_tx, cont_rx) = mpsc::unbounded_channel();
     let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, Option<SplicedReader>)>();
     let (register_tx, mut register_rx) =
@@ -90,14 +90,13 @@ pub fn spawn_splice_feed() -> SpliceFeed {
                             }
                         }
                         None => {
-                            if ready.len() >= MAX_UNCLAIMED_GEN0 {
-                                if let Some((evicted_id, _)) = ready.pop_front() {
+                            if ready.len() >= MAX_UNCLAIMED_GEN0
+                                && let Some((evicted_id, _)) = ready.pop_front() {
                                     tracing::debug!(
                                         evicted_id,
                                         "splice feed evicted an unclaimed gen-0 reader (ready queue full)"
                                     );
                                 }
-                            }
                             ready.push_back((id, spliced));
                         }
                     },
@@ -106,8 +105,8 @@ pub fn spawn_splice_feed() -> SpliceFeed {
             }
         }
     });
-    SpliceFeed {
-        handle: SpliceFeedHandle {
+    SpliceRouter {
+        handle: SpliceRouterHandle {
             cont_tx,
             register_tx,
         },

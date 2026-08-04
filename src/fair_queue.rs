@@ -14,24 +14,24 @@ const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
 const DATA_QUEUE_SIZE: usize = 2;
 
-pub fn channel<T>() -> (Opener<T>, Receiver<T>) {
+pub fn channel<T>() -> (QueueRegistrar<T>, Receiver<T>) {
     let (opener_tx, opener_rx) = mpsc::channel(OPENER_QUEUE_SIZE);
-    let tx = Opener::new(opener_tx);
+    let tx = QueueRegistrar::new(opener_tx);
     let rx = Receiver::new(opener_rx);
     (tx, rx)
 }
 #[derive(Debug)]
-pub struct Opener<T> {
+pub struct QueueRegistrar<T> {
     opener: mpsc::Sender<OpenRequest<T>>,
 }
-impl<T> Clone for Opener<T> {
+impl<T> Clone for QueueRegistrar<T> {
     fn clone(&self) -> Self {
         Self {
             opener: self.opener.clone(),
         }
     }
 }
-impl<T> Opener<T> {
+impl<T> QueueRegistrar<T> {
     fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
         Self { opener }
     }
@@ -60,12 +60,12 @@ impl<T> Opener<T> {
 }
 #[derive(Debug)]
 pub struct LazySender<T> {
-    opener: Opener<T>,
+    opener: QueueRegistrar<T>,
     opening_value: Option<T>,
     sender: Option<NotClone<Sender<T>>>,
 }
 impl<T> LazySender<T> {
-    fn new(opener: Opener<T>, opening_value: T) -> Self {
+    fn new(opener: QueueRegistrar<T>, opening_value: T) -> Self {
         Self {
             opener,
             opening_value: Some(opening_value),
@@ -179,14 +179,14 @@ impl<T> Sender<T> {
 /// Inner fields shared across all clones of a channel's `SenderState`. The
 /// ready-mark `Drop` lives here rather than on `SenderState` itself so it
 /// fires exactly once — when the *last* clone drops — instead of on every
-/// clone drop, which previously injected phantom `ReadyTree` counts backed by
+/// clone drop, which previously injected phantom `ReadyCounts` counts backed by
 /// no message and accumulated forever (counts only drain via `sub` per
 /// received message). Coinciding with the mpsc channel's actual close keeps
 /// the mark semantically a "channel closed" signal.
 #[derive(Debug)]
 struct SenderStateShared {
-    ready: Arc<Mutex<ReadyTree>>,
-    token: Token,
+    ready: Arc<Mutex<ReadyCounts>>,
+    token: QueueToken,
 }
 impl Drop for SenderStateShared {
     fn drop(&mut self) {
@@ -198,7 +198,7 @@ struct SenderState {
     shared: Arc<SenderStateShared>,
 }
 impl SenderState {
-    pub fn new(ready: Arc<Mutex<ReadyTree>>, token: Token) -> Self {
+    pub fn new(ready: Arc<Mutex<ReadyCounts>>, token: QueueToken) -> Self {
         Self {
             shared: Arc::new(SenderStateShared { ready, token }),
         }
@@ -210,7 +210,7 @@ impl SenderState {
     ) -> Result<(), mpsc::error::TrySendError<T>> {
         let mut undo = ready_incr(&self.shared.ready, self.shared.token);
         queue.try_send(value)?;
-        undo.cancel();
+        undo.commit();
         Ok(())
     }
     /// # Cancel safety
@@ -223,7 +223,7 @@ impl SenderState {
     ) -> Result<(), mpsc::error::SendError<T>> {
         let mut undo = ready_incr(&self.shared.ready, self.shared.token);
         queue.send(value).await?;
-        undo.cancel();
+        undo.commit();
         Ok(())
     }
     pub fn poll_reserve<T: Send>(
@@ -250,7 +250,7 @@ impl SenderState {
         if let Err(e) = queue.send_item(value) {
             return Err(e.into_inner().unwrap());
         }
-        undo.cancel();
+        undo.commit();
         Ok(())
     }
 }
@@ -258,25 +258,25 @@ impl SenderState {
 #[derive(Debug)]
 pub struct Receiver<T> {
     opener: mpsc::Receiver<OpenRequest<T>>,
-    next_new_token: Token,
-    ready: Arc<Mutex<ReadyTree>>,
-    queues: BTreeMap<Token, mpsc::Receiver<T>>,
-    recv_queue_start: Token,
+    next_new_token: QueueToken,
+    ready: Arc<Mutex<ReadyCounts>>,
+    queues: BTreeMap<QueueToken, mpsc::Receiver<T>>,
+    recv_queue_start: QueueToken,
 }
 impl<T> Receiver<T> {
     fn new(opener: mpsc::Receiver<OpenRequest<T>>) -> Self {
         Self {
             opener,
-            next_new_token: Token(0),
-            ready: Arc::new(Mutex::new(ReadyTree::new())),
+            next_new_token: QueueToken(0),
+            ready: Arc::new(Mutex::new(ReadyCounts::new())),
             queues: BTreeMap::new(),
-            recv_queue_start: Token(0),
+            recv_queue_start: QueueToken(0),
         }
     }
-    pub async fn recv(&mut self) -> Option<(Token, ReceiverRecv<T>)> {
+    pub async fn recv(&mut self) -> Option<(QueueToken, ReceiverRecv<T>)> {
         struct FairReceiverRecv<'a, T>(&'a mut Receiver<T>);
         impl<T> Future for FairReceiverRecv<'_, T> {
-            type Output = Option<(Token, ReceiverRecv<T>)>;
+            type Output = Option<(QueueToken, ReceiverRecv<T>)>;
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.deref_mut();
                 this.0.poll_recv(cx)
@@ -284,7 +284,10 @@ impl<T> Receiver<T> {
         }
         FairReceiverRecv(self).await
     }
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Token, ReceiverRecv<T>)>> {
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(QueueToken, ReceiverRecv<T>)>> {
         self.poll_recv_excluding(cx, |_| false)
     }
     /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`
@@ -295,9 +298,9 @@ impl<T> Receiver<T> {
         &mut self,
         cx: &mut Context<'_>,
         excluded: E,
-    ) -> Poll<Option<(Token, ReceiverRecv<T>)>>
+    ) -> Poll<Option<(QueueToken, ReceiverRecv<T>)>>
     where
-        E: FnMut(Token) -> bool,
+        E: FnMut(QueueToken) -> bool,
     {
         let mut excluded = excluded;
         while self.queues.len() != MAX_QUEUE_COUNT {
@@ -308,7 +311,7 @@ impl<T> Receiver<T> {
                     assert!(rx.poll_recv(cx).is_pending(), "register waker");
                     let new_token = loop {
                         let token = self.next_new_token;
-                        self.next_new_token = Token(self.next_new_token.0.wrapping_add(1));
+                        self.next_new_token = QueueToken(self.next_new_token.0.wrapping_add(1));
                         if !self.queues.contains_key(&token) {
                             break token;
                         }
@@ -340,7 +343,7 @@ impl<T> Receiver<T> {
                     if wrapped {
                         break;
                     }
-                    self.recv_queue_start = Token(0);
+                    self.recv_queue_start = QueueToken(0);
                     wrapped = true;
                     continue;
                 };
@@ -357,11 +360,11 @@ impl<T> Receiver<T> {
             // that already has a cached head upstream.
             if excluded(token) {
                 saw_ready = true;
-                self.recv_queue_start = Token(token.0.wrapping_add(1));
+                self.recv_queue_start = QueueToken(token.0.wrapping_add(1));
                 continue;
             }
             let queue = self.queues.get_mut(&token).unwrap();
-            self.recv_queue_start = Token(token.0.wrapping_add(1));
+            self.recv_queue_start = QueueToken(token.0.wrapping_add(1));
             match queue.poll_recv(cx) {
                 Poll::Ready(Some(value)) => {
                     self.ready.lock().unwrap().sub(token);
@@ -371,7 +374,7 @@ impl<T> Receiver<T> {
                     {
                         let mut ready = self.ready.lock().unwrap();
                         ready.sub(token);
-                        assert!(!ready.spurious_unready(token).is_spurious);
+                        assert!(!ready.try_mark_unready(token).is_spurious);
                     }
                     self.queues.remove(&token);
                     return Some((token, ReceiverRecv::Close)).into();
@@ -381,7 +384,7 @@ impl<T> Receiver<T> {
                         .ready
                         .lock()
                         .unwrap()
-                        .spurious_unready(token)
+                        .try_mark_unready(token)
                         .is_spurious
                     {
                         // The just-polled queue registered our waker (its
@@ -430,11 +433,11 @@ struct OpenRequest<T> {
 #[derive(Debug)]
 struct OpenResponse<T> {
     pub dedicated_chan: mpsc::Sender<T>,
-    pub token: Token,
-    pub ready: Arc<Mutex<ReadyTree>>,
+    pub token: QueueToken,
+    pub ready: Arc<Mutex<ReadyCounts>>,
 }
 
-fn ready_incr<'a>(tree: &'a Mutex<ReadyTree>, token: Token) -> UndoGuard<impl FnMut() + 'a> {
+fn ready_incr<'a>(tree: &'a Mutex<ReadyCounts>, token: QueueToken) -> UndoGuard<impl FnMut() + 'a> {
     tree.lock().unwrap().add(token);
     UndoGuard::new(move || {
         tree.lock().unwrap().sub(token);
@@ -442,20 +445,20 @@ fn ready_incr<'a>(tree: &'a Mutex<ReadyTree>, token: Token) -> UndoGuard<impl Fn
 }
 
 #[derive(Debug, Clone)]
-struct ReadyTree {
-    ready_count: BTreeMap<Token, usize>,
+struct ReadyCounts {
+    ready_count: BTreeMap<QueueToken, usize>,
 }
-impl ReadyTree {
+impl ReadyCounts {
     pub fn new() -> Self {
         Self {
             ready_count: BTreeMap::new(),
         }
     }
-    pub fn add(&mut self, token: Token) {
+    pub fn add(&mut self, token: QueueToken) {
         let count = self.ready_count.entry(token).or_insert(0);
         *count += 1;
     }
-    pub fn sub(&mut self, token: Token) {
+    pub fn sub(&mut self, token: QueueToken) {
         let Some(count) = self.ready_count.get_mut(&token) else {
             return;
         };
@@ -467,7 +470,7 @@ impl ReadyTree {
             _ => *count -= 1,
         }
     }
-    pub fn spurious_unready(&mut self, token: Token) -> UnreadyResult {
+    pub fn try_mark_unready(&mut self, token: QueueToken) -> UnreadyResult {
         let Some(count) = self.ready_count.get(&token) else {
             return UnreadyResult { is_spurious: true };
         };
@@ -481,7 +484,7 @@ impl ReadyTree {
     pub fn is_empty(&self) -> bool {
         self.ready_count.is_empty()
     }
-    pub fn next(&self, start: Token) -> Option<Token> {
+    pub fn next(&self, start: QueueToken) -> Option<QueueToken> {
         let (token, _) = self.ready_count.range(start..).next()?;
         Some(*token)
     }
@@ -512,7 +515,7 @@ impl<F: FnMut()> UndoGuard<F> {
             undo,
         }
     }
-    pub fn cancel(&mut self) {
+    pub fn commit(&mut self) {
         self.no_undo = true;
     }
 }
@@ -520,7 +523,7 @@ impl<F: FnMut()> UndoGuard<F> {
 #[derive(Debug)]
 struct NotClone<T>(pub T);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Token(pub usize);
+pub struct QueueToken(pub usize);
 
 #[cfg(test)]
 mod tests {

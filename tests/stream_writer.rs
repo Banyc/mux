@@ -17,7 +17,7 @@ fn spawn_mux_pair(
     mux::StreamAccepter,
     JoinSet<mux::MuxError>,
 ) {
-    let mut spawner = JoinSet::new();
+    let mut tasks = JoinSet::new();
     let (client_read, server_write) = duplex(DUPLEX_BUF);
     let (server_read, client_write) = duplex(DUPLEX_BUF);
     let (client_opener, _client_accepter) = spawn_mux_no_reconnection(
@@ -28,7 +28,7 @@ fn spawn_mux_pair(
             heartbeat_interval: Duration::from_secs(60),
             frame_reassembly,
         },
-        &mut spawner,
+        &mut tasks,
     );
     let (_server_opener, server_accepter) = spawn_mux_no_reconnection(
         server_read,
@@ -38,9 +38,9 @@ fn spawn_mux_pair(
             heartbeat_interval: Duration::from_secs(60),
             frame_reassembly,
         },
-        &mut spawner,
+        &mut tasks,
     );
-    (client_opener, server_accepter, spawner)
+    (client_opener, server_accepter, tasks)
 }
 
 #[tokio::test(flavor = "multi_thread")]
