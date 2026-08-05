@@ -215,16 +215,26 @@ mod tests {
         let mut router = spawn_splice_router();
         let dropped = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&dropped);
-        router.tasks.spawn(async move {
-            let _guard = DropCounter(counter);
-            std::future::pending::<()>().await;
-            #[allow(unreachable_code)]
-            SpliceTaskExit::MatcherDone
+        let started = Arc::new(tokio::sync::Notify::new());
+        router.tasks.spawn({
+            let started = started.clone();
+            async move {
+                let _guard = DropCounter(counter);
+                started.notify_waiters();
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                SpliceTaskExit::MatcherDone
+            }
         });
+        // Let the child run so its guard actually exists before aborting;
+        // an aborted-but-never-polled task never constructed it.
+        started.notified().await;
         drop(router);
+        // Abort is asynchronous: the runtime must poll the aborted task to
+        // drop its future (and the guard).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while dropped.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(
             dropped.load(Ordering::SeqCst),
