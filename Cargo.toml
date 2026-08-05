@@ -19,6 +19,18 @@ tokio = { version = "1", features = ["full", "test-util"] }
 [features]
 nightly = []
 
+[lints.clippy]
+# Structural concurrency: every spawned task must be owned by a
+# `JoinSet` held by a long-lived owner (e.g. `SpliceRouter`, a mux
+# session, or the owning writer). The owner reaps children and its drop
+# is the abort backstop. Detached `tokio::spawn`/`Handle::spawn` escape
+# that ownership, so they are disallowed in production code.
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "spawned work must be owned by a JoinSet held by a long-lived owner; detached tasks escape supervision and are aborted only by the runtime" },
+    { path = "tokio::task::spawn", reason = "spawned work must be owned by a JoinSet held by a long-lived owner; detached tasks escape supervision and are aborted only by the runtime" },
+    { path = "tokio::runtime::Handle::spawn", reason = "Handle::spawn is detached with no owner to reap or abort the task; submit the work to an owned JoinSet instead" },
+]
+
 [profile.profiling]
 debug = true
 inherits = "release"

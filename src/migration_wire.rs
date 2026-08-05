@@ -25,7 +25,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -743,50 +742,27 @@ impl AsyncRead for SplicedReader {
 // spawn_splice_driver — owns the SpliceRegistry + queue feeding
 // ---------------------------------------------------------------------------
 
-static SPLICE_DRIVER_PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Number of times the splice driver task has panicked since process start.
-/// The detached driver is spawned through [`spawn_panic_guarded`], which
-/// increments this counter on panic so a crash is observable instead of
-/// being silently swallowed.
-pub(crate) fn splice_driver_panics() -> usize {
-    SPLICE_DRIVER_PANIC_COUNT.load(Ordering::SeqCst)
-}
-
-/// Spawn a detached background task through a panic-counter guard: if the
-/// inner task panics, the wrapper increments [`SPLICE_DRIVER_PANIC_COUNT`]
-/// and re-raises the panic so it aborts the wrapper task too.
-fn spawn_panic_guarded<F, T>(fut: F) -> tokio::task::JoinHandle<T>
-where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::spawn(async move {
-        let inner = tokio::spawn(fut);
-        match inner.await {
-            Ok(output) => output,
-            Err(join_err) => {
-                SPLICE_DRIVER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(error = ?join_err, "splice driver task panicked");
-                std::panic::resume_unwind(join_err.into_panic())
-            }
-        }
-    })
-}
-
-/// Spawn a background task that reads continuation readers from a
-/// channel and dispatches them into the [`SpliceRegistry`], feeding
-/// successor generations into the matching [`SplicedReader`]'s queue.
+/// Returns the splice-driver *future*. The caller is responsible for running
+/// it in a supervised [`JoinSet`](tokio::task::JoinSet) (the
+/// [`SpliceRouter`](crate::splice_feed::SpliceRouter) does this), so a
+/// panic in the driver surfaces as a `JoinError` on reap instead of being
+/// silently swallowed by a detached task.
+///
+/// The driver reads continuation readers from a channel and dispatches them
+/// into the [`SpliceRegistry`], feeding successor generations into the
+/// matching [`SplicedReader`]'s queue.
 ///
 /// Gen‑0 generations produce a [`SplicedReader`] sent back on `gen0_tx`;
 /// successor generations are dequeued from the registry in generation
 /// order and pushed into the matching [`SplicedReader`]'s queue.
 pub fn spawn_splice_driver(
-    mut registry: SpliceRegistry,
-    mut cont_rx: tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
+    registry: SpliceRegistry,
+    cont_rx: tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
     gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
-) -> tokio::task::JoinHandle<Result<(), MigrationError>> {
-    spawn_panic_guarded(async move {
+) -> impl Future<Output = Result<(), MigrationError>> {
+    async move {
+        let mut registry = registry;
+        let mut cont_rx = cont_rx;
         let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
             HashMap::new();
         let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
@@ -912,7 +888,7 @@ pub fn spawn_splice_driver(
             }
         }
         Ok(())
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,7 +1816,7 @@ mod tests {
         let registry = SpliceRegistry::new();
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (c0, mut s0) = duplex(64);
         let h0 = ResumeHeader {
             logical_id: 77,
@@ -1913,7 +1889,7 @@ mod tests {
         let registry = SpliceRegistry::new();
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let _driver = spawn_driver(registry, cont_rx, gen0_tx);
 
         let (c_final, _s_final) = duplex(64);
         let h_final = ResumeHeader {
@@ -1974,7 +1950,7 @@ mod tests {
         let registry = SpliceRegistry::new();
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let _driver = spawn_driver(registry, cont_rx, gen0_tx);
 
         let (c0, mut s0) = duplex(64);
         let h0 = ResumeHeader {
@@ -2029,7 +2005,7 @@ mod tests {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(100));
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (final_reader, mut final_writer) = duplex(8);
         final_writer.write_all(b"x").await.unwrap();
         drop(final_writer);
@@ -2074,7 +2050,7 @@ mod tests {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(50));
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _driver = spawn_splice_driver(registry, cont_rx, gen0_tx);
+        let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (final_reader, final_writer) = duplex(1);
         drop(final_writer);
         cont_tx
@@ -2115,6 +2091,7 @@ mod tests {
 
     type Gen0Rx = tokio::sync::mpsc::UnboundedReceiver<(u64, Option<SplicedReader>)>;
     type ContTx = tokio::sync::mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>;
+    type ContRx = tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>;
 
     fn expect_gen0_reader(received: Option<(u64, Option<SplicedReader>)>) -> (u64, SplicedReader) {
         let (logical_id, spliced) = received.expect("the driver answered the gen-0");
@@ -2124,11 +2101,29 @@ mod tests {
         )
     }
 
-    fn driver(registry: SpliceRegistry) -> (ContTx, Gen0Rx) {
+    /// Spawn the splice-driver future into a supervised JoinSet so it stays
+    /// alive for the duration of the test and is aborted on test exit.
+    fn spawn_driver(
+        registry: SpliceRegistry,
+        cont_rx: ContRx,
+        gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
+    ) -> tokio::task::JoinSet<Result<(), MigrationError>> {
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(spawn_splice_driver(registry, cont_rx, gen0_tx));
+        set
+    }
+
+    fn driver(
+        registry: SpliceRegistry,
+    ) -> (
+        ContTx,
+        Gen0Rx,
+        tokio::task::JoinSet<Result<(), MigrationError>>,
+    ) {
         let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
         let (gen0_tx, gen0_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_splice_driver(registry, cont_rx, gen0_tx);
-        (cont_tx, gen0_rx)
+        let driver_set = spawn_driver(registry, cont_rx, gen0_tx);
+        (cont_tx, gen0_rx, driver_set)
     }
 
     fn hdr(logical_id: u64, generation: u32, is_final: bool) -> ResumeHeader {
@@ -2172,7 +2167,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_duplicate_orphan_generation_does_not_replace_the_real_one() {
-        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
         let mut real = send_gen(&cont_tx, hdr(1, 1, false));
         real.write_all(b"real").await.unwrap();
         real.shutdown().await.unwrap();
@@ -2251,7 +2246,7 @@ mod tests {
     #[tokio::test]
     async fn redelivered_generation_does_not_wedge_the_stream() {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(500));
-        let (cont_tx, mut gen0_rx) = driver(registry);
+        let (cont_tx, mut gen0_rx, _driver) = driver(registry);
         let mut s0 = send_gen(&cont_tx, hdr(7, 0, false));
         let (_id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
         s0.write_all(b"gen0-").await.unwrap();
@@ -2275,7 +2270,7 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_cap_does_not_kill_the_splice_driver() {
-        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
         for i in 0..=MAX_ORPHAN_STREAMS as u64 {
             let _s = send_gen(&cont_tx, hdr(1000 + i, 1, false));
         }
@@ -2290,7 +2285,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_generation_cap_retires_only_the_offending_stream() {
-        let (cont_tx, mut gen0_rx) = driver(SpliceRegistry::new());
+        let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
         let _s0 = send_gen(&cont_tx, hdr(77, 0, false));
         let (id, _reader) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id, 77);
@@ -2343,22 +2338,5 @@ mod tests {
         let (c_over, _s_over) = duplex(1);
         let result = registry.dispatch(hdr(MAX_SPLICE_STREAMS as u64, 0, false), c_over);
         assert!(matches!(result, Err(MigrationError::TooManySpliceStreams)));
-    }
-
-    // -------------------------------------------------------------------
-    // Fix: the splice driver's detached spawn is panic-counter guarded, so
-    // a panic is observable through `splice_driver_panics()` instead of
-    // being silently swallowed.
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn splice_driver_panic_increments_panic_counter() {
-        let before = splice_driver_panics();
-        let handle = spawn_panic_guarded(async { panic!("intentional splice driver panic") });
-        let err = handle
-            .await
-            .expect_err("the guarded task must re-raise its panic");
-        assert!(err.is_panic(), "the re-raised join error must be a panic");
-        assert_eq!(splice_driver_panics(), before + 1);
     }
 }

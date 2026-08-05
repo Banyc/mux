@@ -103,6 +103,10 @@ pub struct MigratingStreamWriter {
     /// delivered via [`gen0_reader_tx`]. `None` while no successor is
     /// open.
     latest_held_reader: Option<StreamReader>,
+    /// Owns the in-flight detached finalizer tasks. Dropping the writer
+    /// aborts any finalizer still running (the abort backstop); callers
+    /// that need a confirmed close await [`Self::finalize`] instead.
+    finalizers: tokio::task::JoinSet<()>,
 }
 
 impl std::fmt::Debug for MigratingStreamWriter {
@@ -129,6 +133,7 @@ impl MigratingStreamWriter {
             auto_migrate,
             gen0_reader_tx: None,
             latest_held_reader: None,
+            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -148,6 +153,7 @@ impl MigratingStreamWriter {
             auto_migrate,
             gen0_reader_tx: Some(gen0_reader_tx),
             latest_held_reader: None,
+            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -180,6 +186,7 @@ impl MigratingStreamWriter {
             auto_migrate: true,
             gen0_reader_tx: None,
             latest_held_reader: None,
+            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -301,11 +308,15 @@ impl MigratingStreamWriter {
 
     /// Best-effort close: closes the active writer (if any) and emits a
     /// FINAL-marker generation so the peer receives a clean EOF. The
-    /// FINAL generation is written by a detached background task (the
+    /// FINAL generation is written by a background task (the
     /// [`GenerationChain`] and an owned [`DualStreamOpener`] clone move
-    /// into it), so this method stays synchronous. If the stream was
-    /// never announced to the peer (still unopened), this is a no-op — no
-    /// FINAL is emitted for a stream the peer never saw.
+    /// into it), so this method stays synchronous. The finalizer is owned
+    /// by this writer's [`JoinSet`] — it runs while the writer is alive
+    /// and is aborted when the writer is dropped (the abort backstop).
+    /// Callers that need a confirmed close must await [`Self::finalize`]
+    /// instead. If the stream was never announced to the peer (still
+    /// unopened), this is a no-op — no FINAL is emitted for a stream the
+    /// peer never saw.
     pub fn finalize_detached(&mut self) -> Result<(), MigratingStreamError> {
         if self.nothing_to_close() {
             self.state = WriterState::Closed;
@@ -316,8 +327,11 @@ impl MigratingStreamWriter {
         }
         let opener = self.opener.clone();
         let mut chain = std::mem::replace(&mut self.chain, GenerationChain::new(0));
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
+        // Outside a Tokio runtime context (e.g. a writer dropped after its
+        // runtime went away) there is nowhere for the finalizer to run, so
+        // it is skipped.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.finalizers.spawn(async move {
                 if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
                     let _ = chain
                         .start_generation(&mut as_async_write(&mut final_writer), true)
@@ -1096,7 +1110,7 @@ mod tests {
         assert_eq!(&resp[..5], b"head-");
         assert!(resp[5..5 + 40_000].iter().all(|b| *b == 0xEE));
         assert_eq!(&resp[5 + 40_000..], b"-tail");
-        req_writer.finalize_detached().unwrap();
+        req_writer.finalize().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1120,7 +1134,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp, "pong");
-        req_writer.finalize_detached().unwrap();
+        req_writer.finalize().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1197,7 +1211,7 @@ mod tests {
         writer.write_all(&[0u8; 3000]).await.unwrap();
 
         // The write was sent on the bulk lane. Just verify it didn't error.
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1216,7 +1230,7 @@ mod tests {
         }
 
         // After demotion, the writer should be on interactive lane.
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1235,7 +1249,7 @@ mod tests {
         writer.force_migrate(LaneClass::Bulk).await.unwrap();
 
         writer.write_all(&[0u8; 5000]).await.unwrap();
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1249,7 +1263,7 @@ mod tests {
         let mut writer = opener.open_migrating(1, LaneClass::Interactive);
 
         writer.write_all(&[0u8; 3000]).await.unwrap(); // triggers promote to bulk
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1265,7 +1279,7 @@ mod tests {
         // Two large writes back-to-back — both should promote immediately
         writer.write_all(&[0u8; 3000]).await.unwrap();
         writer.write_all(&[0u8; 4000]).await.unwrap();
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1391,7 +1405,7 @@ mod tests {
         let send = tokio::spawn(async move {
             let mut writer = opener.open_migrating(42, LaneClass::Interactive);
             writer.write_all(b"hello-world").await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         // Accept gen0
@@ -1441,7 +1455,7 @@ mod tests {
                 };
                 writer.force_migrate(target).await.unwrap();
             }
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1479,7 +1493,7 @@ mod tests {
             writer.write_all(second).await.unwrap();
             writer.force_migrate(LaneClass::Interactive).await.unwrap();
             writer.write_all(third).await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1581,7 +1595,7 @@ mod tests {
             w.write_all(b"stream-A-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Bulk).await.unwrap();
             w.write_all(b"stream-A-chunk-2").await.unwrap();
-            w.finalize_detached().unwrap();
+            w.finalize().await.unwrap();
         });
 
         let opener3 = opener2.clone();
@@ -1590,7 +1604,7 @@ mod tests {
             w.write_all(b"stream-B-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Interactive).await.unwrap();
             w.write_all(b"stream-B-chunk-2").await.unwrap();
-            w.finalize_detached().unwrap();
+            w.finalize().await.unwrap();
         });
 
         // Accept first gen0
@@ -1659,7 +1673,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1706,7 +1720,7 @@ mod tests {
         for _ in 0..4 {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1725,7 +1739,7 @@ mod tests {
         for _ in 0..20 {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.finalize_detached().unwrap();
+        writer.finalize().await.unwrap();
     }
 
     // -------------------------------------------------------------------
@@ -1753,7 +1767,7 @@ mod tests {
             let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
             writer.write_all(b"data-on-bulk").await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1786,7 +1800,7 @@ mod tests {
         let write = tokio::spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"hello-from-c2s  ").await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1830,7 +1844,7 @@ mod tests {
             writer.write_all(b"c2s-1").await.unwrap();
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
             writer.write_all(b"c2s-2").await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -1879,7 +1893,7 @@ mod tests {
                     writer.force_migrate(LaneClass::Interactive).await.unwrap();
                 }
             }
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         // Accept gen0
@@ -1944,7 +1958,7 @@ mod tests {
         let write = tokio::spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"write-only-data").await.unwrap();
-            writer.finalize_detached().unwrap();
+            writer.finalize().await.unwrap();
         });
 
         let accepted = mac.accept().await.unwrap();
@@ -2081,7 +2095,7 @@ mod tests {
         .expect("RESPONSE|FINAL did not cross the shared feed")
         .unwrap();
         assert_eq!(resp, "pong-across");
-        req_writer.finalize_detached().unwrap();
+        req_writer.finalize().await.unwrap();
     }
 
     fn migrating(accepted: AcceptedStream) -> (SplicedReader, StreamWriter) {
@@ -2255,7 +2269,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&got, b"payload");
-        req_writer.finalize_detached().unwrap();
+        req_writer.finalize().await.unwrap();
         drop(silent);
     }
 
@@ -2298,7 +2312,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resp, "pong-across");
-        req_writer.finalize_detached().unwrap();
+        req_writer.finalize().await.unwrap();
         drop(silent);
     }
 
