@@ -17,7 +17,7 @@ use crate::{
     migration_wire::{
         GenerationChain, GenerationReader, MigrationError, ResumeHeader, SplicedReader,
     },
-    splice_feed::{SpliceRouter, SpliceRouterHandle, spawn_splice_router},
+    splice_feed::{SpliceFeedError, SpliceRouter, SpliceRouterHandle, spawn_splice_router},
     stream::writer::StreamWriter,
     traffic_class::LaneClass,
 };
@@ -655,12 +655,12 @@ impl MigratingCapableAccepter {
         if !is_gen0 {
             return match feed.send_continuation(header, gen_reader).await {
                 Ok(()) => Ok(PeekOutcome::Consumed),
-                Err(()) => Ok(PeekOutcome::FeedDead),
+                Err(SpliceFeedError::Closed) => Ok(PeekOutcome::FeedDead),
             };
         }
         let spliced_rx = match feed.await_gene(logical_id).await {
             Ok(rx) => rx,
-            Err(()) => return Ok(PeekOutcome::FeedDead),
+            Err(SpliceFeedError::Closed) => return Ok(PeekOutcome::FeedDead),
         };
         if feed.send_continuation(header, gen_reader).await.is_err() {
             return Ok(PeekOutcome::FeedDead);
@@ -912,7 +912,7 @@ impl ResponseRouterHandle {
         &self,
         logical_id: u64,
         gen0_reader: StreamReader,
-    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, ()> {
+    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, SpliceFeedError> {
         let rx = self.feed.await_gene(logical_id).await?;
         let header = ResumeHeader {
             logical_id,

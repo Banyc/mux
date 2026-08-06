@@ -21,9 +21,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    fmt,
-    future::Future,
-    io,
+    fmt, io,
     pin::Pin,
     task::{Context, Poll, ready},
     time::Duration,
@@ -755,142 +753,140 @@ impl AsyncRead for SplicedReader {
 /// Gen‑0 generations produce a [`SplicedReader`] sent back on `gen0_tx`;
 /// successor generations are dequeued from the registry in generation
 /// order and pushed into the matching [`SplicedReader`]'s queue.
-pub fn spawn_splice_driver(
+pub async fn spawn_splice_driver(
     registry: SpliceRegistry,
     cont_rx: tokio::sync::mpsc::Receiver<(ResumeHeader, GenerationReader)>,
     gen0_tx: tokio::sync::mpsc::Sender<(u64, Option<SplicedReader>)>,
-) -> impl Future<Output = Result<(), MigrationError>> {
-    async move {
-        let mut registry = registry;
-        let mut cont_rx = cont_rx;
-        let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
-            HashMap::new();
-        let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
-        let mut incarnations: HashMap<u64, u64> = HashMap::new();
-        let (cleanup_tx, mut cleanup_rx) =
-            tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
-        let mut next_incarnation: u64 = 1;
-        fn flush_contiguous(
-            registry: &mut SpliceRegistry,
-            logical_id: u64,
-            queue_tx: &tokio::sync::mpsc::Sender<(bool, GenerationReader)>,
-            next_to_flush: &mut HashMap<u64, u32>,
-        ) -> bool {
-            let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
-            while let Some((genn, is_final, reader)) = registry.pop_pending(logical_id) {
-                if genn < next {
-                    drop(reader);
-                    continue;
-                }
-                if genn == next {
-                    match queue_tx.try_send((is_final, reader)) {
-                        Ok(()) => {
-                            next = next.checked_add(1).expect("generation overflow");
-                            if is_final {
-                                return true;
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full((is_final, reader))) => {
-                            registry.reinsert_pending(logical_id, genn, is_final, reader);
-                            break;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+) -> Result<(), MigrationError> {
+    let mut registry = registry;
+    let mut cont_rx = cont_rx;
+    let mut queues: HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>> =
+        HashMap::new();
+    let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
+    let mut incarnations: HashMap<u64, u64> = HashMap::new();
+    let (cleanup_tx, mut cleanup_rx) =
+        tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
+    let mut next_incarnation: u64 = 1;
+    fn flush_contiguous(
+        registry: &mut SpliceRegistry,
+        logical_id: u64,
+        queue_tx: &tokio::sync::mpsc::Sender<(bool, GenerationReader)>,
+        next_to_flush: &mut HashMap<u64, u32>,
+    ) -> bool {
+        let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
+        while let Some((genn, is_final, reader)) = registry.pop_pending(logical_id) {
+            if genn < next {
+                drop(reader);
+                continue;
+            }
+            if genn == next {
+                match queue_tx.try_send((is_final, reader)) {
+                    Ok(()) => {
+                        next = next.checked_add(1).expect("generation overflow");
+                        if is_final {
                             return true;
                         }
                     }
-                } else {
-                    registry.reinsert_pending(logical_id, genn, is_final, reader);
-                    break;
+                    Err(tokio::sync::mpsc::error::TrySendError::Full((is_final, reader))) => {
+                        registry.reinsert_pending(logical_id, genn, is_final, reader);
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return true;
+                    }
                 }
+            } else {
+                registry.reinsert_pending(logical_id, genn, is_final, reader);
+                break;
             }
-            next_to_flush.insert(logical_id, next);
-            false
         }
-        fn cleanup_all(
-            logical_id: u64,
-            queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
-            incarnations: &mut HashMap<u64, u64>,
-            next_to_flush: &mut HashMap<u64, u32>,
-            registry: &mut SpliceRegistry,
-        ) {
-            queues.remove(&logical_id);
-            incarnations.remove(&logical_id);
-            next_to_flush.remove(&logical_id);
-            registry.remove_stream(logical_id);
-        }
-        loop {
-            tokio::select! {
-                cont = cont_rx.recv() => {
-                    let Some((header, reader)) = cont else { break; };
-                    let logical_id = header.logical_id;
-                    let is_gen0 = header.generation == 0;
-                    let is_final = header.is_final;
-                    let spliced_opt = match registry.dispatch(header, reader) {
-                        Ok(opt) => opt,
-                        Err(MigrationError::DuplicateGeneration
-                            | MigrationError::GenerationAfterFinal
-                            | MigrationError::TooManyOrphans
-                            | MigrationError::TooManySpliceStreams) => continue,
-                        Err(MigrationError::TooManyPendingGenerations) => {
-                            cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    match spliced_opt {
-                        Some(spliced) => {
-                            if is_gen0 {
-                                if is_final {
-                                    registry.remove_stream(logical_id);
-                                    incarnations.remove(&logical_id);
-                                    let _ = gen0_tx.send((logical_id, Some(spliced))).await;
-                                } else {
-                                    let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
-                                    let successor_deadline = registry.successor_deadline;
-                                    let token = next_incarnation;
-                                    next_incarnation = next_incarnation.checked_add(1).expect("incarnation overflow");
-                                    let spliced = spliced.with_queue_and_cleanup(
-                                        queue_rx,
-                                        successor_deadline,
-                                        cleanup_tx.clone(),
-                                        token,
-                                    );
-                                    queues.insert(logical_id, queue_tx.clone());
-                                    incarnations.insert(logical_id, token);
-                                    next_to_flush.insert(logical_id, 1);
-                                    let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
-                                    if gen0_tx.send((logical_id, Some(spliced))).await.is_err()
-                                        || reached_final
-                                    {
-                                        cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            if is_gen0 {
-                                let _ = gen0_tx.send((logical_id, None)).await;
-                            }
-                            if let Some(queue_tx) = queues.get(&logical_id).cloned() {
+        next_to_flush.insert(logical_id, next);
+        false
+    }
+    fn cleanup_all(
+        logical_id: u64,
+        queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
+        incarnations: &mut HashMap<u64, u64>,
+        next_to_flush: &mut HashMap<u64, u32>,
+        registry: &mut SpliceRegistry,
+    ) {
+        queues.remove(&logical_id);
+        incarnations.remove(&logical_id);
+        next_to_flush.remove(&logical_id);
+        registry.remove_stream(logical_id);
+    }
+    loop {
+        tokio::select! {
+            cont = cont_rx.recv() => {
+                let Some((header, reader)) = cont else { break; };
+                let logical_id = header.logical_id;
+                let is_gen0 = header.generation == 0;
+                let is_final = header.is_final;
+                let spliced_opt = match registry.dispatch(header, reader) {
+                    Ok(opt) => opt,
+                    Err(MigrationError::DuplicateGeneration
+                        | MigrationError::GenerationAfterFinal
+                        | MigrationError::TooManyOrphans
+                        | MigrationError::TooManySpliceStreams) => continue,
+                    Err(MigrationError::TooManyPendingGenerations) => {
+                        cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                match spliced_opt {
+                    Some(spliced) => {
+                        if is_gen0 {
+                            if is_final {
+                                registry.remove_stream(logical_id);
+                                incarnations.remove(&logical_id);
+                                let _ = gen0_tx.send((logical_id, Some(spliced))).await;
+                            } else {
+                                let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
+                                let successor_deadline = registry.successor_deadline;
+                                let token = next_incarnation;
+                                next_incarnation = next_incarnation.checked_add(1).expect("incarnation overflow");
+                                let spliced = spliced.with_queue_and_cleanup(
+                                    queue_rx,
+                                    successor_deadline,
+                                    cleanup_tx.clone(),
+                                    token,
+                                );
+                                queues.insert(logical_id, queue_tx.clone());
+                                incarnations.insert(logical_id, token);
+                                next_to_flush.insert(logical_id, 1);
                                 let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
-                                if reached_final {
+                                if gen0_tx.send((logical_id, Some(spliced))).await.is_err()
+                                    || reached_final
+                                {
                                     cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                                 }
                             }
                         }
                     }
-                }
-                cleanup = cleanup_rx.recv() => {
-                    if let Some((logical_id, token)) = cleanup
-                        && let Some(&current_token) = incarnations.get(&logical_id)
-                            && current_token == token {
+                    None => {
+                        if is_gen0 {
+                            let _ = gen0_tx.send((logical_id, None)).await;
+                        }
+                        if let Some(queue_tx) = queues.get(&logical_id).cloned() {
+                            let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
+                            if reached_final {
                                 cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                             }
+                        }
+                    }
                 }
             }
+            cleanup = cleanup_rx.recv() => {
+                if let Some((logical_id, token)) = cleanup
+                    && let Some(&current_token) = incarnations.get(&logical_id)
+                        && current_token == token {
+                            cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                        }
+            }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

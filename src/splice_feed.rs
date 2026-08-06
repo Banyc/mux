@@ -18,6 +18,21 @@ pub enum SpliceRouterState {
     ChildJoinFailed,
 }
 
+/// A splice feed channel is gone: the supervised router has shut down, so no
+/// further continuations can be registered or gen-0 readers looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpliceFeedError {
+    Closed,
+}
+
+impl std::fmt::Display for SpliceFeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("splice feed closed")
+    }
+}
+
+impl std::error::Error for SpliceFeedError {}
+
 #[derive(Debug, Clone)]
 pub struct SpliceRouterHandle {
     cont_tx: mpsc::Sender<(ResumeHeader, GenerationReader)>,
@@ -30,19 +45,22 @@ impl SpliceRouterHandle {
         &self,
         header: ResumeHeader,
         reader: GenerationReader,
-    ) -> Result<(), ()> {
-        self.cont_tx.send((header, reader)).await.map_err(|_| ())
+    ) -> Result<(), SpliceFeedError> {
+        self.cont_tx
+            .send((header, reader))
+            .await
+            .map_err(|_| SpliceFeedError::Closed)
     }
 
     pub(crate) async fn await_gene(
         &self,
         logical_id: u64,
-    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, ()> {
+    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, SpliceFeedError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.register_tx
             .send((logical_id, tx))
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| SpliceFeedError::Closed)?;
         Ok(rx)
     }
 

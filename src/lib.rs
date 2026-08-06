@@ -51,7 +51,9 @@ pub use session::{
     spawn_mux_no_reconnection_with_first_receive_deadline,
     spawn_mux_no_reconnection_with_first_receive_deadline_and_ready, spawn_mux_with_reconnection,
 };
-pub use splice_feed::{SpliceRouter, SpliceRouterHandle, SpliceTaskExit, spawn_splice_router};
+pub use splice_feed::{
+    SpliceFeedError, SpliceRouter, SpliceRouterHandle, SpliceTaskExit, spawn_splice_router,
+};
 pub use stream::{
     accepter::StreamAccepter,
     opener::{StreamOpenError, StreamOpener},
