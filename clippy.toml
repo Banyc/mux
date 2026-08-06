@@ -2,4 +2,6 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "spawned work must be owned by a JoinSet held by a long-lived owner (e.g. SpliceRouter or a session) so drop aborts children and panics are observed; no detached tasks" },
     { path = "tokio::task::spawn", reason = "spawned work must be owned by a JoinSet held by a long-lived owner (e.g. SpliceRouter or a session) so drop aborts children and panics are observed; no detached tasks" },
     { path = "tokio::runtime::Handle::spawn", reason = "Handle::spawn is detached with no owner to reap or abort the task; submit the work to an owned JoinSet instead" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use tokio::sync::mpsc::channel(N) so producers await a bounded slot" },
+    { path = "mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use mpsc::channel(N) so producers await a bounded slot" },
 ]

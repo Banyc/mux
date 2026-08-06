@@ -22,15 +22,16 @@ pub struct StreamCloseMsg {
     pub side: Side,
     pub stream_id: StreamId,
 }
+const STREAM_CLOSE_CAPACITY: usize = 8192;
 pub fn stream_close_channel() -> (StreamCloseTxPrototype, StreamCloseRx) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CLOSE_CAPACITY);
     let tx = StreamCloseTxPrototype { tx };
     let rx = StreamCloseRx { rx };
     (tx, rx)
 }
 #[derive(Debug, Clone)]
 pub struct StreamCloseTxPrototype {
-    tx: tokio::sync::mpsc::UnboundedSender<StreamCloseMsg>,
+    tx: tokio::sync::mpsc::Sender<StreamCloseMsg>,
 }
 impl StreamCloseTxPrototype {
     pub fn derive(&self, side: Side, stream_id: StreamId) -> StreamCloseTx {
@@ -45,7 +46,7 @@ impl StreamCloseTxPrototype {
 pub struct StreamCloseTx {
     stream_id: StreamId,
     side: Side,
-    tx: tokio::sync::mpsc::UnboundedSender<StreamCloseMsg>,
+    tx: tokio::sync::mpsc::Sender<StreamCloseMsg>,
 }
 impl Drop for StreamCloseTx {
     fn drop(&mut self) {
@@ -53,12 +54,18 @@ impl Drop for StreamCloseTx {
             stream_id: self.stream_id,
             side: self.side,
         };
-        let _ = self.tx.send(msg);
+        if self.tx.try_send(msg).is_err() {
+            tracing::error!(
+                stream_id = self.stream_id,
+                side = ?self.side,
+                "stream close notification dropped: close channel full"
+            );
+        }
     }
 }
 #[derive(Debug)]
 pub struct StreamCloseRx {
-    rx: tokio::sync::mpsc::UnboundedReceiver<StreamCloseMsg>,
+    rx: tokio::sync::mpsc::Receiver<StreamCloseMsg>,
 }
 impl StreamCloseRx {
     pub async fn recv(&mut self) -> Result<StreamCloseMsg, DeadControl> {

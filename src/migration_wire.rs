@@ -757,8 +757,8 @@ impl AsyncRead for SplicedReader {
 /// order and pushed into the matching [`SplicedReader`]'s queue.
 pub fn spawn_splice_driver(
     registry: SpliceRegistry,
-    cont_rx: tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>,
-    gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
+    cont_rx: tokio::sync::mpsc::Receiver<(ResumeHeader, GenerationReader)>,
+    gen0_tx: tokio::sync::mpsc::Sender<(u64, Option<SplicedReader>)>,
 ) -> impl Future<Output = Result<(), MigrationError>> {
     async move {
         let mut registry = registry;
@@ -843,7 +843,7 @@ pub fn spawn_splice_driver(
                                 if is_final {
                                     registry.remove_stream(logical_id);
                                     incarnations.remove(&logical_id);
-                                    let _ = gen0_tx.send((logical_id, Some(spliced)));
+                                    let _ = gen0_tx.send((logical_id, Some(spliced))).await;
                                 } else {
                                     let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
                                     let successor_deadline = registry.successor_deadline;
@@ -859,7 +859,9 @@ pub fn spawn_splice_driver(
                                     incarnations.insert(logical_id, token);
                                     next_to_flush.insert(logical_id, 1);
                                     let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
-                                    if gen0_tx.send((logical_id, Some(spliced))).is_err() || reached_final {
+                                    if gen0_tx.send((logical_id, Some(spliced))).await.is_err()
+                                        || reached_final
+                                    {
                                         cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
                                     }
                                 }
@@ -867,7 +869,7 @@ pub fn spawn_splice_driver(
                         }
                         None => {
                             if is_gen0 {
-                                let _ = gen0_tx.send((logical_id, None));
+                                let _ = gen0_tx.send((logical_id, None)).await;
                             }
                             if let Some(queue_tx) = queues.get(&logical_id).cloned() {
                                 let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
@@ -898,6 +900,7 @@ pub fn spawn_splice_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::splice_feed::{SPLICE_CONT_CAPACITY, SPLICE_GEN0_CAPACITY};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     // -------------------------------------------------------------------
@@ -1814,8 +1817,8 @@ mod tests {
     #[tokio::test]
     async fn incarnation_stale_reader_drop_does_not_kill_new_reader() {
         let registry = SpliceRegistry::new();
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (c0, mut s0) = duplex(64);
         let h0 = ResumeHeader {
@@ -1824,7 +1827,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h0, Box::pin(c0))).unwrap();
+        cont_tx.send((h0, Box::pin(c0))).await.unwrap();
         let (id0, mut reader0) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id0, 77);
         let (c1, _s1) = duplex(1);
@@ -1834,7 +1837,7 @@ mod tests {
             is_final: true,
             is_response: false,
         };
-        cont_tx.send((h1, Box::pin(c1))).unwrap();
+        cont_tx.send((h1, Box::pin(c1))).await.unwrap();
         drop(_s1);
         s0.write_all(b"hello").await.unwrap();
         drop(s0);
@@ -1850,7 +1853,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h_new, Box::pin(c_new))).unwrap();
+        cont_tx.send((h_new, Box::pin(c_new))).await.unwrap();
         let (id_new, mut reader_new) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id_new, 77);
         drop(reader0);
@@ -1861,7 +1864,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h1_new, Box::pin(c1_new))).unwrap();
+        cont_tx.send((h1_new, Box::pin(c1_new))).await.unwrap();
         s_new.write_all(b"y").await.unwrap();
         drop(s_new);
         let mut buf = [0u8; 1];
@@ -1887,8 +1890,8 @@ mod tests {
     #[tokio::test]
     async fn gen0_final_then_reuse_receives_gen1() {
         let registry = SpliceRegistry::new();
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let _driver = spawn_driver(registry, cont_rx, gen0_tx);
 
         let (c_final, _s_final) = duplex(64);
@@ -1898,7 +1901,7 @@ mod tests {
             is_final: true,
             is_response: false,
         };
-        cont_tx.send((h_final, Box::pin(c_final))).unwrap();
+        cont_tx.send((h_final, Box::pin(c_final))).await.unwrap();
 
         let (_, old_reader) = expect_gen0_reader(gen0_rx.recv().await);
         assert!(
@@ -1913,7 +1916,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h_reuse, Box::pin(c_reuse))).unwrap();
+        cont_tx.send((h_reuse, Box::pin(c_reuse))).await.unwrap();
 
         let (id_new, mut replacement) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id_new, 77, "reuse ID must be 77");
@@ -1925,7 +1928,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h_gen1, Box::pin(c_gen1))).unwrap();
+        cont_tx.send((h_gen1, Box::pin(c_gen1))).await.unwrap();
 
         s_gen1.write_all(b"gen1-data").await.unwrap();
         drop(s_gen1);
@@ -1948,8 +1951,8 @@ mod tests {
     #[tokio::test]
     async fn no_generations_flushed_after_final() {
         let registry = SpliceRegistry::new();
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let _driver = spawn_driver(registry, cont_rx, gen0_tx);
 
         let (c0, mut s0) = duplex(64);
@@ -1959,7 +1962,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h0, Box::pin(c0))).unwrap();
+        cont_tx.send((h0, Box::pin(c0))).await.unwrap();
         let (_id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
 
         s0.write_all(b"pre-final").await.unwrap();
@@ -1977,7 +1980,7 @@ mod tests {
             is_final: true,
             is_response: false,
         };
-        cont_tx.send((h_final, Box::pin(c_final))).unwrap();
+        cont_tx.send((h_final, Box::pin(c_final))).await.unwrap();
 
         let n = reader.read(&mut [0u8; 1]).await.unwrap();
         assert_eq!(n, 0, "clean EOF after FINAL gen1");
@@ -1989,7 +1992,7 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        cont_tx.send((h_after, Box::pin(c_after))).unwrap();
+        cont_tx.send((h_after, Box::pin(c_after))).await.unwrap();
 
         let mut buf = [0u8; 1];
         let read_result =
@@ -2003,8 +2006,8 @@ mod tests {
     #[tokio::test]
     async fn final_orphan_payload_is_validated_in_order() {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(100));
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (final_reader, mut final_writer) = duplex(8);
         final_writer.write_all(b"x").await.unwrap();
@@ -2019,6 +2022,7 @@ mod tests {
                 },
                 Box::pin(final_reader),
             ))
+            .await
             .unwrap();
         let (gen0_reader, gen0_writer) = duplex(1);
         drop(gen0_writer);
@@ -2032,6 +2036,7 @@ mod tests {
                 },
                 Box::pin(gen0_reader),
             ))
+            .await
             .unwrap();
         let (_, mut reader) = expect_gen0_reader(
             tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
@@ -2048,8 +2053,8 @@ mod tests {
     #[tokio::test]
     async fn final_orphan_after_gap_does_not_close_early() {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(50));
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, mut gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let _driver = spawn_driver(registry, cont_rx, gen0_tx);
         let (final_reader, final_writer) = duplex(1);
         drop(final_writer);
@@ -2063,6 +2068,7 @@ mod tests {
                 },
                 Box::pin(final_reader),
             ))
+            .await
             .unwrap();
         let (gen0_reader, gen0_writer) = duplex(1);
         drop(gen0_writer);
@@ -2076,6 +2082,7 @@ mod tests {
                 },
                 Box::pin(gen0_reader),
             ))
+            .await
             .unwrap();
         let (_, mut reader) = expect_gen0_reader(
             tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
@@ -2089,9 +2096,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
-    type Gen0Rx = tokio::sync::mpsc::UnboundedReceiver<(u64, Option<SplicedReader>)>;
-    type ContTx = tokio::sync::mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>;
-    type ContRx = tokio::sync::mpsc::UnboundedReceiver<(ResumeHeader, GenerationReader)>;
+    type Gen0Rx = tokio::sync::mpsc::Receiver<(u64, Option<SplicedReader>)>;
+    type ContTx = tokio::sync::mpsc::Sender<(ResumeHeader, GenerationReader)>;
+    type ContRx = tokio::sync::mpsc::Receiver<(ResumeHeader, GenerationReader)>;
 
     fn expect_gen0_reader(received: Option<(u64, Option<SplicedReader>)>) -> (u64, SplicedReader) {
         let (logical_id, spliced) = received.expect("the driver answered the gen-0");
@@ -2106,7 +2113,7 @@ mod tests {
     fn spawn_driver(
         registry: SpliceRegistry,
         cont_rx: ContRx,
-        gen0_tx: tokio::sync::mpsc::UnboundedSender<(u64, Option<SplicedReader>)>,
+        gen0_tx: tokio::sync::mpsc::Sender<(u64, Option<SplicedReader>)>,
     ) -> tokio::task::JoinSet<Result<(), MigrationError>> {
         let mut set = tokio::task::JoinSet::new();
         set.spawn(spawn_splice_driver(registry, cont_rx, gen0_tx));
@@ -2120,8 +2127,8 @@ mod tests {
         Gen0Rx,
         tokio::task::JoinSet<Result<(), MigrationError>>,
     ) {
-        let (cont_tx, cont_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (gen0_tx, gen0_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cont_tx, cont_rx) = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY);
+        let (gen0_tx, gen0_rx) = tokio::sync::mpsc::channel(SPLICE_GEN0_CAPACITY);
         let driver_set = spawn_driver(registry, cont_rx, gen0_tx);
         (cont_tx, gen0_rx, driver_set)
     }
@@ -2135,9 +2142,9 @@ mod tests {
         }
     }
 
-    fn send_gen(cont_tx: &ContTx, header: ResumeHeader) -> tokio::io::DuplexStream {
+    async fn send_gen(cont_tx: &ContTx, header: ResumeHeader) -> tokio::io::DuplexStream {
         let (theirs, ours) = duplex(64);
-        cont_tx.send((header, Box::pin(theirs))).unwrap();
+        cont_tx.send((header, Box::pin(theirs))).await.unwrap();
         ours
     }
 
@@ -2168,17 +2175,17 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_orphan_generation_does_not_replace_the_real_one() {
         let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
-        let mut real = send_gen(&cont_tx, hdr(1, 1, false));
+        let mut real = send_gen(&cont_tx, hdr(1, 1, false)).await;
         real.write_all(b"real").await.unwrap();
         real.shutdown().await.unwrap();
-        let mut impostor = send_gen(&cont_tx, hdr(1, 1, false));
+        let mut impostor = send_gen(&cont_tx, hdr(1, 1, false)).await;
         impostor.write_all(b"fake").await.unwrap();
         impostor.shutdown().await.unwrap();
-        let mut gen0 = send_gen(&cont_tx, hdr(1, 0, false));
+        let mut gen0 = send_gen(&cont_tx, hdr(1, 0, false)).await;
         gen0.write_all(b"zero").await.unwrap();
         gen0.shutdown().await.unwrap();
         let (_, mut spliced) = expect_gen0_reader(gen0_rx.recv().await);
-        let mut fin = send_gen(&cont_tx, hdr(1, 2, true));
+        let mut fin = send_gen(&cont_tx, hdr(1, 2, true)).await;
         fin.shutdown().await.unwrap();
         let mut got = String::new();
         spliced.read_to_string(&mut got).await.unwrap();
@@ -2247,18 +2254,18 @@ mod tests {
     async fn redelivered_generation_does_not_wedge_the_stream() {
         let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(500));
         let (cont_tx, mut gen0_rx, _driver) = driver(registry);
-        let mut s0 = send_gen(&cont_tx, hdr(7, 0, false));
+        let mut s0 = send_gen(&cont_tx, hdr(7, 0, false)).await;
         let (_id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
         s0.write_all(b"gen0-").await.unwrap();
         drop(s0);
-        let mut s1 = send_gen(&cont_tx, hdr(7, 1, false));
+        let mut s1 = send_gen(&cont_tx, hdr(7, 1, false)).await;
         s1.write_all(b"gen1-").await.unwrap();
         drop(s1);
         let mut buf = [0u8; 10];
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"gen0-gen1-");
-        let _s1b = send_gen(&cont_tx, hdr(7, 1, false));
-        let s2 = send_gen(&cont_tx, hdr(7, 2, true));
+        let _s1b = send_gen(&cont_tx, hdr(7, 1, false)).await;
+        let s2 = send_gen(&cont_tx, hdr(7, 2, true)).await;
         drop(s2);
         let mut rest = Vec::new();
         tokio::time::timeout(Duration::from_secs(3), reader.read_to_end(&mut rest))
@@ -2272,9 +2279,9 @@ mod tests {
     async fn orphan_cap_does_not_kill_the_splice_driver() {
         let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
         for i in 0..=MAX_ORPHAN_STREAMS as u64 {
-            let _s = send_gen(&cont_tx, hdr(1000 + i, 1, false));
+            let _s = send_gen(&cont_tx, hdr(1000 + i, 1, false)).await;
         }
-        let _s0 = send_gen(&cont_tx, hdr(77, 0, false));
+        let _s0 = send_gen(&cont_tx, hdr(77, 0, false)).await;
         let (id, _reader) = expect_gen0_reader(
             tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
                 .await
@@ -2286,13 +2293,13 @@ mod tests {
     #[tokio::test]
     async fn pending_generation_cap_retires_only_the_offending_stream() {
         let (cont_tx, mut gen0_rx, _driver) = driver(SpliceRegistry::new());
-        let _s0 = send_gen(&cont_tx, hdr(77, 0, false));
+        let _s0 = send_gen(&cont_tx, hdr(77, 0, false)).await;
         let (id, _reader) = expect_gen0_reader(gen0_rx.recv().await);
         assert_eq!(id, 77);
         for genn in 2..=(MAX_PENDING_GENERATIONS as u32 + 2) {
-            let _s = send_gen(&cont_tx, hdr(77, genn, false));
+            let _s = send_gen(&cont_tx, hdr(77, genn, false)).await;
         }
-        let _s_other = send_gen(&cont_tx, hdr(88, 0, false));
+        let _s_other = send_gen(&cont_tx, hdr(88, 0, false)).await;
         let (other_id, _other_reader) = expect_gen0_reader(
             tokio::time::timeout(Duration::from_secs(1), gen0_rx.recv())
                 .await

@@ -698,13 +698,13 @@ impl MigratingCapableAccepter {
         let is_gen0 = header.generation == 0;
         let gen_reader: GenerationReader = Box::pin(reader);
         if !is_gen0 {
-            return match feed.send_continuation(header, gen_reader) {
+            return match feed.send_continuation(header, gen_reader).await {
                 Ok(()) => Ok(PeekOutcome::Consumed),
                 Err(()) => Ok(PeekOutcome::FeedDead),
             };
         }
-        let spliced_rx = feed.await_gene(logical_id);
-        if feed.send_continuation(header, gen_reader).is_err() {
+        let spliced_rx = feed.await_gene(logical_id).await;
+        if feed.send_continuation(header, gen_reader).await.is_err() {
             return Ok(PeekOutcome::FeedDead);
         }
         match spliced_rx.await {
@@ -926,6 +926,7 @@ impl ResponseRouter {
                         if let Some(Ok(Some((header, reader)))) = joined
                             && feed
                                 .send_continuation(header, Box::pin(reader) as GenerationReader)
+                                .await
                                 .is_err()
                         {
                             break;
@@ -941,12 +942,12 @@ pub struct ResponseRouterHandle {
     feed: SpliceRouterHandle,
 }
 impl ResponseRouterHandle {
-    pub fn inject_response_gene(
+    pub async fn inject_response_gene(
         &self,
         logical_id: u64,
         gen0_reader: StreamReader,
     ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
-        let rx = self.feed.await_gene(logical_id);
+        let rx = self.feed.await_gene(logical_id).await;
         let header = ResumeHeader {
             logical_id,
             generation: 0,
@@ -955,7 +956,8 @@ impl ResponseRouterHandle {
         };
         let _ = self
             .feed
-            .send_continuation(header, Box::pin(gen0_reader) as GenerationReader);
+            .send_continuation(header, Box::pin(gen0_reader) as GenerationReader)
+            .await;
         rx
     }
 }
@@ -1096,7 +1098,7 @@ mod tests {
             .unwrap();
         assert_eq!(&req, b"request");
         let gen0_reader = gen0_rx.await.unwrap();
-        let spliced_rx = router.handle().inject_response_gene(42, gen0_reader);
+        let spliced_rx = router.handle().inject_response_gene(42, gen0_reader).await;
         let mut resp_reader = spliced_rx.await.unwrap();
         resp_writer.write_all(b"head-").await.unwrap();
         resp_writer.write_all(&vec![0xEE; 40_000]).await.unwrap();
@@ -1125,6 +1127,7 @@ mod tests {
         let mut resp_reader = router
             .handle()
             .inject_response_gene(7, gen0_reader)
+            .await
             .await
             .unwrap();
         resp_writer.write_all(b"pong").await.unwrap();
@@ -1170,6 +1173,7 @@ mod tests {
         let mut resp_reader = router
             .handle()
             .inject_response_gene(9, gen0_reader)
+            .await
             .await
             .unwrap();
         let (up, down) = tokio::join!(
@@ -2081,6 +2085,7 @@ mod tests {
             .handle()
             .inject_response_gene(7, gen0_reader)
             .await
+            .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
         resp_writer.rebind(y2_op).await.unwrap();
@@ -2200,14 +2205,16 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        let first = handle.await_gene(7);
+        let first = handle.await_gene(7).await;
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
+            .await
             .expect("the feed is alive");
         let _live = first.await.expect("the first gen-0 is spliced");
-        let second = handle.await_gene(7);
+        let second = handle.await_gene(7).await;
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
+            .await
             .expect("the feed is alive");
         let settled = tokio::time::timeout(Duration::from_millis(200), second).await;
         let Ok(result) = settled else {
@@ -2287,6 +2294,7 @@ mod tests {
         let mut resp_reader = router
             .handle()
             .inject_response_gene(21, gen0_reader)
+            .await
             .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
@@ -2631,6 +2639,7 @@ mod tests {
                 let mut resp_reader = handle
                     .inject_response_gene(id, gen0_reader)
                     .await
+                    .await
                     .expect("no response reader");
                 let mut got = Vec::new();
                 tokio::time::timeout(
@@ -2705,8 +2714,8 @@ mod tests {
     async fn the_first_registration_for_a_gen0_owns_it() {
         let feed = spawn_splice_router();
         let handle = feed.handle();
-        let first = handle.await_gene(3);
-        let second = handle.await_gene(3);
+        let first = handle.await_gene(3).await;
+        let second = handle.await_gene(3).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (theirs, _ours) = tokio::io::duplex(64);
         handle
@@ -2719,6 +2728,7 @@ mod tests {
                 },
                 Box::pin(theirs) as GenerationReader,
             )
+            .await
             .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(5), first)
@@ -2751,6 +2761,7 @@ mod tests {
             };
             handle
                 .send_continuation(header, Box::pin(theirs) as GenerationReader)
+                .await
                 .unwrap();
             peer_halves.push(ours);
         }

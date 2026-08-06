@@ -8,25 +8,25 @@ use crate::migration_wire::{
 
 #[derive(Debug, Clone)]
 pub struct SpliceRouterHandle {
-    cont_tx: mpsc::UnboundedSender<(ResumeHeader, GenerationReader)>,
-    register_tx: mpsc::UnboundedSender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
+    cont_tx: mpsc::Sender<(ResumeHeader, GenerationReader)>,
+    register_tx: mpsc::Sender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
 }
 
 impl SpliceRouterHandle {
-    pub(crate) fn send_continuation(
+    pub(crate) async fn send_continuation(
         &self,
         header: ResumeHeader,
         reader: GenerationReader,
     ) -> Result<(), ()> {
-        self.cont_tx.send((header, reader)).map_err(|_| ())
+        self.cont_tx.send((header, reader)).await.map_err(|_| ())
     }
 
-    pub(crate) fn await_gene(
+    pub(crate) async fn await_gene(
         &self,
         logical_id: u64,
     ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.register_tx.send((logical_id, tx));
+        let _ = self.register_tx.send((logical_id, tx)).await;
         rx
     }
 }
@@ -55,6 +55,9 @@ pub struct SpliceRouter {
 }
 
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
+pub(crate) const SPLICE_CONT_CAPACITY: usize = 1024;
+pub(crate) const SPLICE_GEN0_CAPACITY: usize = 64;
+pub(crate) const SPLICE_REGISTER_CAPACITY: usize = 64;
 
 fn panic_message(err: tokio::task::JoinError) -> String {
     let payload = err.into_panic();
@@ -129,10 +132,13 @@ impl SpliceRouter {
 }
 
 pub fn spawn_splice_router() -> SpliceRouter {
-    let (cont_tx, cont_rx) = mpsc::unbounded_channel();
-    let (gen0_tx, mut gen0_rx) = mpsc::unbounded_channel::<(u64, Option<SplicedReader>)>();
-    let (register_tx, mut register_rx) =
-        mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>();
+    let (cont_tx, cont_rx) = mpsc::channel(SPLICE_CONT_CAPACITY);
+    let (gen0_tx, mut gen0_rx) =
+        mpsc::channel::<(u64, Option<SplicedReader>)>(SPLICE_GEN0_CAPACITY);
+    let (register_tx, mut register_rx) = mpsc::channel::<(
+        u64,
+        tokio::sync::oneshot::Sender<SplicedReader>,
+    )>(SPLICE_REGISTER_CAPACITY);
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
@@ -250,8 +256,8 @@ mod tests {
         let mut router = spawn_splice_router();
         // Sever the router's own senders so the driver and matcher see
         // their feed channels close and exit normally.
-        router.handle.cont_tx = tokio::sync::mpsc::unbounded_channel().0;
-        router.handle.register_tx = tokio::sync::mpsc::unbounded_channel().0;
+        router.handle.cont_tx = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY).0;
+        router.handle.register_tx = tokio::sync::mpsc::channel(SPLICE_REGISTER_CAPACITY).0;
         let mut exits = Vec::new();
         while let Some(exit) = router.reap_next().await {
             exits.push(exit);
@@ -264,7 +270,9 @@ mod tests {
             "the driver did not exit cleanly: {exits:?}"
         );
         assert!(
-            exits.iter().any(|e| matches!(e, SpliceTaskExit::MatcherDone)),
+            exits
+                .iter()
+                .any(|e| matches!(e, SpliceTaskExit::MatcherDone)),
             "the matcher did not exit cleanly: {exits:?}"
         );
     }
