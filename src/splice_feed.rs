@@ -46,7 +46,7 @@ impl SpliceRouterHandle {
         Ok(rx)
     }
 
-    pub(crate) fn state(&self) -> SpliceRouterState {
+    pub fn state(&self) -> SpliceRouterState {
         *self.state.borrow()
     }
 }
@@ -72,7 +72,6 @@ pub enum SpliceTaskExit {
 pub struct SpliceRouter {
     handle: SpliceRouterHandle,
     _supervision: JoinSet<()>,
-    state: watch::Receiver<SpliceRouterState>,
 }
 
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
@@ -253,20 +252,15 @@ pub fn spawn_splice_router() -> SpliceRouter {
         }),
     ];
 
-    let mut _supervision = spawn_splice_supervisor(children, state_tx.clone());
-    _supervision.spawn(async move {
-        let _keep_state_sender_alive = state_tx;
-        std::future::pending::<()>().await
-    });
+    let _supervision = spawn_splice_supervisor(children, state_tx);
 
     SpliceRouter {
         handle: SpliceRouterHandle {
             cont_tx,
             register_tx,
-            state: state_rx.clone(),
+            state: state_rx,
         },
         _supervision,
-        state: state_rx,
     }
 }
 

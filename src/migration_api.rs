@@ -890,12 +890,15 @@ impl ResponseRouter {
                     }
                 }
             });
-            while let Some(joined) = inner.join_next().await {
-                if let Err(err) = joined {
-                    tracing::warn!(
-                        "a ResponseRouter accepter task ended with an error: {err}"
-                    );
+            match inner.join_next().await {
+                Some(Ok(())) => tracing::debug!("ResponseRouter accepter task stopped"),
+                Some(Err(error)) if error.is_panic() => {
+                    tracing::error!(?error, "ResponseRouter accepter task panicked");
                 }
+                Some(Err(error)) => {
+                    tracing::warn!(?error, "ResponseRouter accepter task failed to join");
+                }
+                None => unreachable!("one accepter task was inserted"),
             }
         });
     }

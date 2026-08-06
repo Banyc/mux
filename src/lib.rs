@@ -4,6 +4,7 @@
 extern crate test;
 
 #[cfg(feature = "nightly")]
+#[allow(clippy::disallowed_methods)]
 mod bench;
 mod central_io;
 mod control;
