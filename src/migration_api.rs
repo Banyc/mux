@@ -90,6 +90,9 @@ enum WriterState {
     Closed,
 }
 
+/// A migrating stream writer. Dropping an opened writer is an abort: the
+/// peer eventually gets [`BrokenPipe`](io::ErrorKind::BrokenPipe). Callers
+/// that require clean EOF must call [`Self::finalize`] before dropping.
 pub struct MigratingStreamWriter {
     opener: DualStreamOpener,
     chain: GenerationChain,
@@ -103,10 +106,6 @@ pub struct MigratingStreamWriter {
     /// delivered via [`gen0_reader_tx`]. `None` while no successor is
     /// open.
     latest_held_reader: Option<StreamReader>,
-    /// Owns the in-flight detached finalizer tasks. Dropping the writer
-    /// aborts any finalizer still running (the abort backstop); callers
-    /// that need a confirmed close await [`Self::finalize`] instead.
-    finalizers: tokio::task::JoinSet<()>,
 }
 
 impl std::fmt::Debug for MigratingStreamWriter {
@@ -133,7 +132,6 @@ impl MigratingStreamWriter {
             auto_migrate,
             gen0_reader_tx: None,
             latest_held_reader: None,
-            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -153,7 +151,6 @@ impl MigratingStreamWriter {
             auto_migrate,
             gen0_reader_tx: Some(gen0_reader_tx),
             latest_held_reader: None,
-            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -186,7 +183,6 @@ impl MigratingStreamWriter {
             auto_migrate: true,
             gen0_reader_tx: None,
             latest_held_reader: None,
-            finalizers: tokio::task::JoinSet::new(),
         }
     }
 
@@ -306,49 +302,14 @@ impl MigratingStreamWriter {
         Ok(())
     }
 
-    /// Best-effort close: closes the active writer (if any) and emits a
-    /// FINAL-marker generation so the peer receives a clean EOF. The
-    /// FINAL generation is written by a background task (the
-    /// [`GenerationChain`] and an owned [`DualStreamOpener`] clone move
-    /// into it), so this method stays synchronous. The finalizer is owned
-    /// by this writer's [`JoinSet`] — it runs while the writer is alive
-    /// and is aborted when the writer is dropped (the abort backstop).
-    /// Callers that need a confirmed close must await [`Self::finalize`]
-    /// instead. If the stream was never announced to the peer (still
-    /// unopened), this is a no-op — no FINAL is emitted for a stream the
-    /// peer never saw.
-    pub fn finalize_detached(&mut self) -> Result<(), MigratingStreamError> {
-        if self.nothing_to_close() {
-            self.state = WriterState::Closed;
-            return Ok(());
-        }
-        if let WriterState::Active { writer, .. } = &mut self.state {
-            let _ = writer.shutdown();
-        }
-        let opener = self.opener.clone();
-        let mut chain = std::mem::replace(&mut self.chain, GenerationChain::new(0));
-        // Outside a Tokio runtime context (e.g. a writer dropped after its
-        // runtime went away) there is nowhere for the finalizer to run, so
-        // it is skipped.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            self.finalizers.spawn(async move {
-                if let Ok((_, mut final_writer)) = opener.open(LaneClass::Interactive).await {
-                    let _ = chain
-                        .start_generation(&mut as_async_write(&mut final_writer), true)
-                        .await;
-                    let _ = final_writer.shutdown();
-                }
-            });
-        }
-        self.state = WriterState::Closed;
-        Ok(())
-    }
-
     /// Confirmed close: opens a new substream for a FINAL-marker generation,
     /// writes the FINAL resume header, and closes. The peer receives a
     /// clean EOF (the [`SplicedReader`] sees `has_final_marker`). If the
     /// stream was never announced to the peer (still unopened), this is
     /// a no-op — no FINAL is emitted for a stream the peer never saw.
+    /// Dropping an opened writer instead of calling this is an abort and
+    /// the peer eventually gets [`BrokenPipe`](io::ErrorKind::BrokenPipe);
+    /// callers that require clean EOF must call this method before drop.
     pub async fn finalize(&mut self) -> Result<(), MigratingStreamError> {
         if self.nothing_to_close() {
             self.state = WriterState::Closed;
@@ -391,12 +352,6 @@ impl MigratingStreamWriter {
             | WriterState::Migrating { .. }
             | WriterState::Closed => Ok(()),
         }
-    }
-}
-
-impl Drop for MigratingStreamWriter {
-    fn drop(&mut self) {
-        let _ = self.finalize_detached();
     }
 }
 
@@ -703,7 +658,10 @@ impl MigratingCapableAccepter {
                 Err(()) => Ok(PeekOutcome::FeedDead),
             };
         }
-        let spliced_rx = feed.await_gene(logical_id).await;
+        let spliced_rx = match feed.await_gene(logical_id).await {
+            Ok(rx) => rx,
+            Err(()) => return Ok(PeekOutcome::FeedDead),
+        };
         if feed.send_continuation(header, gen_reader).await.is_err() {
             return Ok(PeekOutcome::FeedDead);
         }
@@ -884,11 +842,6 @@ pub struct ResponseRouter {
     feed: SpliceRouter,
     tasks: tokio::task::JoinSet<()>,
 }
-impl Drop for ResponseRouter {
-    fn drop(&mut self) {
-        self.feed.abort();
-    }
-}
 impl ResponseRouter {
     pub fn handle(&self) -> ResponseRouterHandle {
         ResponseRouterHandle {
@@ -900,38 +853,48 @@ impl ResponseRouter {
         while self.tasks.try_join_next().is_some() {}
         let feed = self.feed.handle();
         self.tasks.spawn(async move {
-            let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
-            let mut accepting = true;
-            loop {
-                let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
-                let has_peeks = !peeks.is_empty();
-                if !can_accept && !has_peeks {
-                    break;
-                }
-                tokio::select! {
-                    accepted = accepter.accept(), if can_accept => match accepted {
-                        Ok((reader, _writer, _lane)) => {
-                            peeks.spawn(async move {
-                                match MigratingCapableAccepter::peek_resume_header(reader).await {
-                                    Ok(Some((true, Some(header), reader))) if header.is_response => {
-                                        Some((header, reader))
+            let mut inner: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            inner.spawn(async move {
+                let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
+                let mut accepting = true;
+                loop {
+                    let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
+                    let has_peeks = !peeks.is_empty();
+                    if !can_accept && !has_peeks {
+                        break;
+                    }
+                    tokio::select! {
+                        accepted = accepter.accept(), if can_accept => match accepted {
+                            Ok((reader, _writer, _lane)) => {
+                                peeks.spawn(async move {
+                                    match MigratingCapableAccepter::peek_resume_header(reader).await {
+                                        Ok(Some((true, Some(header), reader))) if header.is_response => {
+                                            Some((header, reader))
+                                        }
+                                        _ => None,
                                     }
-                                    _ => None,
-                                }
-                            });
-                        }
-                        Err(_) => accepting = false,
-                    },
-                    joined = peeks.join_next(), if has_peeks => {
-                        if let Some(Ok(Some((header, reader)))) = joined
-                            && feed
-                                .send_continuation(header, Box::pin(reader) as GenerationReader)
-                                .await
-                                .is_err()
-                        {
-                            break;
+                                });
+                            }
+                            Err(_) => accepting = false,
+                        },
+                        joined = peeks.join_next(), if has_peeks => {
+                            if let Some(Ok(Some((header, reader)))) = joined
+                                && feed
+                                    .send_continuation(header, Box::pin(reader) as GenerationReader)
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
+                }
+            });
+            while let Some(joined) = inner.join_next().await {
+                if let Err(err) = joined {
+                    tracing::warn!(
+                        "a ResponseRouter accepter task ended with an error: {err}"
+                    );
                 }
             }
         });
@@ -946,19 +909,18 @@ impl ResponseRouterHandle {
         &self,
         logical_id: u64,
         gen0_reader: StreamReader,
-    ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
-        let rx = self.feed.await_gene(logical_id).await;
+    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, ()> {
+        let rx = self.feed.await_gene(logical_id).await?;
         let header = ResumeHeader {
             logical_id,
             generation: 0,
             is_final: false,
             is_response: true,
         };
-        let _ = self
-            .feed
+        self.feed
             .send_continuation(header, Box::pin(gen0_reader) as GenerationReader)
-            .await;
-        rx
+            .await?;
+        Ok(rx)
     }
 }
 pub fn spawn_response_router(accepter: DualStreamAccepter) -> ResponseRouter {
@@ -975,6 +937,7 @@ pub fn spawn_response_router(accepter: DualStreamAccepter) -> ResponseRouter {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{
@@ -1098,7 +1061,11 @@ mod tests {
             .unwrap();
         assert_eq!(&req, b"request");
         let gen0_reader = gen0_rx.await.unwrap();
-        let spliced_rx = router.handle().inject_response_gene(42, gen0_reader).await;
+        let spliced_rx = router
+            .handle()
+            .inject_response_gene(42, gen0_reader)
+            .await
+            .expect("splice feed alive");
         let mut resp_reader = spliced_rx.await.unwrap();
         resp_writer.write_all(b"head-").await.unwrap();
         resp_writer.write_all(&vec![0xEE; 40_000]).await.unwrap();
@@ -1128,6 +1095,7 @@ mod tests {
             .handle()
             .inject_response_gene(7, gen0_reader)
             .await
+            .expect("splice feed alive")
             .await
             .unwrap();
         resp_writer.write_all(b"pong").await.unwrap();
@@ -1174,6 +1142,7 @@ mod tests {
             .handle()
             .inject_response_gene(9, gen0_reader)
             .await
+            .expect("splice feed alive")
             .await
             .unwrap();
         let (up, down) = tokio::join!(
@@ -2085,6 +2054,7 @@ mod tests {
             .handle()
             .inject_response_gene(7, gen0_reader)
             .await
+            .expect("splice feed alive")
             .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
@@ -2167,6 +2137,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_writer_does_not_open_a_final_generation() {
+        let (opener, _accepter, _srv_int, _srv_bulk, _cli_int, _cli_bulk) =
+            make_dual_session().await;
+        let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+        writer
+            .write_all(b"announce")
+            .await
+            .expect("the session is live");
+        let (dead, opens) = counting_dead_opener();
+        writer
+            .rebind(dead)
+            .await
+            .expect("rebinding is a local state change");
+        drop(writer);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "dropping an opened writer opened a FINAL generation on the peer, so a dropped stream is treated as cleanly closed instead of an abort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_finalize_is_not_retried_behind_the_caller() {
         let (opener, _accepter, _srv_int, _srv_bulk, _cli_int, _cli_bulk) =
             make_dual_session().await;
@@ -2205,13 +2200,13 @@ mod tests {
             is_final: false,
             is_response: false,
         };
-        let first = handle.await_gene(7).await;
+        let first = handle.await_gene(7).await.expect("splice feed alive");
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
             .await
             .expect("the feed is alive");
         let _live = first.await.expect("the first gen-0 is spliced");
-        let second = handle.await_gene(7).await;
+        let second = handle.await_gene(7).await.expect("splice feed alive");
         handle
             .send_continuation(gen0(7), Box::pin(tokio::io::empty()) as GenerationReader)
             .await
@@ -2295,6 +2290,7 @@ mod tests {
             .handle()
             .inject_response_gene(21, gen0_reader)
             .await
+            .expect("splice feed alive")
             .await
             .unwrap();
         resp_writer.write_all(b"pong-").await.unwrap();
@@ -2639,6 +2635,7 @@ mod tests {
                 let mut resp_reader = handle
                     .inject_response_gene(id, gen0_reader)
                     .await
+                    .expect("splice feed alive")
                     .await
                     .expect("no response reader");
                 let mut got = Vec::new();
@@ -2714,8 +2711,8 @@ mod tests {
     async fn the_first_registration_for_a_gen0_owns_it() {
         let feed = spawn_splice_router();
         let handle = feed.handle();
-        let first = handle.await_gene(3).await;
-        let second = handle.await_gene(3).await;
+        let first = handle.await_gene(3).await.expect("splice feed alive");
+        let second = handle.await_gene(3).await.expect("splice feed alive");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (theirs, _ours) = tokio::io::duplex(64);
         handle

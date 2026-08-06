@@ -4,13 +4,13 @@ use std::{
     io::IoSlice,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
+    sync::watch,
     task::JoinSet,
 };
 
@@ -59,7 +59,6 @@ pub enum DeliveryMode {
 #[derive(Debug, Clone)]
 pub enum MessageSendError {
     PayloadTooLarge,
-    SemaphoreClosed,
     WriteFailed,
 }
 
@@ -69,7 +68,6 @@ impl fmt::Display for MessageSendError {
             MessageSendError::PayloadTooLarge => {
                 write!(f, "payload exceeds maximum message length")
             }
-            MessageSendError::SemaphoreClosed => write!(f, "sender has been closed"),
             MessageSendError::WriteFailed => write!(f, "write to stream failed"),
         }
     }
@@ -81,6 +79,86 @@ impl std::error::Error for MessageSendError {}
 pub enum RecvError {
     LaneDead,
     FrameTooLarge,
+}
+
+// ---------------------------------------------------------------------------
+// MessageAdmission
+// ---------------------------------------------------------------------------
+
+/// Atomic in-flight message admission. The atomic `inflight` count is the
+/// sole truth for capacity; the watch channel only wakes waiting `reserve`
+/// callers when a permit is released. Subscribing before the first failed
+/// CAS closes the release race between `try_reserve` and `await`.
+#[derive(Debug)]
+struct MessageAdmission {
+    max: usize,
+    inflight: AtomicUsize,
+    capacity_changed: watch::Sender<u64>,
+}
+
+impl MessageAdmission {
+    fn new(max: usize) -> Self {
+        assert!(max > 0, "message admission limit must be non-zero");
+        let (capacity_changed, _) = watch::channel(0_u64);
+        Self {
+            max,
+            inflight: AtomicUsize::new(0),
+            capacity_changed,
+        }
+    }
+
+    fn try_reserve(self: &Arc<Self>) -> Option<MessagePermit> {
+        let mut inflight = self.inflight.load(Ordering::Acquire);
+        loop {
+            if inflight >= self.max {
+                return None;
+            }
+            match self.inflight.compare_exchange_weak(
+                inflight,
+                inflight + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(MessagePermit {
+                        admission: Arc::clone(self),
+                    });
+                }
+                Err(actual) => inflight = actual,
+            }
+        }
+    }
+
+    async fn reserve(self: &Arc<Self>) -> MessagePermit {
+        let mut changed = self.capacity_changed.subscribe();
+        loop {
+            if let Some(permit) = self.try_reserve() {
+                return permit;
+            }
+            changed
+                .changed()
+                .await
+                .expect("MessageAdmission owns the watch sender while this Arc exists");
+        }
+    }
+}
+
+/// RAII release guard for one admitted in-flight message slot. Dropped when
+/// the send future's lexical scope ends, freeing the slot and waking one
+/// waiting `reserve` caller.
+#[derive(Debug)]
+struct MessagePermit {
+    admission: Arc<MessageAdmission>,
+}
+
+impl Drop for MessagePermit {
+    fn drop(&mut self) {
+        let previous = self.admission.inflight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        self.admission.capacity_changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +176,7 @@ pub struct DualMessageSender {
     opener: DualStreamOpener,
     mode: DeliveryMode,
     max_message_len: usize,
-    semaphore: Arc<Semaphore>,
+    admission: Arc<MessageAdmission>,
     next_seq: AtomicU64,
 }
 
@@ -117,13 +195,13 @@ impl DualMessageSender {
             opener,
             mode,
             max_message_len: DEFAULT_MAX_MESSAGE_LEN,
-            semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_MESSAGES)),
+            admission: Arc::new(MessageAdmission::new(DEFAULT_MAX_INFLIGHT_MESSAGES)),
             next_seq: AtomicU64::new(0),
         }
     }
 
     pub fn with_max_inflight(mut self, max: usize) -> Self {
-        self.semaphore = Arc::new(Semaphore::new(max));
+        self.admission = Arc::new(MessageAdmission::new(max));
         self
     }
 
@@ -140,11 +218,7 @@ impl DualMessageSender {
             return Err(MessageSendError::PayloadTooLarge);
         }
 
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| MessageSendError::SemaphoreClosed)?;
+        let _permit = self.admission.reserve().await;
 
         let seq = if matches!(self.mode, DeliveryMode::Ordered) {
             Some(self.next_seq.fetch_add(1, Ordering::Relaxed))
@@ -190,17 +264,10 @@ impl DualMessageSender {
             }
         }
 
-        // Shutdown the write side and drop. The permit is held until
-        // this scope exits, bounding in-flight streams.
+        // Shutdown the write side. The permit drops lexically at the end of
+        // this scope on every success, I/O error, or cancelled send.
         let _ = writer.shutdown();
-        drop(permit);
         Ok(())
-    }
-}
-
-impl Drop for DualMessageSender {
-    fn drop(&mut self) {
-        self.semaphore.close();
     }
 }
 
@@ -422,6 +489,7 @@ impl DualMessageReceiver {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{
@@ -632,19 +700,19 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Sender semaphore backpressure
+    // Sender admission backpressure
     // -------------------------------------------------------------------
 
-    /// The semaphore bounds in-flight sends. Both lanes' transport peer
-    /// halves are held alive but NEVER read, so once the 128 B duplex
+    /// The atomic admission bounds in-flight sends. Both lanes' transport
+    /// peer halves are held alive but NEVER read, so once the 128 B duplex
     /// buffer plus all in-process buffering (< ~600 KiB) saturates under
     /// 1 MiB payloads, writes park forever and permits are held.
     ///
     /// This replaces a timing-based assert that counted completed sends
-    /// inside a fixed sleep window, which was racy because the semaphore
+    /// inside a fixed sleep window, which was racy because the admission
     /// bounds concurrency (not throughput per unit time).
     #[tokio::test(flavor = "multi_thread")]
-    async fn semaphore_backpressure_limits_inflight() {
+    async fn atomic_admission_backpressure_limits_inflight() {
         use std::sync::atomic::AtomicUsize;
         use tokio::sync::Barrier;
         use tokio::time::timeout;
@@ -675,7 +743,7 @@ mod tests {
 
         let tx =
             Arc::new(DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_inflight(2));
-        let semaphore = tx.semaphore.clone();
+        let admission = Arc::clone(&tx.admission);
 
         let barrier = Arc::new(Barrier::new(10));
         let finished = Arc::new(AtomicUsize::new(0));
@@ -694,21 +762,21 @@ mod tests {
             }));
         }
 
-        // Wait for the semaphore to saturate — exactly 2 permits held.
+        // Wait for the admission to saturate — exactly 2 permits held.
         timeout(Duration::from_secs(5), async {
-            while semaphore.available_permits() != 0 {
+            while admission.inflight.load(Ordering::Acquire) != 2 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("semaphore never reached 0 — inflight bound not enforced");
+        .expect("inflight never reached 2 — in-flight bound not enforced");
 
-        // After a brief settle, permits must STAY at 0 and no send finished.
+        // After a brief settle, inflight must STAY at 2 and no send finished.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            semaphore.available_permits(),
-            0,
-            "permits must remain at 0 while writes are parked"
+            admission.inflight.load(Ordering::Acquire),
+            2,
+            "inflight must remain at 2 while writes are parked"
         );
         let done = finished.load(Ordering::SeqCst);
         assert_eq!(
@@ -720,6 +788,117 @@ mod tests {
         for h in handles {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
+    }
+
+    /// A cancelled send releases its in-flight permit: the permit lives
+    /// only in the send future's lexical scope, so aborting the send frees
+    /// the slot for the next caller. Uses the same non-draining 128-byte
+    /// transport with a limit of one, so a permit parked anywhere else
+    /// would deadlock the second send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_send_releases_message_permit() {
+        use tokio::time::timeout;
+
+        let (_int_peer, int_local) = duplex(128);
+        let (int_r, int_w) = tokio::io::split(int_local);
+        let (_bulk_peer, bulk_local) = duplex(128);
+        let (bulk_r, bulk_w) = tokio::io::split(bulk_local);
+
+        let cfg = config(Initiation::Server);
+        let mut int_spawner = JoinSet::new();
+        let (int_opener, _int_acc) =
+            spawn_mux_no_reconnection(int_r, int_w, cfg.clone(), &mut int_spawner);
+        let mut bulk_spawner = JoinSet::new();
+        let (bulk_opener, _bulk_acc) =
+            spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
+        tokio::task::spawn(async move {
+            let _ = int_spawner.join_next().await;
+        });
+        tokio::task::spawn(async move {
+            let _ = bulk_spawner.join_next().await;
+        });
+
+        let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
+
+        let tx =
+            Arc::new(DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_inflight(1));
+        let admission = Arc::clone(&tx.admission);
+        let payload = vec![0u8; 1 << 20];
+
+        // First send acquires the single permit and parks on the full
+        // transport buffer.
+        let first = tokio::spawn({
+            let tx = tx.clone();
+            let payload = payload.clone();
+            async move { tx.send(&payload).await }
+        });
+        timeout(Duration::from_secs(5), async {
+            while admission.inflight.load(Ordering::Acquire) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the first send never acquired its permit");
+
+        first.abort();
+        let _ = first.await;
+
+        timeout(Duration::from_secs(5), async {
+            while admission.inflight.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the aborted send did not release its permit");
+
+        // The freed permit lets a second send acquire even though the
+        // transport still cannot drain.
+        let second = tokio::spawn({
+            let tx = tx.clone();
+            let payload = payload.clone();
+            async move { tx.send(&payload).await }
+        });
+        timeout(Duration::from_secs(5), async {
+            while admission.inflight.load(Ordering::Acquire) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a released permit did not let the second send acquire");
+
+        second.abort();
+        let _ = second.await;
+    }
+
+    // -------------------------------------------------------------------
+    // MessageAdmission unit tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_admission_reserve_waits_then_completes() {
+        let admission = Arc::new(MessageAdmission::new(2));
+        let first = admission.try_reserve().expect("first reserve fits");
+        let second = admission.try_reserve().expect("second reserve fits");
+        let third = admission.reserve();
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut third)
+                .await
+                .is_err(),
+            "a third permit must stay pending at capacity"
+        );
+        drop(first);
+        let third_permit = tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .expect("releasing a permit must unblock a waiting reserve");
+        assert_eq!(admission.inflight.load(Ordering::Acquire), 2);
+        drop(second);
+        drop(third_permit);
+        assert_eq!(
+            admission.inflight.load(Ordering::Acquire),
+            0,
+            "dropping every permit must drain the in-flight count"
+        );
     }
 
     // -------------------------------------------------------------------

@@ -312,6 +312,8 @@ async fn open_stream(
     Ok((stream_id, msg))
 }
 
+pub const MAX_CONCURRENT_STREAMS: usize = 8192;
+
 #[derive(Debug)]
 pub struct MuxControl {
     stream_table: HashMap<StreamId, StreamState>,
@@ -320,6 +322,7 @@ pub struct MuxControl {
     next_possible_local_stream_id: StreamId,
     write_data_tx: WriteDataTxFactory,
     frame_reassembly: bool,
+    max_concurrent_streams: usize,
 }
 impl MuxControl {
     pub fn new(
@@ -334,6 +337,7 @@ impl MuxControl {
             next_possible_local_stream_id: 0,
             write_data_tx,
             frame_reassembly,
+            max_concurrent_streams: MAX_CONCURRENT_STREAMS,
         }
     }
     fn classify_stream_id(&self, stream_id: StreamId) -> ClassifiedStreamId {
@@ -393,6 +397,11 @@ impl MuxControl {
         self.next_possible_local_stream_id = local_stream_id.ring_add(1, max_local_stream_id);
         Ok(self.wire_stream_id(local_stream_id))
     }
+    #[cfg(test)]
+    fn set_max_concurrent_streams_for_test(&mut self, max: usize) {
+        assert!(max > 0);
+        self.max_concurrent_streams = max;
+    }
     pub fn local_close(&mut self, stream_id: StreamId, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return;
@@ -445,6 +454,9 @@ impl MuxControl {
         peer_read_closed: PeerReadClosedFlag,
         stream_id: Option<StreamId>,
     ) -> Result<(StreamId, StreamWriteDataTx), ControlOpenError> {
+        if self.stream_table.len() >= self.max_concurrent_streams {
+            return Err(ControlOpenError::TooManyOpenStreams(TooManyOpenStreams {}));
+        }
         let wire_open = stream_id.is_none();
         let stream_id = match stream_id {
             Some(stream_id) => stream_id,
@@ -650,6 +662,7 @@ pub enum Initiation {
 pub struct TooManyOpenStreams {}
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod reassembly_tests {
     use super::*;
     use crate::central_io::{
@@ -765,6 +778,68 @@ mod reassembly_tests {
             .await
             .unwrap();
         rx
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_limit_rejects_local_and_peer_opens() {
+        let (mut control, _close_tx, _drain) = make_control(false);
+        control.set_max_concurrent_streams_for_test(2);
+        let (_, pair1) = open_stream(&mut control, &_close_tx, None).await.unwrap();
+        let (_, pair2) = open_stream(&mut control, &_close_tx, None).await.unwrap();
+        let local = control
+            .open(
+                StreamDispatcher::new(stream_read_data_channel().0),
+                PeerReadClosedFlag::new(),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(local, Err(ControlOpenError::TooManyOpenStreams(_))),
+            "a local open above the limit was admitted"
+        );
+        drop(pair1);
+        drop(pair2);
+
+        let (mut peer_control, peer_close_tx, peer_drain) = make_control(false);
+        peer_control.set_max_concurrent_streams_for_test(2);
+        let (_, pair3) = open_stream(&mut peer_control, &peer_close_tx, Some(7))
+            .await
+            .unwrap();
+        let (_, pair4) = open_stream(&mut peer_control, &peer_close_tx, Some(9))
+            .await
+            .unwrap();
+        let peer = peer_control
+            .open(
+                StreamDispatcher::new(stream_read_data_channel().0),
+                PeerReadClosedFlag::new(),
+                Some(11),
+            )
+            .await;
+        assert!(
+            matches!(peer, Err(ControlOpenError::TooManyOpenStreams(_))),
+            "a peer open above the limit was admitted"
+        );
+        drop((pair3, pair4, peer_drain));
+    }
+
+    #[tokio::test]
+    async fn stream_limit_bounds_pending_close_state() {
+        let (mut control, close_tx, _drain) = make_control(false);
+        control.set_max_concurrent_streams_for_test(2);
+        let (_, pair1) = open_stream(&mut control, &close_tx, None).await.unwrap();
+        let (_, pair2) = open_stream(&mut control, &close_tx, None).await.unwrap();
+        drop(pair1);
+        drop(pair2);
+        assert_eq!(
+            close_tx.pending_stream_count(),
+            2,
+            "the read/write close guards of both streams did not derive from the same StreamCloseTxPrototype"
+        );
+        let third = open_stream(&mut control, &close_tx, None).await;
+        assert!(
+            matches!(third, Err(ControlOpenError::TooManyOpenStreams(_))),
+            "a third open was admitted after two streams closed without their pending close state being drained"
+        );
     }
 
     #[tokio::test]

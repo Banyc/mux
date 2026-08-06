@@ -526,6 +526,7 @@ struct NotClone<T>(pub T);
 pub struct QueueToken(pub usize);
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::task::Waker;
 

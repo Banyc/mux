@@ -1,4 +1,7 @@
-use tokio::sync::mpsc;
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::migration_wire::{
@@ -6,10 +9,20 @@ use crate::migration_wire::{
     spawn_splice_driver,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpliceRouterState {
+    Running,
+    Stopped,
+    DriverFailed,
+    ChildPanicked,
+    ChildJoinFailed,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpliceRouterHandle {
     cont_tx: mpsc::Sender<(ResumeHeader, GenerationReader)>,
     register_tx: mpsc::Sender<(u64, tokio::sync::oneshot::Sender<SplicedReader>)>,
+    state: watch::Receiver<SpliceRouterState>,
 }
 
 impl SpliceRouterHandle {
@@ -24,18 +37,25 @@ impl SpliceRouterHandle {
     pub(crate) async fn await_gene(
         &self,
         logical_id: u64,
-    ) -> tokio::sync::oneshot::Receiver<SplicedReader> {
+    ) -> Result<tokio::sync::oneshot::Receiver<SplicedReader>, ()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.register_tx.send((logical_id, tx)).await;
-        rx
+        self.register_tx
+            .send((logical_id, tx))
+            .await
+            .map_err(|_| ())?;
+        Ok(rx)
+    }
+
+    pub(crate) fn state(&self) -> SpliceRouterState {
+        *self.state.borrow()
     }
 }
 
 /// The typed exit of one supervised splice task, produced when the
-/// [`SpliceRouter`] reaps its [`JoinSet`]. A panic in either the matcher
-/// or the driver surfaces as [`SpliceTaskExit::Panicked`] (with the panic
-/// message) instead of being silently swallowed; a task aborted during
-/// shutdown surfaces as [`SpliceTaskExit::Cancelled`].
+/// [`SpliceRouter`]'s supervisor reaps its inner [`JoinSet`]. A panic in
+/// either the matcher or the driver surfaces as [`SpliceTaskExit::Panicked`]
+/// (with the panic message) instead of being silently swallowed; a task
+/// aborted during shutdown surfaces as [`SpliceTaskExit::Cancelled`].
 #[derive(Debug)]
 pub enum SpliceTaskExit {
     /// The matcher task exited normally (its feed channels closed).
@@ -51,7 +71,8 @@ pub enum SpliceTaskExit {
 #[derive(Debug)]
 pub struct SpliceRouter {
     handle: SpliceRouterHandle,
-    tasks: JoinSet<SpliceTaskExit>,
+    _supervision: JoinSet<()>,
+    state: watch::Receiver<SpliceRouterState>,
 }
 
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
@@ -99,36 +120,73 @@ impl SpliceRouter {
     pub fn handle(&self) -> SpliceRouterHandle {
         self.handle.clone()
     }
+}
 
-    /// Reap a single completed splice task and return its typed exit.
-    /// A panicked child is surfaced as [`SpliceTaskExit::Panicked`] (and
-    /// logged), never silently swallowed.
-    pub(crate) async fn reap_next(&mut self) -> Option<SpliceTaskExit> {
-        let joined = self.tasks.join_next().await?;
-        let exit = match joined {
-            Ok(exit) => exit,
-            Err(err) => join_error_to_exit(err),
-        };
-        observe_exit(&exit);
-        Some(exit)
-    }
-
-    /// Reap every already-completed task without blocking, logging each
-    /// exit.
-    fn reap(&mut self) {
-        while let Some(joined) = self.tasks.try_join_next() {
-            let exit = match joined {
-                Ok(exit) => exit,
-                Err(err) => join_error_to_exit(err),
-            };
-            observe_exit(&exit);
+fn spawn_splice_supervisor(
+    children: Vec<Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>>>,
+    state_tx: watch::Sender<SpliceRouterState>,
+) -> JoinSet<()> {
+    let mut outer = JoinSet::new();
+    outer.spawn(async move {
+        let mut inner: JoinSet<SpliceTaskExit> = JoinSet::new();
+        for child in children {
+            inner.spawn(child);
         }
-    }
-
-    pub(crate) fn abort(&mut self) {
-        self.reap();
-        self.tasks.abort_all();
-    }
+        let mut saw_driver_done = false;
+        let mut saw_matcher_done = false;
+        loop {
+            let Some(joined) = inner.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok(exit) => {
+                    observe_exit(&exit);
+                    match exit {
+                        SpliceTaskExit::DriverDone(Err(_)) => {
+                            let _ = state_tx.send(SpliceRouterState::DriverFailed);
+                            inner.abort_all();
+                            while inner.join_next().await.is_some() {}
+                            return;
+                        }
+                        SpliceTaskExit::DriverDone(Ok(())) => saw_driver_done = true,
+                        SpliceTaskExit::MatcherDone => saw_matcher_done = true,
+                        SpliceTaskExit::Panicked(_) => {
+                            let _ = state_tx.send(SpliceRouterState::ChildPanicked);
+                            inner.abort_all();
+                            while inner.join_next().await.is_some() {}
+                            return;
+                        }
+                        SpliceTaskExit::Cancelled => {
+                            let _ = state_tx.send(SpliceRouterState::ChildJoinFailed);
+                            inner.abort_all();
+                            while inner.join_next().await.is_some() {}
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let exit = join_error_to_exit(err);
+                    observe_exit(&exit);
+                    match exit {
+                        SpliceTaskExit::Panicked(_) => {
+                            let _ = state_tx.send(SpliceRouterState::ChildPanicked);
+                        }
+                        _ => {
+                            let _ = state_tx.send(SpliceRouterState::ChildJoinFailed);
+                        }
+                    }
+                    inner.abort_all();
+                    while inner.join_next().await.is_some() {}
+                    return;
+                }
+            }
+            if saw_driver_done && saw_matcher_done {
+                let _ = state_tx.send(SpliceRouterState::Stopped);
+                return;
+            }
+        }
+    });
+    outer
 }
 
 pub fn spawn_splice_router() -> SpliceRouter {
@@ -139,63 +197,76 @@ pub fn spawn_splice_router() -> SpliceRouter {
         u64,
         tokio::sync::oneshot::Sender<SplicedReader>,
     )>(SPLICE_REGISTER_CAPACITY);
-    let mut tasks = JoinSet::new();
-    tasks.spawn(async move {
-        let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
-        SpliceTaskExit::DriverDone(driver.await)
-    });
-    tasks.spawn(async move {
-        let mut waiters: std::collections::HashMap<
-            u64,
-            tokio::sync::oneshot::Sender<SplicedReader>,
-        > = std::collections::HashMap::new();
-        let mut ready: std::collections::VecDeque<(u64, Option<SplicedReader>)> =
-            std::collections::VecDeque::new();
-        loop {
-            tokio::select! {
-                reg = register_rx.recv() => match reg {
-                    Some((id, tx)) => match ready.iter().position(|(parked, _)| *parked == id)
-                        .and_then(|at| ready.remove(at)).map(|(_, spliced)| spliced)
-                    {
-                        Some(None) => drop(tx),
-                        Some(Some(spliced)) => { let _ = tx.send(spliced); }
-                        None => match waiters.entry(id) {
-                            std::collections::hash_map::Entry::Occupied(_) => drop(tx),
-                            std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(tx); }
+
+    let (state_tx, state_rx) = watch::channel(SpliceRouterState::Running);
+
+    let children: Vec<Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>>> = vec![
+        Box::pin(async move {
+            let driver = spawn_splice_driver(SpliceRegistry::new(), cont_rx, gen0_tx);
+            SpliceTaskExit::DriverDone(driver.await)
+        }),
+        Box::pin(async move {
+            let mut waiters: std::collections::HashMap<
+                u64,
+                tokio::sync::oneshot::Sender<SplicedReader>,
+            > = std::collections::HashMap::new();
+            let mut ready: std::collections::VecDeque<(u64, Option<SplicedReader>)> =
+                std::collections::VecDeque::new();
+            loop {
+                tokio::select! {
+                    reg = register_rx.recv() => match reg {
+                        Some((id, tx)) => match ready.iter().position(|(parked, _)| *parked == id)
+                            .and_then(|at| ready.remove(at)).map(|(_, spliced)| spliced)
+                        {
+                            Some(None) => drop(tx),
+                            Some(Some(spliced)) => { let _ = tx.send(spliced); }
+                            None => match waiters.entry(id) {
+                                std::collections::hash_map::Entry::Occupied(_) => drop(tx),
+                                std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(tx); }
+                            },
                         },
+                        None => break,
                     },
-                    None => break,
-                },
-                gen0 = gen0_rx.recv() => match gen0 {
-                    Some((id, spliced)) => match waiters.remove(&id) {
-                        Some(tx) => {
-                            if let Some(spliced) = spliced {
-                                let _ = tx.send(spliced);
-                            }
-                        }
-                        None => {
-                            if ready.len() >= MAX_UNCLAIMED_GEN0
-                                && let Some((evicted_id, _)) = ready.pop_front() {
-                                    tracing::debug!(
-                                        evicted_id,
-                                        "splice feed evicted an unclaimed gen-0 reader (ready queue full)"
-                                    );
+                    gen0 = gen0_rx.recv() => match gen0 {
+                        Some((id, spliced)) => match waiters.remove(&id) {
+                            Some(tx) => {
+                                if let Some(spliced) = spliced {
+                                    let _ = tx.send(spliced);
                                 }
-                            ready.push_back((id, spliced));
-                        }
+                            }
+                            None => {
+                                if ready.len() >= MAX_UNCLAIMED_GEN0
+                                    && let Some((evicted_id, _)) = ready.pop_front() {
+                                        tracing::debug!(
+                                            evicted_id,
+                                            "splice feed evicted an unclaimed gen-0 reader (ready queue full)"
+                                        );
+                                    }
+                                ready.push_back((id, spliced));
+                            }
+                        },
+                        None => break,
                     },
-                    None => break,
-                },
+                }
             }
-        }
-        SpliceTaskExit::MatcherDone
+            SpliceTaskExit::MatcherDone
+        }),
+    ];
+
+    let mut _supervision = spawn_splice_supervisor(children, state_tx.clone());
+    _supervision.spawn(async move {
+        let _keep_state_sender_alive = state_tx;
+        std::future::pending::<()>().await
     });
+
     SpliceRouter {
         handle: SpliceRouterHandle {
             cont_tx,
             register_tx,
+            state: state_rx.clone(),
         },
-        tasks,
+        _supervision,
+        state: state_rx,
     }
 }
 
@@ -218,24 +289,23 @@ mod tests {
     // is the abort backstop), not just leaks them.
     #[tokio::test]
     async fn dropping_the_router_aborts_its_children() {
-        let mut router = spawn_splice_router();
+        let (state_tx, _state_rx) = watch::channel(SpliceRouterState::Running);
         let dropped = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&dropped);
         let started = Arc::new(tokio::sync::Notify::new());
-        router.tasks.spawn({
-            let started = started.clone();
-            async move {
-                let _guard = DropCounter(counter);
-                started.notify_waiters();
-                std::future::pending::<()>().await;
-                #[allow(unreachable_code)]
-                SpliceTaskExit::MatcherDone
-            }
+        let notify = Arc::clone(&started);
+        let child: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> = Box::pin(async move {
+            let _guard = DropCounter(counter);
+            notify.notify_waiters();
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            SpliceTaskExit::MatcherDone
         });
+        let supervision = spawn_splice_supervisor(vec![child], state_tx);
         // Let the child run so its guard actually exists before aborting;
         // an aborted-but-never-polled task never constructed it.
         started.notified().await;
-        drop(router);
+        drop(supervision);
         // Abort is asynchronous: the runtime must poll the aborted task to
         // drop its future (and the guard).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -249,56 +319,40 @@ mod tests {
         );
     }
 
-    // When the feed channels close, the driver and matcher exit normally
-    // and reaping drains both as typed exits (no abort involved).
+    // A panic in a supervised child is surfaced as ChildPanicked on the
+    // shared state channel without any explicit reap call.
     #[tokio::test]
-    async fn normal_shutdown_drains_the_supervised_tasks() {
-        let mut router = spawn_splice_router();
-        // Sever the router's own senders so the driver and matcher see
-        // their feed channels close and exit normally.
-        router.handle.cont_tx = tokio::sync::mpsc::channel(SPLICE_CONT_CAPACITY).0;
-        router.handle.register_tx = tokio::sync::mpsc::channel(SPLICE_REGISTER_CAPACITY).0;
-        let mut exits = Vec::new();
-        while let Some(exit) = router.reap_next().await {
-            exits.push(exit);
-        }
-        assert_eq!(exits.len(), 2, "expected the driver and matcher to exit");
-        assert!(
-            exits
-                .iter()
-                .any(|e| matches!(e, SpliceTaskExit::DriverDone(Ok(())))),
-            "the driver did not exit cleanly: {exits:?}"
-        );
-        assert!(
-            exits
-                .iter()
-                .any(|e| matches!(e, SpliceTaskExit::MatcherDone)),
-            "the matcher did not exit cleanly: {exits:?}"
-        );
-    }
-
-    // A panic in a supervised task is surfaced as a typed
-    // SpliceTaskExit::Panicked when reaped, not silently swallowed.
-    #[tokio::test]
-    async fn a_supervised_task_panic_is_observed_when_reaped() {
-        let mut router = spawn_splice_router();
-        router.tasks.spawn(async {
-            panic!("intentional splice task panic");
+    async fn splice_child_panic_updates_health_without_reap() {
+        let (state_tx, state_rx) = watch::channel(SpliceRouterState::Running);
+        let child: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> = Box::pin(async move {
+            panic!("intentional splice supervisor child panic");
             #[allow(unreachable_code)]
             SpliceTaskExit::MatcherDone
         });
-        let exit = router
-            .reap_next()
+        let _supervision = spawn_splice_supervisor(vec![child], state_tx);
+        let mut state_rx = state_rx;
+        tokio::time::timeout(std::time::Duration::from_secs(1), state_rx.changed())
             .await
-            .expect("the panicking task should be reaped");
-        match exit {
-            SpliceTaskExit::Panicked(msg) => {
-                assert!(
-                    msg.contains("intentional splice task panic"),
-                    "unexpected panic message: {msg}"
-                );
-            }
-            other => panic!("expected a panic exit, got {other:?}"),
-        }
+            .expect("the supervisor never reported its child's panic")
+            .expect("the state sender closed before reporting the panic");
+        assert_eq!(*state_rx.borrow(), SpliceRouterState::ChildPanicked);
+    }
+
+    // A closed registration channel surfaces as an Err from await_gene so
+    // the caller maps it to FeedDead instead of awaiting a receiver that
+    // can never resolve.
+    #[tokio::test]
+    async fn closed_register_channel_is_returned_to_await_gene() {
+        let mut router = spawn_splice_router();
+        let (register_tx, register_rx) = mpsc::channel::<(
+            u64,
+            tokio::sync::oneshot::Sender<SplicedReader>,
+        )>(SPLICE_REGISTER_CAPACITY);
+        drop(register_rx);
+        router.handle.register_tx = register_tx;
+        assert!(
+            router.handle.await_gene(7).await.is_err(),
+            "a closed registration channel was silently ignored"
+        );
     }
 }

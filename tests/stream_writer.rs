@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Duration;
 
 use mux::{Initiation, MuxConfig, spawn_mux_no_reconnection};

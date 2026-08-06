@@ -112,6 +112,11 @@ impl StreamCloseTxPrototype {
             state: self.state.clone(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_stream_count(&self) -> usize {
+        self.state.pending.lock().unwrap().len()
+    }
 }
 #[derive(Debug, Clone)]
 pub struct StreamCloseTx {
@@ -151,6 +156,8 @@ pub struct DeadStreamInit {}
 mod tests {
     use super::*;
 
+    // It directly constructs close guards without MuxControl, so it is a unit
+    // test of lossless coalescing rather than a production cardinality claim.
     #[tokio::test]
     async fn close_notifications_survive_a_large_burst() {
         let (close_tx, mut close_rx) = stream_close_channel();

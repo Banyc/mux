@@ -1,3 +1,7 @@
+// Benchmark example: test-runtime tasks are outside the production spawn
+// inventory.
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     io,
     sync::Arc,
