@@ -501,6 +501,48 @@ mod tests {
     use std::time::Duration;
     use tokio::io::duplex;
 
+    /// An actively-polled scope of test-owned background tasks. The test
+    /// body runs through [`TestScope::run`], which races it against
+    /// `join_next()` on the scope, so a background task that panics (in
+    /// particular one that unwraps a panicked child join) fails the test
+    /// immediately instead of being observed only when the scope is
+    /// dropped. Background tasks that end normally are drained silently
+    /// (legitimate shutdowns); dropping the scope remains the abort
+    /// backstop for tasks still running when the body completes.
+    struct TestScope {
+        tasks: JoinSet<()>,
+    }
+
+    impl TestScope {
+        fn new() -> Self {
+            Self {
+                tasks: JoinSet::new(),
+            }
+        }
+
+        fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+            self.tasks.spawn(task);
+        }
+
+        async fn run<F: std::future::Future>(&mut self, body: F) -> F::Output {
+            tokio::pin!(body);
+            loop {
+                tokio::select! {
+                    value = &mut body => return value,
+                    joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                        // A background task exited before the body. Re-raise
+                        // any panic it surfaced immediately; a normal
+                        // completion is a legitimate shutdown (e.g. the lane
+                        // supervision ending when the sessions end) and is
+                        // drained silently.
+                        let joined = joined.expect("background task exists");
+                        joined.expect("a background task panicked");
+                    }
+                }
+            }
+        }
+    }
+
     fn config(initiation: Initiation) -> MuxConfig {
         MuxConfig {
             initiation,
@@ -509,12 +551,7 @@ mod tests {
         }
     }
 
-    async fn paired_sessions() -> (
-        DualStreamOpener,
-        DualStreamAccepter,
-        JoinSet<crate::session::MuxError>,
-        JoinSet<crate::session::MuxError>,
-    ) {
+    async fn paired_sessions() -> (DualStreamOpener, DualStreamAccepter, TestScope) {
         let (int_c2s, int_s2c) = duplex(32768);
         let (bulk_c2s, bulk_s2c) = duplex(32768);
 
@@ -556,12 +593,20 @@ mod tests {
         let srv_opener = DualStreamOpener::new(int_srv_op, bulk_srv_op, Liveness::new());
         let cli_accepter = DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
 
-        let mut srv_spawner = JoinSet::new();
-        srv_spawner.spawn(supervise_lanes(srv_int, srv_bulk));
-        let mut cli_spawner = JoinSet::new();
-        cli_spawner.spawn(supervise_lanes(cli_int, cli_bulk));
+        // Both lanes' supervision runs inside the shared scope, so an early
+        // lane panic surfaces through `run` while the test body is still
+        // executing. The `MuxError` value is only a normal-shutdown signal;
+        // a panic inside a lane propagates through the unwrap in
+        // `supervise_lanes` and aborts the wrapper task.
+        let mut scope = TestScope::new();
+        scope.spawn(async move {
+            let _ = supervise_lanes(srv_int, srv_bulk).await;
+        });
+        scope.spawn(async move {
+            let _ = supervise_lanes(cli_int, cli_bulk).await;
+        });
 
-        (srv_opener, cli_accepter, srv_spawner, cli_spawner)
+        (srv_opener, cli_accepter, scope)
     }
 
     /// Supervise both lanes' session tasks: select between the two lane
@@ -596,44 +641,50 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn round_trip_unordered() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+                // Send in background
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
+                let mut tx_tasks = JoinSet::new();
+                tx_tasks.spawn(async move {
+                    tx.send(b"hello").await.unwrap();
+                    tx.send(b"world").await.unwrap();
+                });
 
-        // Send in background
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
-        let mut tx_tasks = JoinSet::new();
-        tx_tasks.spawn(async move {
-            tx.send(b"hello").await.unwrap();
-            tx.send(b"world").await.unwrap();
-        });
+                let msg1 = rx.recv().await.unwrap().unwrap();
+                let msg2 = rx.recv().await.unwrap().unwrap();
 
-        let msg1 = rx.recv().await.unwrap().unwrap();
-        let msg2 = rx.recv().await.unwrap().unwrap();
+                while let Some(result) = tx_tasks.join_next().await {
+                    result.unwrap();
+                }
 
-        while let Some(result) = tx_tasks.join_next().await {
-            result.unwrap();
-        }
-
-        // Unordered: both messages arrive; order not guaranteed
-        let mut msgs = [msg1, msg2];
-        msgs.sort();
-        assert_eq!(msgs[0], b"hello");
-        assert_eq!(msgs[1], b"world");
+                // Unordered: both messages arrive; order not guaranteed
+                let mut msgs = [msg1, msg2];
+                msgs.sort();
+                assert_eq!(msgs[0], b"hello");
+                assert_eq!(msgs[1], b"world");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn round_trip_ordered() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
+                tx.send(b"first").await.unwrap();
+                tx.send(b"second").await.unwrap();
 
-        let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
-        tx.send(b"first").await.unwrap();
-        tx.send(b"second").await.unwrap();
-
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"first");
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"second");
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"first");
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"second");
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -642,32 +693,38 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn small_message_routes_interactive() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
+                // Small payload (< 2 KiB) → frame < AUTO_BULK_THRESHOLD
+                tx.send(&[0xAAu8; 100]).await.unwrap();
 
-        // Small payload (< 2 KiB) → frame < AUTO_BULK_THRESHOLD
-        tx.send(&[0xAAu8; 100]).await.unwrap();
-
-        let msg = rx.recv().await.unwrap().unwrap();
-        assert_eq!(msg.len(), 100);
-        assert_eq!(msg[0], 0xAA);
+                let msg = rx.recv().await.unwrap().unwrap();
+                assert_eq!(msg.len(), 100);
+                assert_eq!(msg[0], 0xAA);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn large_message_routes_bulk() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
+                // Large payload (> 2 KiB) → frame > AUTO_BULK_THRESHOLD
+                let large = vec![0xBBu8; 5000];
+                tx.send(&large).await.unwrap();
 
-        // Large payload (> 2 KiB) → frame > AUTO_BULK_THRESHOLD
-        let large = vec![0xBBu8; 5000];
-        tx.send(&large).await.unwrap();
-
-        let msg = rx.recv().await.unwrap().unwrap();
-        assert_eq!(msg.len(), 5000);
+                let msg = rx.recv().await.unwrap().unwrap();
+                assert_eq!(msg.len(), 5000);
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -676,29 +733,32 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unordered_concurrent_messages() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
+                // Send multiple messages concurrently
+                let tx = Arc::new(tx);
+                let mut send_tasks = JoinSet::new();
+                for i in 0..10u8 {
+                    let tx = tx.clone();
+                    send_tasks.spawn(async move {
+                        tx.send(&[i; 50]).await.unwrap();
+                    });
+                }
+                while let Some(result) = send_tasks.join_next().await {
+                    result.unwrap();
+                }
 
-        // Send multiple messages concurrently
-        let tx = Arc::new(tx);
-        let mut send_tasks = JoinSet::new();
-        for i in 0..10u8 {
-            let tx = tx.clone();
-            send_tasks.spawn(async move {
-                tx.send(&[i; 50]).await.unwrap();
-            });
-        }
-        while let Some(result) = send_tasks.join_next().await {
-            result.unwrap();
-        }
-
-        let mut received = vec![];
-        for _ in 0..10 {
-            received.push(rx.recv().await.unwrap().unwrap());
-        }
-        assert_eq!(received.len(), 10);
+                let mut received = vec![];
+                for _ in 0..10 {
+                    received.push(rx.recv().await.unwrap().unwrap());
+                }
+                assert_eq!(received.len(), 10);
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -707,13 +767,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_payload_rejected() {
-        let (opener, _accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, _accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered)
+                    .with_max_message_len(1024);
 
-        let tx = DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_message_len(1024);
-
-        let too_big = vec![0u8; 2048];
-        let result = tx.send(&too_big).await;
-        assert!(matches!(result, Err(MessageSendError::PayloadTooLarge)));
+                let too_big = vec![0u8; 2048];
+                let result = tx.send(&too_big).await;
+                assert!(matches!(result, Err(MessageSendError::PayloadTooLarge)));
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -748,6 +812,10 @@ mod tests {
         let mut bulk_spawner = JoinSet::new();
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
+        let mut scope = TestScope::new();
+        scope.spawn(async move {
+            let _ = supervise_lanes(int_spawner, bulk_spawner).await;
+        });
 
         let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
@@ -772,36 +840,42 @@ mod tests {
             });
         }
 
-        // Wait for the admission to saturate — exactly 2 permits held.
-        timeout(Duration::from_secs(5), async {
-            while admission.inflight.load(Ordering::Acquire) != 2 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("inflight never reached 2 — in-flight bound not enforced");
+        scope
+            .run(async {
+                // Wait for the admission to saturate — exactly 2 permits held.
+                timeout(Duration::from_secs(5), async {
+                    while admission.inflight.load(Ordering::Acquire) != 2 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("inflight never reached 2 — in-flight bound not enforced");
 
-        // After a brief settle, inflight must STAY at 2 and no send finished.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            admission.inflight.load(Ordering::Acquire),
-            2,
-            "inflight must remain at 2 while writes are parked"
-        );
-        let done = finished.load(Ordering::SeqCst);
-        assert_eq!(
-            done, 0,
-            "no sends should have completed while writes are parked, but {done} finished"
-        );
+                // After a brief settle, inflight must STAY at 2 and no send
+                // finished.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    admission.inflight.load(Ordering::Acquire),
+                    2,
+                    "inflight must remain at 2 while writes are parked"
+                );
+                let done = finished.load(Ordering::SeqCst);
+                assert_eq!(
+                    done, 0,
+                    "no sends should have completed while writes are parked, but {done} finished"
+                );
 
-        drop(tx);
-        while let Some(result) = tokio::time::timeout(Duration::from_secs(2), handles.join_next())
-            .await
-            .ok()
-            .flatten()
-        {
-            result.unwrap();
-        }
+                drop(tx);
+                while let Some(result) =
+                    tokio::time::timeout(Duration::from_secs(2), handles.join_next())
+                        .await
+                        .ok()
+                        .flatten()
+                {
+                    result.unwrap();
+                }
+            })
+            .await;
     }
 
     /// A cancelled send releases its in-flight permit: the permit lives
@@ -825,8 +899,10 @@ mod tests {
         let mut bulk_spawner = JoinSet::new();
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
-        let mut spawners = JoinSet::new();
-        spawners.spawn(supervise_lanes(int_spawner, bulk_spawner));
+        let mut scope = TestScope::new();
+        scope.spawn(async move {
+            let _ = supervise_lanes(int_spawner, bulk_spawner).await;
+        });
 
         let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
@@ -834,71 +910,77 @@ mod tests {
             Arc::new(DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_inflight(1));
         let admission = Arc::clone(&tx.admission);
         let payload = vec![0u8; 1 << 20];
-        let (stop_tx, stop_rx) = watch::channel(false);
 
-        // First send acquires the single permit and parks on the full
-        // transport buffer. It is cancelled through the watch inside the
-        // task, so the task returns normally instead of being aborted (no
-        // cancelled JoinError to tolerate) and the permit is released.
-        let mut sends = JoinSet::new();
-        sends.spawn({
-            let tx = tx.clone();
-            let payload = payload.clone();
-            let mut stop = stop_rx;
-            async move {
-                tokio::select! {
-                    result = tx.send(&payload) => result,
-                    _ = stop.changed() => Ok(()),
+        scope
+            .run(async {
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let mut sends = JoinSet::new();
+
+                // First send acquires the single permit and parks on the full
+                // transport buffer. It is cancelled through the watch inside
+                // the task, so the task returns normally instead of being
+                // aborted (no cancelled JoinError to tolerate) and the permit
+                // is released.
+                sends.spawn({
+                    let tx = tx.clone();
+                    let payload = payload.clone();
+                    let mut stop = stop_rx;
+                    async move {
+                        tokio::select! {
+                            result = tx.send(&payload) => result,
+                            _ = stop.changed() => Ok(()),
+                        }
+                    }
+                });
+                timeout(Duration::from_secs(5), async {
+                    while admission.inflight.load(Ordering::Acquire) != 1 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the first send never acquired its permit");
+
+                stop_tx.send(true).unwrap();
+                while let Some(result) = sends.join_next().await {
+                    result.unwrap().unwrap();
                 }
-            }
-        });
-        timeout(Duration::from_secs(5), async {
-            while admission.inflight.load(Ordering::Acquire) != 1 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the first send never acquired its permit");
 
-        stop_tx.send(true).unwrap();
-        while let Some(result) = sends.join_next().await {
-            result.unwrap().unwrap();
-        }
+                timeout(Duration::from_secs(5), async {
+                    while admission.inflight.load(Ordering::Acquire) != 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the cancelled send did not release its permit");
 
-        timeout(Duration::from_secs(5), async {
-            while admission.inflight.load(Ordering::Acquire) != 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the cancelled send did not release its permit");
+                // The freed permit lets a second send acquire even though the
+                // transport still cannot drain.
+                let (stop_tx, stop_rx) = watch::channel(false);
+                sends.spawn({
+                    let tx = tx.clone();
+                    let payload = payload.clone();
+                    let mut stop = stop_rx;
+                    async move {
+                        tokio::select! {
+                            result = tx.send(&payload) => result,
+                            _ = stop.changed() => Ok(()),
+                        }
+                    }
+                });
+                timeout(Duration::from_secs(5), async {
+                    while admission.inflight.load(Ordering::Acquire) != 1 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("a released permit did not let the second send acquire");
 
-        // The freed permit lets a second send acquire even though the
-        // transport still cannot drain.
-        let (stop_tx, stop_rx) = watch::channel(false);
-        sends.spawn({
-            let tx = tx.clone();
-            let payload = payload.clone();
-            let mut stop = stop_rx;
-            async move {
-                tokio::select! {
-                    result = tx.send(&payload) => result,
-                    _ = stop.changed() => Ok(()),
+                stop_tx.send(true).unwrap();
+                while let Some(result) = sends.join_next().await {
+                    result.unwrap().unwrap();
                 }
-            }
-        });
-        timeout(Duration::from_secs(5), async {
-            while admission.inflight.load(Ordering::Acquire) != 1 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("a released permit did not let the second send acquire");
-
-        stop_tx.send(true).unwrap();
-        while let Some(result) = sends.join_next().await {
-            result.unwrap().unwrap();
-        }
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -938,21 +1020,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_reorder_across_gap() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
+                // Send in seq order: 0, 1, 2
+                tx.send(b"zero").await.unwrap(); // seq 0
+                tx.send(b"one").await.unwrap(); // seq 1
+                tx.send(b"two").await.unwrap(); // seq 2
 
-        // Send in seq order: 0, 1, 2
-        tx.send(b"zero").await.unwrap(); // seq 0
-        tx.send(b"one").await.unwrap(); // seq 1
-        tx.send(b"two").await.unwrap(); // seq 2
-
-        // Ordered mode must yield in seq order even if reads
-        // complete out of order.
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"zero");
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"one");
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"two");
+                // Ordered mode must yield in seq order even if reads
+                // complete out of order.
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"zero");
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"one");
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"two");
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -961,26 +1046,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_force_advance_on_full_buffer() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
+                // Send seq 0, then skip seq 1, send seq 2..=257
+                // When buffer exceeds reorder cap (256), force-advance
+                // skips the gap at seq 1.
+                tx.send(b"seq0").await.unwrap();
+                for _i in 2..=257u16 {
+                    tx.send(&[0xAA; 50]).await.unwrap();
+                }
 
-        // Send seq 0, then skip seq 1, send seq 2..=257
-        // When buffer exceeds reorder cap (256), force-advance
-        // skips the gap at seq 1.
-        tx.send(b"seq0").await.unwrap();
-        for _i in 2..=257u16 {
-            tx.send(&[0xAA; 50]).await.unwrap();
-        }
+                // seq 0 comes first
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"seq0");
 
-        // seq 0 comes first
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"seq0");
-
-        // seq 1 is permanently missing — after buffer fills,
-        // force-advance yields seq 2 next (not seq 1).
-        let next = rx.recv().await.unwrap().unwrap();
-        assert_eq!(next.len(), 50);
+                // seq 1 is permanently missing — after buffer fills,
+                // force-advance yields seq 2 next (not seq 1).
+                let next = rx.recv().await.unwrap().unwrap();
+                assert_eq!(next.len(), 50);
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -993,40 +1081,44 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_force_advance_keeps_all_buffered_messages() {
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
 
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
-        let tx = DualMessageSender::new(opener, DeliveryMode::Ordered);
+                // Send seq 0, skip seq 1, send seq 2..=257 with DISTINCT
+                // payloads.
+                tx.send(b"seq0").await.unwrap();
+                for i in 2..=257u16 {
+                    let payload = format!("msg-{i}");
+                    tx.send(payload.as_bytes()).await.unwrap();
+                }
 
-        // Send seq 0, skip seq 1, send seq 2..=257 with DISTINCT payloads.
-        tx.send(b"seq0").await.unwrap();
-        for i in 2..=257u16 {
-            let payload = format!("msg-{i}");
-            tx.send(payload.as_bytes()).await.unwrap();
-        }
+                // seq 0
+                assert_eq!(rx.recv().await.unwrap().unwrap(), b"seq0");
 
-        // seq 0
-        assert_eq!(rx.recv().await.unwrap().unwrap(), b"seq0");
+                // Collect the rest. Every seq 2..=257 must be delivered exactly
+                // once — none dropped, none duplicated.
+                let mut delivered = Vec::new();
+                for _ in 0..256 {
+                    delivered.push(rx.recv().await.unwrap().unwrap());
+                }
 
-        // Collect the rest. Every seq 2..=257 must be delivered exactly
-        // once — none dropped, none duplicated.
-        let mut delivered = Vec::new();
-        for _ in 0..256 {
-            delivered.push(rx.recv().await.unwrap().unwrap());
-        }
-
-        // Decode and assert every expected message appears exactly once.
-        let mut expected: Vec<String> = (2..=257).map(|i| format!("msg-{i}")).collect();
-        let mut got: Vec<String> = delivered
-            .iter()
-            .map(|b| String::from_utf8(b.clone()).unwrap())
-            .collect();
-        expected.sort();
-        got.sort();
-        assert_eq!(
-            got, expected,
-            "force-advance must not drop buffered messages"
-        );
+                // Decode and assert every expected message appears exactly once.
+                let mut expected: Vec<String> = (2..=257).map(|i| format!("msg-{i}")).collect();
+                let mut got: Vec<String> = delivered
+                    .iter()
+                    .map(|b| String::from_utf8(b.clone()).unwrap())
+                    .collect();
+                expected.sort();
+                got.sort();
+                assert_eq!(
+                    got, expected,
+                    "force-advance must not drop buffered messages"
+                );
+            })
+            .await;
     }
 
     struct MaxAllocRecorder;
@@ -1064,36 +1156,43 @@ mod tests {
     async fn a_length_prefix_alone_does_not_allocate_its_payload() {
         use tokio::io::AsyncWriteExt;
         const HUGE: usize = 1 << 30;
-        let (opener, accepter, _srv, _cli) = paired_sessions().await;
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
-            .with_max_message_len(2 * HUGE);
-        let (_reader, mut writer) = opener.open_auto();
-        MAX_SINGLE_ALLOC.store(0, Ordering::Relaxed);
-        writer
-            .write_all(&(HUGE as u32).to_le_bytes())
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), rx.recv())
-                .await
-                .is_err(),
-            "recv yielded a message that was never sent",
-        );
-        let peak = MAX_SINGLE_ALLOC.load(Ordering::Relaxed);
-        assert!(
-            peak < HUGE / 2,
-            "a bare length prefix caused a {peak}-byte allocation - a peer sending nothing but \
-             prefixes can exhaust the receiver's memory",
-        );
+        let (opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
+                    .with_max_message_len(2 * HUGE);
+                let (_reader, mut writer) = opener.open_auto();
+                MAX_SINGLE_ALLOC.store(0, Ordering::Relaxed);
+                writer
+                    .write_all(&(HUGE as u32).to_le_bytes())
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                        .await
+                        .is_err(),
+                    "recv yielded a message that was never sent",
+                );
+                let peak = MAX_SINGLE_ALLOC.load(Ordering::Relaxed);
+                assert!(
+                    peak < HUGE / 2,
+                    "a bare length prefix caused a {peak}-byte allocation - a peer sending nothing but \
+                     prefixes can exhaust the receiver's memory",
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn recv_reports_eof_repeatedly_instead_of_panicking() {
-        let (opener, accepter, srv, _cli) = paired_sessions().await;
+        // This test intentionally ends both sessions mid-body (EOF is the
+        // behaviour under test), so the scope is dropped up front and the
+        // body runs without racing it; `recv` then reports the resulting EOF.
+        let (opener, accepter, scope) = paired_sessions().await;
         let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
         drop(opener);
-        drop(srv);
+        drop(scope);
         assert!(rx.recv().await.unwrap().is_none());
         assert!(rx.recv().await.unwrap().is_none(), "second EOF panicked");
         assert!(rx.recv().await.unwrap().is_none(), "third EOF panicked");
@@ -1105,30 +1204,39 @@ mod tests {
     /// surfaces at the call site instead of hiding as a missing message.
     #[tokio::test(flavor = "multi_thread")]
     async fn recv_propagates_panic_from_a_read_task() {
-        let (_opener, accepter, _srv, _cli) = paired_sessions().await;
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
-        // Inject a read task that panics. `spawn_read_task` is private, so
-        // drive one through `read_tasks` directly with the same task type.
-        rx.inflight += 1;
-        rx.read_tasks.spawn(async move {
-            panic!("simulated read-task panic");
-        });
+        let (_opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+                // Inject a read task that panics. `spawn_read_task` is private,
+                // so drive one through `read_tasks` directly with the same task
+                // type.
+                rx.inflight += 1;
+                rx.read_tasks.spawn(async move {
+                    panic!("simulated read-task panic");
+                });
 
-        // `recv` should propagate the panic. Run it in a spawned task and
-        // assert the spawn surfaces a `JoinError` (panic), since `recv`
-        // itself is not `catch_unwind`-compatible without `futures`.
-        let mut recv_tasks = JoinSet::new();
-        recv_tasks.spawn(async move { rx.recv().await });
-        let join_result = recv_tasks.join_next().await.unwrap();
-        assert!(
-            join_result.is_err(),
-            "recv must propagate a panicked read task instead of swallowing it"
-        );
+                // `recv` should propagate the panic. Run it in a spawned task
+                // and assert the spawn surfaces a `JoinError` (panic), since
+                // `recv` itself is not `catch_unwind`-compatible without
+                // `futures`.
+                let mut recv_tasks = JoinSet::new();
+                recv_tasks.spawn(async move { rx.recv().await });
+                let join_result = recv_tasks.join_next().await.unwrap();
+                assert!(
+                    join_result.is_err(),
+                    "recv must propagate a panicked read task instead of swallowing it"
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_buffered_messages_drain_after_lanes_die() {
-        let (opener, accepter, srv, _cli) = paired_sessions().await;
+        // This test intentionally ends both sessions mid-body (draining the
+        // receiver after the lanes die is the behaviour under test), so the
+        // scope is dropped up front and the body runs without racing it.
+        let (opener, accepter, scope) = paired_sessions().await;
         let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
         rx.ordered.insert(
             1,
@@ -1145,7 +1253,7 @@ mod tests {
             },
         );
         drop(opener);
-        drop(srv);
+        drop(scope);
         let mut got = Vec::new();
         while let Some(payload) = rx.recv().await.unwrap() {
             got.push(payload);
@@ -1159,23 +1267,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_last_sequence_number_does_not_wrap_the_cursor() {
-        let (_opener, accepter, _srv, _cli) = paired_sessions().await;
-        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
-        rx.next_seq = u64::MAX;
-        rx.insert_ordered(Message {
-            seq: Some(u64::MAX),
-            payload: b"last".to_vec(),
-        });
-        assert_eq!(rx.pop_ordered(), Some(b"last".to_vec()));
-        assert_eq!(rx.next_seq, u64::MAX, "the cursor wrapped past the end");
-        rx.insert_ordered(Message {
-            seq: Some(0),
-            payload: b"replay".to_vec(),
-        });
-        assert_eq!(
-            rx.pop_ordered(),
-            None,
-            "a message from the start of the space was delivered after the end of it, so the cursor no longer rejects anything"
-        );
+        let (_opener, accepter, mut scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                rx.next_seq = u64::MAX;
+                rx.insert_ordered(Message {
+                    seq: Some(u64::MAX),
+                    payload: b"last".to_vec(),
+                });
+                assert_eq!(rx.pop_ordered(), Some(b"last".to_vec()));
+                assert_eq!(rx.next_seq, u64::MAX, "the cursor wrapped past the end");
+                rx.insert_ordered(Message {
+                    seq: Some(0),
+                    payload: b"replay".to_vec(),
+                });
+                assert_eq!(
+                    rx.pop_ordered(),
+                    None,
+                    "a message from the start of the space was delivered after the end of it, so the cursor no longer rejects anything"
+                );
+            })
+            .await;
     }
 }
