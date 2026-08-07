@@ -367,14 +367,19 @@ enum ControlJoin {
     Stopped,
 }
 
-/// Join the control task. Maps `JoinError::Cancelled` to
-/// [`ControlJoin::Cancelled`] instead of unwrapping/panicking.
+/// Join the control task. Only `JoinError::Cancelled` is preserved as
+/// [`ControlJoin::Cancelled`]; every other `JoinError` (a panic, or any
+/// future non-cancel kind) is resumed here so the panic propagates with its
+/// original backtrace instead of being silently downgraded to an ordinary
+/// `MuxError::TaskJoin`. The supervised tasks only ever complete via
+/// `abort_all` (cancellation) — there is no benign non-cancel exit.
 async fn join_control(set: &mut JoinSet<Result<(), RunControlError>>) -> ControlJoin {
     match set.join_next().await {
         None => ControlJoin::Stopped,
         Some(Ok(Err(e))) => ControlJoin::Err(e),
         Some(Ok(Ok(()))) => ControlJoin::Stopped,
-        Some(Err(e)) => ControlJoin::Cancelled(e),
+        Some(Err(e)) if e.is_cancelled() => ControlJoin::Cancelled(e),
+        Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 
@@ -394,7 +399,8 @@ async fn join_central_io_reader(
         Some(Ok(Err(RunCentralIoReaderError::IoReader(e)))) => ReaderJoin::Io(e),
         Some(Ok(Err(RunCentralIoReaderError::Control(_)))) => ReaderJoin::ControlChannelClosed,
         Some(Ok(Ok(()))) => ReaderJoin::ControlChannelClosed,
-        Some(Err(e)) => ReaderJoin::Cancelled(e),
+        Some(Err(e)) if e.is_cancelled() => ReaderJoin::Cancelled(e),
+        Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 
@@ -414,7 +420,8 @@ async fn join_central_io_writer(
         Some(Ok(Err(RunCentralIoWriterError::IoWriter(e)))) => WriterJoin::Io(e),
         Some(Ok(Err(RunCentralIoWriterError::Control(_)))) => WriterJoin::ControlChannelClosed,
         Some(Ok(Ok(()))) => WriterJoin::ControlChannelClosed,
-        Some(Err(e)) => WriterJoin::Cancelled(e),
+        Some(Err(e)) if e.is_cancelled() => WriterJoin::Cancelled(e),
+        Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 
@@ -430,9 +437,10 @@ mod tests {
     // A normal shutdown/reset cancels child tasks, so the old supervisor
     // code panicked on a routine lifecycle event.
     //
-    // This test spawns a forever-pending task, aborts it, then joins through
-    // the control-join helper and asserts that cancellation surfaces as
-    // `MuxError::TaskJoin` with `source.is_cancelled()`, with no panic.
+    // `join_control` now preserves cancellation as `ControlJoin::Cancelled`
+    // and resumes the panic for any other `JoinError` kind. This test
+    // exercises the cancellation path only (a forever-pending task is
+    // aborted, then joined); a separate test exercises the panic-resume path.
     #[tokio::test(flavor = "multi_thread")]
     async fn join_control_cancellation_is_not_fatal() {
         let mut set: JoinSet<Result<(), RunControlError>> = JoinSet::new();
@@ -484,6 +492,85 @@ mod tests {
         match join_control(&mut set).await {
             ControlJoin::Stopped => (),
             other => panic!("expected ControlJoin::Stopped, got {other:?}"),
+        }
+    }
+
+    // A panicking control task must resume its panic through `join_control`
+    // instead of being downgraded to `ControlJoin::Cancelled`. The panic is
+    // caught at the thread boundary with `catch_unwind` to assert the payload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_control_panic_is_resumed() {
+        let mut set: JoinSet<Result<(), RunControlError>> = JoinSet::new();
+        set.spawn(async move {
+            panic!("control boom");
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(join_control(&mut set))
+            })
+        }));
+        match result {
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("");
+                assert!(msg.contains("control boom"), "panic payload: {msg:?}");
+            }
+            Ok(join) => panic!("expected a resumed panic, got {join:?}"),
+        }
+    }
+
+    // A panicking central-io reader task must resume its panic through
+    // `join_central_io_reader` instead of being downgraded to `ReaderJoin::Cancelled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_central_io_reader_panic_is_resumed() {
+        let mut set: JoinSet<Result<(), RunCentralIoReaderError>> = JoinSet::new();
+        set.spawn(async move {
+            panic!("reader boom");
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(join_central_io_reader(&mut set))
+            })
+        }));
+        match result {
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("");
+                assert!(msg.contains("reader boom"), "panic payload: {msg:?}");
+            }
+            Ok(join) => panic!("expected a resumed panic, got {join:?}"),
+        }
+    }
+
+    // A panicking central-io writer task must resume its panic through
+    // `join_central_io_writer` instead of being downgraded to `WriterJoin::Cancelled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_central_io_writer_panic_is_resumed() {
+        let mut set: JoinSet<Result<(), RunCentralIoWriterError>> = JoinSet::new();
+        set.spawn(async move {
+            panic!("writer boom");
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(join_central_io_writer(&mut set))
+            })
+        }));
+        match result {
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("");
+                assert!(msg.contains("writer boom"), "panic payload: {msg:?}");
+            }
+            Ok(join) => panic!("expected a resumed panic, got {join:?}"),
         }
     }
 
