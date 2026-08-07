@@ -557,23 +557,37 @@ mod tests {
         let cli_accepter = DualStreamAccepter::new(int_cli_acc, bulk_cli_acc, Liveness::new());
 
         let mut srv_spawner = JoinSet::new();
-        srv_spawner.spawn(async move {
-            let _ = srv_int.join_next().await;
-            let _ = srv_bulk.join_next().await;
-            crate::session::MuxError::TaskStopped {
-                task: "test_session",
-            }
-        });
+        srv_spawner.spawn(supervise_lanes(srv_int, srv_bulk));
         let mut cli_spawner = JoinSet::new();
-        cli_spawner.spawn(async move {
-            let _ = cli_int.join_next().await;
-            let _ = cli_bulk.join_next().await;
-            crate::session::MuxError::TaskStopped {
-                task: "test_session",
-            }
-        });
+        cli_spawner.spawn(supervise_lanes(cli_int, cli_bulk));
 
         (srv_opener, cli_accepter, srv_spawner, cli_spawner)
+    }
+
+    /// Supervise both lanes' session tasks: select between the two lane
+    /// JoinSets and directly unwrap whichever finishes first, so an early
+    /// lane panic surfaces instead of being hidden behind the other lane.
+    /// Falls back to a synthetic `TaskStopped` once both lanes are drained.
+    async fn supervise_lanes(
+        mut int: JoinSet<crate::session::MuxError>,
+        mut bulk: JoinSet<crate::session::MuxError>,
+    ) -> crate::session::MuxError {
+        loop {
+            if int.is_empty() && bulk.is_empty() {
+                break;
+            }
+            tokio::select! {
+                joined = int.join_next(), if !int.is_empty() => {
+                    return joined.unwrap().unwrap();
+                }
+                joined = bulk.join_next(), if !bulk.is_empty() => {
+                    return joined.unwrap().unwrap();
+                }
+            }
+        }
+        crate::session::MuxError::TaskStopped {
+            task: "test_session",
+        }
     }
 
     // -------------------------------------------------------------------
@@ -812,12 +826,7 @@ mod tests {
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
         let mut spawners = JoinSet::new();
-        spawners.spawn(async move {
-            let _ = int_spawner.join_next().await;
-        });
-        spawners.spawn(async move {
-            let _ = bulk_spawner.join_next().await;
-        });
+        spawners.spawn(supervise_lanes(int_spawner, bulk_spawner));
 
         let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
@@ -825,14 +834,23 @@ mod tests {
             Arc::new(DualMessageSender::new(opener, DeliveryMode::Unordered).with_max_inflight(1));
         let admission = Arc::clone(&tx.admission);
         let payload = vec![0u8; 1 << 20];
+        let (stop_tx, stop_rx) = watch::channel(false);
 
         // First send acquires the single permit and parks on the full
-        // transport buffer.
+        // transport buffer. It is cancelled through the watch inside the
+        // task, so the task returns normally instead of being aborted (no
+        // cancelled JoinError to tolerate) and the permit is released.
         let mut sends = JoinSet::new();
-        let first_abort = sends.spawn({
+        sends.spawn({
             let tx = tx.clone();
             let payload = payload.clone();
-            async move { tx.send(&payload).await }
+            let mut stop = stop_rx;
+            async move {
+                tokio::select! {
+                    result = tx.send(&payload) => result,
+                    _ = stop.changed() => Ok(()),
+                }
+            }
         });
         timeout(Duration::from_secs(5), async {
             while admission.inflight.load(Ordering::Acquire) != 1 {
@@ -842,11 +860,9 @@ mod tests {
         .await
         .expect("the first send never acquired its permit");
 
-        first_abort.abort();
+        stop_tx.send(true).unwrap();
         while let Some(result) = sends.join_next().await {
-            if let Err(error) = result {
-                assert!(error.is_cancelled(), "{error}");
-            }
+            result.unwrap().unwrap();
         }
 
         timeout(Duration::from_secs(5), async {
@@ -855,14 +871,21 @@ mod tests {
             }
         })
         .await
-        .expect("the aborted send did not release its permit");
+        .expect("the cancelled send did not release its permit");
 
         // The freed permit lets a second send acquire even though the
         // transport still cannot drain.
-        let second_abort = sends.spawn({
+        let (stop_tx, stop_rx) = watch::channel(false);
+        sends.spawn({
             let tx = tx.clone();
             let payload = payload.clone();
-            async move { tx.send(&payload).await }
+            let mut stop = stop_rx;
+            async move {
+                tokio::select! {
+                    result = tx.send(&payload) => result,
+                    _ = stop.changed() => Ok(()),
+                }
+            }
         });
         timeout(Duration::from_secs(5), async {
             while admission.inflight.load(Ordering::Acquire) != 1 {
@@ -872,11 +895,9 @@ mod tests {
         .await
         .expect("a released permit did not let the second send acquire");
 
-        second_abort.abort();
+        stop_tx.send(true).unwrap();
         while let Some(result) = sends.join_next().await {
-            if let Err(error) = result {
-                assert!(error.is_cancelled(), "{error}");
-            }
+            result.unwrap().unwrap();
         }
     }
 
