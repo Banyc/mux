@@ -70,20 +70,13 @@ impl SpliceRouterHandle {
 }
 
 /// The typed exit of one supervised splice task, produced when the splice
-/// feed's supervisor reaps its inner [`JoinSet`]. A panic in either the
-/// matcher or the driver surfaces as [`SpliceTaskExit::Panicked`] (with the
-/// panic message) instead of being silently swallowed; a task aborted during
-/// shutdown surfaces as [`SpliceTaskExit::Cancelled`].
+/// feed's supervisor reaps its inner [`JoinSet`].
 #[derive(Debug)]
 pub enum SpliceTaskExit {
     /// The matcher task exited normally (its feed channels closed).
     MatcherDone,
     /// The splice driver exited with its final result.
     DriverDone(Result<(), MigrationError>),
-    /// A supervised splice task panicked; carries the panic message.
-    Panicked(String),
-    /// A supervised splice task was cancelled (aborted during shutdown).
-    Cancelled,
 }
 
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
@@ -93,17 +86,11 @@ pub(crate) const SPLICE_REGISTER_CAPACITY: usize = 64;
 
 fn observe_exit(exit: &SpliceTaskExit) {
     match exit {
-        SpliceTaskExit::Panicked(msg) => {
-            tracing::error!(panic = %msg, "a supervised splice task panicked");
-        }
         SpliceTaskExit::DriverDone(Err(error)) => {
             tracing::warn!(?error, "splice driver exited with an error");
         }
         SpliceTaskExit::DriverDone(Ok(())) | SpliceTaskExit::MatcherDone => {
             tracing::debug!("a supervised splice task exited cleanly");
-        }
-        SpliceTaskExit::Cancelled => {
-            tracing::debug!("a supervised splice task was cancelled");
         }
     }
 }
@@ -130,17 +117,10 @@ fn spawn_splice_supervisor(
                 SpliceTaskExit::DriverDone(Err(_)) => {
                     let _ = state_tx.send(SpliceRouterState::DriverFailed);
                     inner.abort_all();
-                    while inner.join_next().await.is_some() {}
                     return;
                 }
                 SpliceTaskExit::DriverDone(Ok(())) => saw_driver_done = true,
                 SpliceTaskExit::MatcherDone => saw_matcher_done = true,
-                SpliceTaskExit::Panicked(_) => {
-                    unreachable!("a panicked child propagates through the supervisor via unwrap")
-                }
-                SpliceTaskExit::Cancelled => {
-                    unreachable!("a cancelled child propagates through the supervisor via unwrap")
-                }
             }
             if saw_driver_done && saw_matcher_done {
                 let _ = state_tx.send(SpliceRouterState::Stopped);
