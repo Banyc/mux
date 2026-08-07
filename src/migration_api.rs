@@ -605,9 +605,7 @@ impl MigratingCapableAccepter {
                     continue;
                 }
                 AcceptStep::Peeked(None) => unreachable!("peek JoinSet was nonempty"),
-                AcceptStep::Peeked(Some(result)) => {
-                    result.expect("peek task panicked or was cancelled")
-                }
+                AcceptStep::Peeked(Some(result)) => result.unwrap(),
             };
             let PeekedStream {
                 outcome,
@@ -913,7 +911,7 @@ impl ResponseRouter {
                                     }
                                 }
                                 Some(Ok(None)) => {}
-                                Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
+                                Some(result) => result.unwrap(),
                                 None => {}
                             }
                         }
@@ -922,7 +920,7 @@ impl ResponseRouter {
             });
             match inner.join_next().await {
                 Some(Ok(())) => tracing::debug!("ResponseRouter accepter task stopped"),
-                Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
+                Some(result) => result.unwrap(),
                 None => unreachable!("one accepter task was inserted"),
             }
         });
