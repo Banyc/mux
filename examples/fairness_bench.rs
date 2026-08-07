@@ -67,7 +67,6 @@ async fn main() {
         stream
     },);
     let client_tcp = client_tcp.unwrap();
-    let server_tcp = server_tcp.unwrap();
     client_tcp.set_nodelay(true).unwrap();
     server_tcp.set_nodelay(true).unwrap();
 

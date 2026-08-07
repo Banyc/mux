@@ -124,10 +124,7 @@ fn spawn_splice_supervisor(
             let Some(joined) = inner.join_next().await else {
                 break;
             };
-            let exit = match joined {
-                Ok(exit) => exit,
-                Err(err) => err.unwrap(),
-            };
+            let exit = joined.unwrap();
             observe_exit(&exit);
             match exit {
                 SpliceTaskExit::DriverDone(Err(_)) => {
