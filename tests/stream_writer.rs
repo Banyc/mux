@@ -90,13 +90,16 @@ async fn queued_payload_arrives_before_eof() {
         let (mut server_reader, _server_writer) = server_accepter.accept().await.unwrap();
         let payload: Vec<u8> = (0u8..=u8::MAX).cycle().take(PAYLOAD_LEN).collect();
         let expected = payload.clone();
-        let writer = tokio::spawn(async move {
+        let mut writer_tasks = JoinSet::new();
+        writer_tasks.spawn(async move {
             client_writer.write_all(&payload).await.unwrap();
             client_writer.shutdown().unwrap();
         });
         let mut received = Vec::new();
         server_reader.read_to_end(&mut received).await.unwrap();
-        writer.await.unwrap();
+        while let Some(result) = writer_tasks.join_next().await {
+            result.unwrap();
+        }
         assert_eq!(received, expected);
     }
 }

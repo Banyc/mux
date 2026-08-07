@@ -734,14 +734,6 @@ mod tests {
         let mut bulk_spawner = JoinSet::new();
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
-        // Keep spawners alive so mux session tasks keep running.
-        let mut spawners = JoinSet::new();
-        spawners.spawn(async move {
-            let _ = int_spawner.join_next().await;
-        });
-        spawners.spawn(async move {
-            let _ = bulk_spawner.join_next().await;
-        });
 
         let opener = DualStreamOpener::new(int_opener, bulk_opener, Liveness::new());
 
@@ -794,7 +786,7 @@ mod tests {
             .ok()
             .flatten()
         {
-            let _ = result;
+            result.unwrap();
         }
     }
 
