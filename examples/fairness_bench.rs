@@ -62,12 +62,12 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server_tcp_task = tokio::spawn(async move {
+    let (client_tcp, server_tcp) = tokio::join!(TcpStream::connect(addr), async {
         let (stream, _) = listener.accept().await.unwrap();
         stream
-    });
-    let client_tcp = TcpStream::connect(addr).await.unwrap();
-    let server_tcp = server_tcp_task.await.unwrap();
+    },);
+    let client_tcp = client_tcp.unwrap();
+    let server_tcp = server_tcp.unwrap();
     client_tcp.set_nodelay(true).unwrap();
     server_tcp.set_nodelay(true).unwrap();
 
@@ -120,7 +120,8 @@ async fn uncontended_bulk(
     drop(c_reader);
     drop(s_writer);
 
-    let server_task = tokio::spawn(async move {
+    let mut server_set: JoinSet<()> = JoinSet::new();
+    server_set.spawn(async move {
         let mut buf = vec![0u8; CHUNK];
         let mut remaining = bulk_bytes;
         while remaining > 0 {
@@ -139,7 +140,9 @@ async fn uncontended_bulk(
         remaining -= n;
     }
     let elapsed = start.elapsed().as_secs_f64();
-    server_task.await.unwrap();
+    while let Some(result) = server_set.join_next().await {
+        result.unwrap();
+    }
     (bulk_bytes as f64) / elapsed / (1024.0 * 1024.0)
 }
 
@@ -158,7 +161,8 @@ async fn contended_ping(
     let (mut ping_c_reader, mut ping_c_writer) = client_opener.open().await.unwrap();
     let (mut ping_s_reader, mut ping_s_writer) = server_accepter.accept().await.unwrap();
 
-    let bulk_server_task = tokio::spawn(async move {
+    let mut workers: JoinSet<()> = JoinSet::new();
+    workers.spawn(async move {
         let mut buf = vec![0u8; CHUNK];
         let mut remaining = bulk_bytes;
         while remaining > 0 {
@@ -168,7 +172,7 @@ async fn contended_ping(
         }
     });
 
-    let echo_task = tokio::spawn(async move {
+    workers.spawn(async move {
         let mut buf = [0u8; PING_SIZE];
         loop {
             if ping_s_reader.read_exact(&mut buf).await.is_err() {
@@ -180,7 +184,8 @@ async fn contended_ping(
         }
     });
 
-    let bulk_client_task: tokio::task::JoinHandle<f64> = tokio::spawn(async move {
+    let mut bulk_client_set: JoinSet<f64> = JoinSet::new();
+    bulk_client_set.spawn(async move {
         let chunk = vec![0x42u8; CHUNK];
         let start = Instant::now();
         let mut remaining = bulk_bytes;
@@ -204,7 +209,7 @@ async fn contended_ping(
     });
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    if bulk_client_task.is_finished() {
+    if bulk_client_set.is_empty() {
         panic!("bulk finished before ping contention; increase --bulk-mib");
     }
 
@@ -220,10 +225,14 @@ async fn contended_ping(
 
     let _ = ping_c_writer.shutdown();
     drop(ping_c_reader);
-    let _ = echo_task.await;
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
 
-    let contended_bulk_mib_s = bulk_client_task.await.unwrap();
-    bulk_server_task.await.unwrap();
+    let contended_bulk_mib_s = bulk_client_set.join_next().await.unwrap().unwrap();
+    while let Some(result) = bulk_client_set.join_next().await {
+        result.unwrap();
+    }
 
     latencies.sort_unstable();
     let ping_us_p50 = percentile(&latencies, 50);

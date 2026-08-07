@@ -17,7 +17,7 @@ use crate::{
     migration_wire::{
         GenerationChain, GenerationReader, MigrationError, ResumeHeader, SplicedReader,
     },
-    splice_feed::{SpliceFeedError, SpliceRouter, SpliceRouterHandle, spawn_splice_router},
+    splice_feed::{SpliceFeedError, SpliceRouterHandle, spawn_splice_router},
     stream::writer::StreamWriter,
     traffic_class::LaneClass,
 };
@@ -499,7 +499,7 @@ pub struct MigratingCapableAccepter {
     pass_plain_streams: bool,
     response_opener: Option<DualStreamOpener>,
     feed: SpliceRouterHandle,
-    _own_feed: Option<SpliceRouter>,
+    own_feed_driver: Option<JoinSet<()>>,
     peeks: JoinSet<PeekedStream>,
 }
 
@@ -526,6 +526,26 @@ struct PeekedStream {
 enum AcceptStep {
     Accepted(Result<(StreamReader, StreamWriter, LaneClass), crate::dual_lane::DualAcceptError>),
     Peeked(Option<Result<PeekedStream, tokio::task::JoinError>>),
+    FeedDone(Option<Result<(), tokio::task::JoinError>>),
+}
+
+/// Reap the accepter's own splice-feed supervision [`JoinSet`]. Each completed
+/// supervisor task is unwrapped so a panicked supervisor surfaces on reap;
+/// once the set is empty the driver is dropped so the accepter stops polling
+/// it.
+async fn drain_feed_driver(
+    driver: &mut Option<JoinSet<()>>,
+) -> Option<Result<(), tokio::task::JoinError>> {
+    match driver {
+        Some(set) => match set.join_next().await {
+            Some(result) => Some(result),
+            None => {
+                *driver = None;
+                None
+            }
+        },
+        None => None,
+    }
 }
 
 impl MigratingCapableAccepter {
@@ -534,13 +554,13 @@ impl MigratingCapableAccepter {
     }
 
     fn new_with_plain_streams(inner: DualStreamAccepter, pass_plain_streams: bool) -> Self {
-        let feed = spawn_splice_router();
+        let (feed, own_feed_driver) = spawn_splice_router();
         Self {
             inner,
             pass_plain_streams,
             response_opener: None,
-            feed: feed.handle(),
-            _own_feed: Some(feed),
+            feed,
+            own_feed_driver: Some(own_feed_driver),
             peeks: JoinSet::new(),
         }
     }
@@ -551,7 +571,7 @@ impl MigratingCapableAccepter {
             pass_plain_streams: false,
             response_opener: None,
             feed,
-            _own_feed: None,
+            own_feed_driver: None,
             peeks: JoinSet::new(),
         }
     }
@@ -586,9 +606,13 @@ impl MigratingCapableAccepter {
         loop {
             let can_accept = self.peeks.len() < MAX_CONCURRENT_PEEKS;
             let has_peeks = !self.peeks.is_empty();
+            let has_own_feed = self.own_feed_driver.is_some();
             let step = tokio::select! {
                 accepted = self.inner.accept(), if can_accept => AcceptStep::Accepted(accepted),
                 joined = self.peeks.join_next(), if has_peeks => AcceptStep::Peeked(joined),
+                drained = drain_feed_driver(&mut self.own_feed_driver), if has_own_feed => {
+                    AcceptStep::FeedDone(drained)
+                }
             };
             let peek = match step {
                 AcceptStep::Accepted(accepted) => {
@@ -606,6 +630,11 @@ impl MigratingCapableAccepter {
                 }
                 AcceptStep::Peeked(None) => unreachable!("peek JoinSet was nonempty"),
                 AcceptStep::Peeked(Some(result)) => result.unwrap(),
+                AcceptStep::FeedDone(Some(result)) => {
+                    result.unwrap();
+                    continue;
+                }
+                AcceptStep::FeedDone(None) => continue,
             };
             let PeekedStream {
                 outcome,
@@ -844,16 +873,22 @@ impl DualStreamAccepter {
 /// are observed instead of being silently discarded (a panic in an accepter
 /// loop surfaces on reap rather than vanishing into a `try_join_next` drain).
 ///
-/// This mirrors the [`SpliceRouter`]/[`SpliceRouterHandle`] split: the handle
-/// only carries mpsc senders, the driver owns the supervision.
+/// This mirrors the [`SpliceRouterHandle`] split: the handle only carries mpsc
+/// senders, the driver owns the supervision. The splice-feed supervision
+/// [`JoinSet`] created by [`spawn_splice_router`] is folded into the driver on
+/// the first [`ResponseRouter::add_accepter`] call, so it is actively reaped
+/// alongside the accepter tasks instead of sitting un-polled in the router.
 #[derive(Debug)]
 pub struct ResponseRouter {
-    feed: SpliceRouter,
+    feed: SpliceRouterHandle,
+    splice_driver: Option<JoinSet<()>>,
 }
 impl Default for ResponseRouter {
     fn default() -> Self {
+        let (feed, splice_driver) = spawn_splice_router();
         Self {
-            feed: spawn_splice_router(),
+            feed,
+            splice_driver: Some(splice_driver),
         }
     }
 }
@@ -864,16 +899,19 @@ impl ResponseRouter {
 
     pub fn handle(&self) -> ResponseRouterHandle {
         ResponseRouterHandle {
-            feed: self.feed.handle(),
+            feed: self.feed.clone(),
         }
     }
 
     pub fn add_accepter(
-        &self,
+        &mut self,
         mut accepter: DualStreamAccepter,
         driver: &mut ResponseRouterDriver,
     ) {
-        let feed = self.feed.handle();
+        if let Some(supervision) = self.splice_driver.take() {
+            driver.fold_supervision(supervision);
+        }
+        let feed = self.feed.clone();
         driver.spawn(async move {
             let mut inner: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             inner.spawn(async move {
@@ -911,7 +949,9 @@ impl ResponseRouter {
                                     }
                                 }
                                 Some(Ok(None)) => {}
-                                Some(result) => result.unwrap(),
+                                Some(result) => {
+                                    result.unwrap();
+                                }
                                 None => {}
                             }
                         }
@@ -939,6 +979,18 @@ impl ResponseRouterDriver {
 
     pub fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
         self.tasks.spawn(task);
+    }
+
+    /// Fold a supervisor [`JoinSet`] (e.g. the splice-feed supervision) into
+    /// this driver so its tasks are reaped alongside the accepter tasks. Each
+    /// completed task is unwrapped, so a panicked supervisor propagates
+    /// through this driver's reap.
+    pub fn fold_supervision(&mut self, mut supervision: JoinSet<()>) {
+        self.tasks.spawn(async move {
+            while let Some(result) = supervision.join_next().await {
+                result.unwrap();
+            }
+        });
     }
 
     pub async fn join_next(&mut self) -> Option<Result<(), tokio::task::JoinError>> {
@@ -989,7 +1041,7 @@ impl ResponseRouterHandle {
 pub fn spawn_response_router(
     accepter: DualStreamAccepter,
 ) -> (ResponseRouter, ResponseRouterDriver) {
-    let router = ResponseRouter::new();
+    let mut router = ResponseRouter::new();
     let mut driver = ResponseRouterDriver::new();
     router.add_accepter(accepter, &mut driver);
     (router, driver)
@@ -2018,9 +2070,9 @@ mod tests {
     async fn shared_feed_second_accepter_splices_byte_exact() {
         let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
-        let feed = spawn_splice_router();
-        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
-        let mut mac2 = acc2.into_migrating_only_with_feed(feed.handle());
+        let (feed, mut driver) = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
+        let mut mac2 = acc2.into_migrating_only_with_feed(feed);
         let send = tokio::spawn(async move {
             let mut w = op1.open_migrating_manual(42, LaneClass::Interactive);
             w.write_all(b"born-on-session-one|").await.unwrap();
@@ -2052,15 +2104,16 @@ mod tests {
         send.await.unwrap();
         drain1.abort();
         drain2.abort();
+        driver.abort_all();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rebind_mid_stream_is_lossless() {
         let (op1, acc1, _a, _b, _c, _d) = make_dual_session().await;
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
-        let feed = spawn_splice_router();
-        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
-        let mut mac2 = acc2.into_migrating_only_with_feed(feed.handle());
+        let (feed, mut driver) = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
+        let mut mac2 = acc2.into_migrating_only_with_feed(feed);
         let half = 200 * 1024;
         let pattern: Vec<u8> = (0..2 * half).map(|i| (i % 251) as u8).collect();
         let expected = pattern.clone();
@@ -2096,13 +2149,14 @@ mod tests {
         send.await.unwrap();
         drain1.abort();
         drain2.abort();
+        driver.abort_all();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn response_final_crossing_shared_feed_closes_cleanly() {
         let (x1_op, x1_acc, y1_op, y1_acc, _t1) = make_duplex_session().await;
         let (_x2_op, x2_acc, y2_op, _y2_acc, _t2) = make_duplex_session().await;
-        let (router, mut driver) = spawn_response_router(x1_acc);
+        let (mut router, mut driver) = spawn_response_router(x1_acc);
         router.add_accepter(x2_acc, &mut driver);
         let mut mac1 = y1_acc.into_migrating_duplex(y1_op);
         let (mut req_writer, gen0_rx) = x1_op.open_migrating_with_reader(7, LaneClass::Interactive);
@@ -2255,8 +2309,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeated_gen0_releases_its_waiter_instead_of_parking_the_accepter() {
-        let feed = spawn_splice_router();
-        let handle = feed.handle();
+        let (feed, mut driver) = spawn_splice_router();
+        let handle = feed;
         let gen0 = |logical_id| ResumeHeader {
             logical_id,
             generation: 0,
@@ -2284,6 +2338,7 @@ mod tests {
             result.is_err(),
             "the repeated gen-0 handed out a second reader for a logical stream that already has one"
         );
+        driver.abort_all();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2461,13 +2516,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn add_accepter_reaps_finished_accepters() {
         let (_x_op, live, _y_op, _y_acc, live_tasks) = make_duplex_session().await;
-        let (router, mut driver) = spawn_response_router(live);
+        let (mut router, mut driver) = spawn_response_router(live);
         for _ in 0..8 {
             let (_x_op, dead, _y_op, _y_acc, tasks) = make_duplex_session().await;
             drop(tasks);
             router.add_accepter(dead, &mut driver);
             tokio::time::sleep(Duration::from_millis(20)).await;
-            while driver.try_join_next().is_some() {}
+            while let Some(joined) = driver.try_join_next() {
+                joined.unwrap();
+            }
         }
         assert!(
             driver.len() <= 3,
@@ -2566,9 +2623,9 @@ mod tests {
         }
         let (op1, acc1, _c1, _t1) = make_counted_dual_session().await;
         let (op2, acc2, session2_bytes, _t2) = make_counted_dual_session().await;
-        let feed = spawn_splice_router();
-        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
-        let mac2 = acc2.into_migrating_only_with_feed(feed.handle());
+        let (feed, mut driver) = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
+        let mac2 = acc2.into_migrating_only_with_feed(feed);
         let mut writers = JoinSet::new();
         for id in 0..STREAMS {
             let op1 = op1.clone();
@@ -2647,6 +2704,7 @@ mod tests {
         );
         drain1.abort();
         drain2.abort();
+        driver.abort_all();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2773,8 +2831,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_registration_for_a_gen0_owns_it() {
-        let feed = spawn_splice_router();
-        let handle = feed.handle();
+        let (feed, mut driver) = spawn_splice_router();
+        let handle = feed;
         let first = handle.await_gene(3).await.expect("splice feed alive");
         let second = handle.await_gene(3).await.expect("splice feed alive");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2805,12 +2863,13 @@ mod tests {
             ),
             "two registrations were both told they own the same stream"
         );
+        driver.abort_all();
     }
 
     #[tokio::test]
     async fn an_unclaimed_gen0_is_eventually_let_go() {
-        let feed = spawn_splice_router();
-        let handle = feed.handle();
+        let (feed, mut driver) = spawn_splice_router();
+        let handle = feed;
         let mut peer_halves = Vec::new();
         for logical_id in 0..(MAX_UNCLAIMED_GEN0 as u64 + 8) {
             let (theirs, ours) = tokio::io::duplex(64);
@@ -2840,6 +2899,7 @@ mod tests {
                 .is_ok(),
             "a gen-0 whose registration is still on its way was thrown away"
         );
+        driver.abort_all();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2858,9 +2918,9 @@ mod tests {
         }
         let (op1, acc1, s1a, s1b, s1c, s1d) = make_dual_session().await;
         let (op2, acc2, _s2a, _s2b, _s2c, _s2d) = make_dual_session().await;
-        let feed = spawn_splice_router();
-        let mut mac1 = acc1.into_migrating_only_with_feed(feed.handle());
-        let mac2 = acc2.into_migrating_only_with_feed(feed.handle());
+        let (feed, mut driver) = spawn_splice_router();
+        let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
+        let mac2 = acc2.into_migrating_only_with_feed(feed);
         let drain2 = spawn_drain(mac2);
         let (killed_tx, killed_rx) = tokio::sync::watch::channel(false);
         let (past_rebind_tx, mut past_rebind_rx) = tokio::sync::mpsc::channel(STREAMS as usize);
@@ -2939,5 +2999,6 @@ mod tests {
             "the old session still opens streams, so it was never killed"
         );
         drain2.abort();
+        driver.abort_all();
     }
 }

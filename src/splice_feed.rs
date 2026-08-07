@@ -69,11 +69,11 @@ impl SpliceRouterHandle {
     }
 }
 
-/// The typed exit of one supervised splice task, produced when the
-/// [`SpliceRouter`]'s supervisor reaps its inner [`JoinSet`]. A panic in
-/// either the matcher or the driver surfaces as [`SpliceTaskExit::Panicked`]
-/// (with the panic message) instead of being silently swallowed; a task
-/// aborted during shutdown surfaces as [`SpliceTaskExit::Cancelled`].
+/// The typed exit of one supervised splice task, produced when the splice
+/// feed's supervisor reaps its inner [`JoinSet`]. A panic in either the
+/// matcher or the driver surfaces as [`SpliceTaskExit::Panicked`] (with the
+/// panic message) instead of being silently swallowed; a task aborted during
+/// shutdown surfaces as [`SpliceTaskExit::Cancelled`].
 #[derive(Debug)]
 pub enum SpliceTaskExit {
     /// The matcher task exited normally (its feed channels closed).
@@ -86,35 +86,10 @@ pub enum SpliceTaskExit {
     Cancelled,
 }
 
-#[derive(Debug)]
-pub struct SpliceRouter {
-    handle: SpliceRouterHandle,
-    _supervision: JoinSet<()>,
-}
-
 pub(crate) const MAX_UNCLAIMED_GEN0: usize = 64;
 pub(crate) const SPLICE_CONT_CAPACITY: usize = 1024;
 pub(crate) const SPLICE_GEN0_CAPACITY: usize = 64;
 pub(crate) const SPLICE_REGISTER_CAPACITY: usize = 64;
-
-fn panic_message(err: tokio::task::JoinError) -> String {
-    let payload = err.into_panic();
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        format!("non-string panic payload: {payload:p}")
-    }
-}
-
-fn join_error_to_exit(err: tokio::task::JoinError) -> SpliceTaskExit {
-    if err.is_panic() {
-        SpliceTaskExit::Panicked(panic_message(err))
-    } else {
-        SpliceTaskExit::Cancelled
-    }
-}
 
 fn observe_exit(exit: &SpliceTaskExit) {
     match exit {
@@ -130,12 +105,6 @@ fn observe_exit(exit: &SpliceTaskExit) {
         SpliceTaskExit::Cancelled => {
             tracing::debug!("a supervised splice task was cancelled");
         }
-    }
-}
-
-impl SpliceRouter {
-    pub fn handle(&self) -> SpliceRouterHandle {
-        self.handle.clone()
     }
 }
 
@@ -155,46 +124,25 @@ fn spawn_splice_supervisor(
             let Some(joined) = inner.join_next().await else {
                 break;
             };
-            match joined {
-                Ok(exit) => {
-                    observe_exit(&exit);
-                    match exit {
-                        SpliceTaskExit::DriverDone(Err(_)) => {
-                            let _ = state_tx.send(SpliceRouterState::DriverFailed);
-                            inner.abort_all();
-                            while inner.join_next().await.is_some() {}
-                            return;
-                        }
-                        SpliceTaskExit::DriverDone(Ok(())) => saw_driver_done = true,
-                        SpliceTaskExit::MatcherDone => saw_matcher_done = true,
-                        SpliceTaskExit::Panicked(_) => {
-                            let _ = state_tx.send(SpliceRouterState::ChildPanicked);
-                            inner.abort_all();
-                            while inner.join_next().await.is_some() {}
-                            return;
-                        }
-                        SpliceTaskExit::Cancelled => {
-                            let _ = state_tx.send(SpliceRouterState::ChildJoinFailed);
-                            inner.abort_all();
-                            while inner.join_next().await.is_some() {}
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    let exit = join_error_to_exit(err);
-                    observe_exit(&exit);
-                    match exit {
-                        SpliceTaskExit::Panicked(_) => {
-                            let _ = state_tx.send(SpliceRouterState::ChildPanicked);
-                        }
-                        _ => {
-                            let _ = state_tx.send(SpliceRouterState::ChildJoinFailed);
-                        }
-                    }
+            let exit = match joined {
+                Ok(exit) => exit,
+                Err(err) => err.unwrap(),
+            };
+            observe_exit(&exit);
+            match exit {
+                SpliceTaskExit::DriverDone(Err(_)) => {
+                    let _ = state_tx.send(SpliceRouterState::DriverFailed);
                     inner.abort_all();
                     while inner.join_next().await.is_some() {}
                     return;
+                }
+                SpliceTaskExit::DriverDone(Ok(())) => saw_driver_done = true,
+                SpliceTaskExit::MatcherDone => saw_matcher_done = true,
+                SpliceTaskExit::Panicked(_) => {
+                    unreachable!("a panicked child propagates through the supervisor via unwrap")
+                }
+                SpliceTaskExit::Cancelled => {
+                    unreachable!("a cancelled child propagates through the supervisor via unwrap")
                 }
             }
             if saw_driver_done && saw_matcher_done {
@@ -206,7 +154,7 @@ fn spawn_splice_supervisor(
     outer
 }
 
-pub fn spawn_splice_router() -> SpliceRouter {
+pub fn spawn_splice_router() -> (SpliceRouterHandle, tokio::task::JoinSet<()>) {
     let (cont_tx, cont_rx) = mpsc::channel(SPLICE_CONT_CAPACITY);
     let (gen0_tx, mut gen0_rx) =
         mpsc::channel::<(u64, Option<SplicedReader>)>(SPLICE_GEN0_CAPACITY);
@@ -270,16 +218,14 @@ pub fn spawn_splice_router() -> SpliceRouter {
         }),
     ];
 
-    let _supervision = spawn_splice_supervisor(children, state_tx);
+    let supervision = spawn_splice_supervisor(children, state_tx);
 
-    SpliceRouter {
-        handle: SpliceRouterHandle {
-            cont_tx,
-            register_tx,
-            state: state_rx,
-        },
-        _supervision,
-    }
+    let handle = SpliceRouterHandle {
+        cont_tx,
+        register_tx,
+        state: state_rx,
+    };
+    (handle, supervision)
 }
 
 #[cfg(test)]
@@ -331,23 +277,27 @@ mod tests {
         );
     }
 
-    // A panic in a supervised child is surfaced as ChildPanicked on the
-    // shared state channel without any explicit reap call.
+    // A panic in a supervised child propagates through the supervisor (via
+    // unwrap on the joined result) and surfaces as a panic on the outer
+    // JoinSet reap, instead of being downgraded to a state observation.
     #[tokio::test]
-    async fn splice_child_panic_updates_health_without_reap() {
-        let (state_tx, state_rx) = watch::channel(SpliceRouterState::Running);
+    async fn splice_child_panic_propagates_through_the_supervisor() {
+        let (state_tx, _state_rx) = watch::channel(SpliceRouterState::Running);
         let child: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> = Box::pin(async move {
             panic!("intentional splice supervisor child panic");
             #[allow(unreachable_code)]
             SpliceTaskExit::MatcherDone
         });
-        let _supervision = spawn_splice_supervisor(vec![child], state_tx);
-        let mut state_rx = state_rx;
-        tokio::time::timeout(std::time::Duration::from_secs(1), state_rx.changed())
+        let mut supervision = spawn_splice_supervisor(vec![child], state_tx);
+        let joined = supervision
+            .join_next()
             .await
-            .expect("the supervisor never reported its child's panic")
-            .expect("the state sender closed before reporting the panic");
-        assert_eq!(*state_rx.borrow(), SpliceRouterState::ChildPanicked);
+            .expect("the supervisor task never produced a result");
+        let err = joined.expect_err("a panicked child must surface as a JoinError");
+        assert!(
+            err.is_panic(),
+            "the supervisor's reap must surface the child's panic"
+        );
     }
 
     // A closed registration channel surfaces as an Err from await_gene so
@@ -355,15 +305,15 @@ mod tests {
     // can never resolve.
     #[tokio::test]
     async fn closed_register_channel_is_returned_to_await_gene() {
-        let mut router = spawn_splice_router();
+        let (mut handle, _supervision) = spawn_splice_router();
         let (register_tx, register_rx) = mpsc::channel::<(
             u64,
             tokio::sync::oneshot::Sender<SplicedReader>,
         )>(SPLICE_REGISTER_CAPACITY);
         drop(register_rx);
-        router.handle.register_tx = register_tx;
+        handle.register_tx = register_tx;
         assert!(
-            router.handle.await_gene(7).await.is_err(),
+            handle.await_gene(7).await.is_err(),
             "a closed registration channel was silently ignored"
         );
     }

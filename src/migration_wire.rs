@@ -742,9 +742,9 @@ impl AsyncRead for SplicedReader {
 
 /// Returns the splice-driver *future*. The caller is responsible for running
 /// it in a supervised [`JoinSet`](tokio::task::JoinSet) (the
-/// [`SpliceRouter`](crate::splice_feed::SpliceRouter) does this), so a
-/// panic in the driver surfaces as a `JoinError` on reap instead of being
-/// silently swallowed by a detached task.
+/// [`spawn_splice_router`](crate::splice_feed::spawn_splice_router) supervisor
+/// does this), so a panic in the driver surfaces as a `JoinError` on reap
+/// instead of being silently swallowed by a detached task.
 ///
 /// The driver reads continuation readers from a channel and dispatches them
 /// into the [`SpliceRegistry`], feeding successor generations into the
