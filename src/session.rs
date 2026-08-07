@@ -352,7 +352,7 @@ async fn join_control(set: &mut JoinSet<Result<(), RunControlError>>) -> Control
         Some(Ok(Err(e))) => ControlJoin::Err(e),
         Some(Ok(Ok(()))) => ControlJoin::Stopped,
         Some(result) => {
-            result.unwrap();
+            let _ = result.unwrap();
             ControlJoin::Stopped
         }
     }
@@ -374,7 +374,7 @@ async fn join_central_io_reader(
         Some(Ok(Err(RunCentralIoReaderError::Control(_)))) => ReaderJoin::ControlChannelClosed,
         Some(Ok(Ok(()))) => ReaderJoin::ControlChannelClosed,
         Some(result) => {
-            result.unwrap();
+            let _ = result.unwrap();
             ReaderJoin::Stopped
         }
     }
@@ -396,7 +396,7 @@ async fn join_central_io_writer(
         Some(Ok(Err(RunCentralIoWriterError::Control(_)))) => WriterJoin::ControlChannelClosed,
         Some(Ok(Ok(()))) => WriterJoin::ControlChannelClosed,
         Some(result) => {
-            result.unwrap();
+            let _ = result.unwrap();
             WriterJoin::Stopped
         }
     }
