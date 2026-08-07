@@ -1052,7 +1052,6 @@ pub fn spawn_response_router(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{
@@ -1231,7 +1230,8 @@ mod tests {
         let upload = 512 * 1024;
         let download = 512 * 1024;
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(9, LaneClass::Interactive);
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let chunk = vec![0xABu8; 64 * 1024];
             let mut sent = 0;
             while sent < upload {
@@ -1242,8 +1242,9 @@ mod tests {
         });
         let accepted = mac.accept().await.unwrap();
         let (mut req_reader, mut resp_writer) = migrating_duplex(accepted);
-        let drain = spawn_drain(mac);
-        let respond = tokio::spawn(async move {
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
+        tasks.spawn(async move {
             let chunk = vec![0xCDu8; 64 * 1024];
             let mut sent = 0;
             while sent < download {
@@ -1280,9 +1281,9 @@ mod tests {
         assert!(up.iter().all(|b| *b == 0xAB), "upload corrupted");
         assert_eq!(down.len(), download, "download byte count mismatch");
         assert!(down.iter().all(|b| *b == 0xCD), "download corrupted");
-        send.await.unwrap();
-        respond.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1456,17 +1457,19 @@ mod tests {
         let (_reader, mut short_writer) = opener.open(LaneClass::Interactive).await.unwrap();
         short_writer.write_all(b"short").await.unwrap();
         short_writer.shutdown().unwrap();
-        let accept = tokio::spawn(async move { mac.accept().await });
+        let mut accept = JoinSet::new();
+        accept.spawn(async move { mac.accept().await });
         tokio::task::yield_now().await;
         assert!(
-            !accept.is_finished(),
+            accept.try_join_next().is_none(),
             "empty or truncated stream escaped as an application stream"
         );
         let mut writer = opener.open_migrating(42, LaneClass::Interactive);
         writer.write_all(b"hello").await.unwrap();
-        let accepted = tokio::time::timeout(Duration::from_secs(1), accept)
+        let accepted = tokio::time::timeout(Duration::from_secs(1), accept.join_next())
             .await
             .expect("strict accepter did not reach the valid migrating stream")
+            .unwrap()
             .unwrap()
             .unwrap();
         match accepted {
@@ -1490,7 +1493,8 @@ mod tests {
         let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut mac = accepter.into_migrating_capable();
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating(42, LaneClass::Interactive);
             writer.write_all(b"hello-world").await.unwrap();
             writer.finalize().await.unwrap();
@@ -1502,9 +1506,8 @@ mod tests {
 
         // Drain successor generations so the FINAL gen reaches the
         // SplicedReader's queue before we read.
-        let drain = spawn_drain(mac);
-
-        send.await.unwrap();
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         // Read from SplicedReader — gets clean EOF after payload + FINAL
         let mut data = Vec::new();
@@ -1513,7 +1516,9 @@ mod tests {
             .unwrap();
         assert_eq!(data, b"hello-world");
 
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1528,7 +1533,8 @@ mod tests {
         let chunk_size = 10 * 1024;
         let migrations: usize = 100;
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating_manual(77, LaneClass::Interactive);
             for i in 0..migrations {
                 let mut chunk = vec![0u8; chunk_size];
@@ -1549,7 +1555,8 @@ mod tests {
         let accepted = mac.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
 
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1557,8 +1564,9 @@ mod tests {
             .unwrap();
         assert_eq!(data.len(), chunk_size * migrations, "byte count mismatch");
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1574,7 +1582,8 @@ mod tests {
         let second = b"1111 2222 3333 4444 5555 6666 7777 8888";
         let third = b"xxxx yyyy zzzz wwww vvvv uuuu tttt ssss";
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
             writer.write_all(first).await.unwrap();
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
@@ -1587,7 +1596,8 @@ mod tests {
         let accepted = mac.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
 
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1596,8 +1606,9 @@ mod tests {
         let expected: Vec<u8> = first.iter().chain(second).chain(third).copied().collect();
         assert_eq!(data, expected, "data mismatch");
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1610,7 +1621,8 @@ mod tests {
         let mut mac = accepter.into_migrating_capable();
 
         // Sender writes gen0 data then finalize (gen1 FINAL)
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating(42, LaneClass::Interactive);
             writer.write_all(b"Hello, world!").await.unwrap();
             writer.finalize().await.unwrap();
@@ -1622,7 +1634,8 @@ mod tests {
 
         // Continuously drain successor generations so the FINAL gen
         // reaches the SplicedReader's queue.
-        let drain = tokio::spawn(async move { while mac.accept().await.is_ok() {} });
+        let mut drains = JoinSet::new();
+        drains.spawn(async move { while mac.accept().await.is_ok() {} });
 
         // SplicedReader should read payload, then see FINAL and get clean EOF
         let mut data = Vec::new();
@@ -1631,8 +1644,9 @@ mod tests {
             .unwrap();
         assert_eq!(data, b"Hello, world!");
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1644,7 +1658,8 @@ mod tests {
         let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut mac = accepter.into_migrating_capable();
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating(1, LaneClass::Interactive);
             writer.write_all(b"Prologue ").await.unwrap();
             writer.write_all(&[0u8; 3000]).await.unwrap();
@@ -1655,7 +1670,8 @@ mod tests {
         let accepted = mac.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
 
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut buf = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf)
@@ -1664,8 +1680,9 @@ mod tests {
         assert!(buf.starts_with("Prologue "), "got: {buf:?}");
         assert!(buf.contains("Epilogue."), "got: {buf:?}");
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1678,7 +1695,8 @@ mod tests {
         let mut mac = accepter.into_migrating_capable();
 
         let opener2 = opener.clone();
-        let send_a = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut w = opener.open_migrating_manual(10, LaneClass::Interactive);
             w.write_all(b"stream-A-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Bulk).await.unwrap();
@@ -1687,7 +1705,7 @@ mod tests {
         });
 
         let opener3 = opener2.clone();
-        let send_b = tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut w = opener3.open_migrating_manual(20, LaneClass::Bulk);
             w.write_all(b"stream-B-chunk-1").await.unwrap();
             w.force_migrate(LaneClass::Interactive).await.unwrap();
@@ -1704,7 +1722,8 @@ mod tests {
         let (reader_b, _) = migrating(b);
 
         // Drain successors while readers consume data
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let (ra, rb) = tokio::join!(
             async {
@@ -1735,9 +1754,9 @@ mod tests {
             ]
         );
 
-        send_a.await.unwrap();
-        send_b.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1752,7 +1771,8 @@ mod tests {
         let sync_size = 3 * 1024 * 1024;
         let deltas = 10;
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating(1, LaneClass::Interactive);
             writer.write_all(&vec![0xABu8; sync_size]).await.unwrap();
             for i in 0..deltas {
@@ -1767,7 +1787,8 @@ mod tests {
         let accepted = mac.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
 
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut data = Vec::with_capacity(sync_size + 200);
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
@@ -1786,8 +1807,9 @@ mod tests {
             );
         }
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1851,7 +1873,8 @@ mod tests {
         let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut mac = accepter.into_migrating_capable();
 
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
             writer.write_all(b"data-on-bulk").await.unwrap();
@@ -1861,7 +1884,8 @@ mod tests {
         let accepted = mac.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
 
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut data = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut data)
@@ -1869,8 +1893,9 @@ mod tests {
             .unwrap();
         assert_eq!(data, "data-on-bulk");
 
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1885,7 +1910,8 @@ mod tests {
         let (mut client_reader, client_writer) =
             opener.open_migrating_duplex(7, LaneClass::Interactive);
 
-        let write = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"hello-from-c2s  ").await.unwrap();
             writer.finalize().await.unwrap();
@@ -1900,7 +1926,9 @@ mod tests {
             .await
             .unwrap();
 
-        write.await.unwrap();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
 
         let mut resp = [0u8; 16];
         tokio::io::AsyncReadExt::read_exact(&mut client_reader, &mut resp)
@@ -1927,7 +1955,8 @@ mod tests {
         let (mut client_reader, client_writer) =
             opener.open_migrating_duplex(8, LaneClass::Interactive);
 
-        let write = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"c2s-1").await.unwrap();
             writer.force_migrate(LaneClass::Bulk).await.unwrap();
@@ -1947,7 +1976,9 @@ mod tests {
             .await
             .unwrap();
 
-        write.await.unwrap();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
 
         let mut resp = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut client_reader, &mut resp)
@@ -1970,7 +2001,8 @@ mod tests {
 
         const MIGRATIONS: usize = 100;
 
-        let write = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = client_writer;
             for i in 0..MIGRATIONS {
                 let chunk = format!("chunk-{:03}-{:04X}", i, i);
@@ -1992,9 +2024,10 @@ mod tests {
         };
 
         // Drain successors while echoing
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
-        let echo = tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut buf = vec![0u8; 256];
             loop {
                 let n = tokio::io::AsyncReadExt::read(&mut accepted_reader, &mut buf)
@@ -2012,9 +2045,9 @@ mod tests {
                 .unwrap();
         });
 
-        write.await.unwrap();
-        echo.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
 
         let mut echoed = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut echoed)
@@ -2043,7 +2076,8 @@ mod tests {
 
         let client_writer = opener.open_migrating(10, LaneClass::Interactive);
 
-        let write = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut writer = client_writer;
             writer.write_all(b"write-only-data").await.unwrap();
             writer.finalize().await.unwrap();
@@ -2054,7 +2088,8 @@ mod tests {
 
         // Drain successors (FINAL generation from shutdown) so the
         // SplicedReader can chain through to clean EOF.
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
 
         let mut data = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut accepted_reader, &mut data)
@@ -2062,8 +2097,9 @@ mod tests {
             .unwrap();
         assert_eq!(data, "write-only-data");
 
-        write.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2072,8 +2108,9 @@ mod tests {
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
         let (feed, mut driver) = spawn_splice_router();
         let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
-        let mut mac2 = acc2.into_migrating_only_with_feed(feed);
-        let send = tokio::spawn(async move {
+        let mac2 = acc2.into_migrating_only_with_feed(feed);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut w = op1.open_migrating_manual(42, LaneClass::Interactive);
             w.write_all(b"born-on-session-one|").await.unwrap();
             w.rebind(op2).await.unwrap();
@@ -2082,16 +2119,9 @@ mod tests {
         });
         let accepted = mac1.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
-        let drain1 = tokio::spawn(async move {
-            loop {
-                let _ = mac1.accept().await;
-            }
-        });
-        let drain2 = tokio::spawn(async move {
-            loop {
-                let _ = mac2.accept().await;
-            }
-        });
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac1);
+        spawn_drain(&mut drains, mac2);
         let mut data = String::new();
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2101,9 +2131,9 @@ mod tests {
         .expect("cross-session splice stalled")
         .unwrap();
         assert_eq!(data, "born-on-session-one|continued-on-session-two");
-        send.await.unwrap();
-        drain1.abort();
-        drain2.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
         driver.abort_all();
     }
 
@@ -2113,11 +2143,12 @@ mod tests {
         let (op2, acc2, _e, _f, _g, _h) = make_dual_session().await;
         let (feed, mut driver) = spawn_splice_router();
         let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
-        let mut mac2 = acc2.into_migrating_only_with_feed(feed);
+        let mac2 = acc2.into_migrating_only_with_feed(feed);
         let half = 200 * 1024;
         let pattern: Vec<u8> = (0..2 * half).map(|i| (i % 251) as u8).collect();
         let expected = pattern.clone();
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let mut w = op1.open_migrating(9, LaneClass::Interactive);
             w.write_all(&pattern[..half]).await.unwrap();
             w.rebind(op2).await.unwrap();
@@ -2126,16 +2157,9 @@ mod tests {
         });
         let accepted = mac1.accept().await.unwrap();
         let (mut reader, _) = migrating(accepted);
-        let drain1 = tokio::spawn(async move {
-            loop {
-                let _ = mac1.accept().await;
-            }
-        });
-        let drain2 = tokio::spawn(async move {
-            loop {
-                let _ = mac2.accept().await;
-            }
-        });
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac1);
+        spawn_drain(&mut drains, mac2);
         let mut data = Vec::new();
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2146,9 +2170,9 @@ mod tests {
         .unwrap();
         assert_eq!(data.len(), expected.len(), "byte count mismatch");
         assert_eq!(data, expected, "bytes lost or reordered across rebind");
-        send.await.unwrap();
-        drain1.abort();
-        drain2.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
         driver.abort_all();
     }
 
@@ -2204,27 +2228,27 @@ mod tests {
         }
     }
 
-    fn spawn_drain(mut mac: MigratingCapableAccepter) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    fn spawn_drain(tasks: &mut JoinSet<()>, mut mac: MigratingCapableAccepter) {
+        tasks.spawn(async move {
             loop {
                 let _ = mac.accept().await;
             }
-        })
+        });
     }
 
-    fn counting_dead_opener() -> (DualStreamOpener, Arc<std::sync::atomic::AtomicUsize>) {
+    fn counting_dead_opener(
+        tasks: &mut JoinSet<()>,
+    ) -> (DualStreamOpener, Arc<std::sync::atomic::AtomicUsize>) {
         use crate::stream::opener::{StreamOpener, stream_open_channel};
         let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (int_tx, mut int_rx) = stream_open_channel();
         let (bulk_tx, _bulk_rx) = stream_open_channel();
-        {
-            let opens = Arc::clone(&opens);
-            tokio::spawn(async move {
-                while int_rx.recv().await.is_ok() {
-                    opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-        }
+        let opens_task = Arc::clone(&opens);
+        tasks.spawn(async move {
+            while int_rx.recv().await.is_ok() {
+                opens_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
         let opener = DualStreamOpener::new(
             StreamOpener::new(int_tx),
             StreamOpener::new(bulk_tx),
@@ -2262,7 +2286,8 @@ mod tests {
             .write_all(b"announce")
             .await
             .expect("the session is live");
-        let (dead, opens) = counting_dead_opener();
+        let mut dead_tasks = JoinSet::new();
+        let (dead, opens) = counting_dead_opener(&mut dead_tasks);
         writer
             .rebind(dead)
             .await
@@ -2287,7 +2312,8 @@ mod tests {
             .write_all(b"announce")
             .await
             .expect("the session is live");
-        let (dead, opens) = counting_dead_opener();
+        let mut dead_tasks = JoinSet::new();
+        let (dead, opens) = counting_dead_opener(&mut dead_tasks);
         writer
             .rebind(dead)
             .await
@@ -2448,7 +2474,8 @@ mod tests {
         req_writer.write_all(b"gen0").await.unwrap();
         let (mut req_reader, _resp_writer) = migrating_duplex(mac.accept().await.unwrap());
         let _gen0_reader = gen0_rx.await.unwrap();
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
         for i in 0..MIGRATIONS {
             let target = match i % 2 {
                 0 => LaneClass::Bulk,
@@ -2474,7 +2501,6 @@ mod tests {
         );
         assert_eq!(&got[..4], b"gen0");
         assert!(got[4..].as_chunks::<4>().0.iter().all(|c| c == b"genn"));
-        drain.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2490,7 +2516,8 @@ mod tests {
             "write on a dead session must fail"
         );
         w.rebind(op2).await.unwrap();
-        let send = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             w.write_all(b"revived").await.unwrap();
             w.finalize().await.unwrap();
         });
@@ -2499,7 +2526,8 @@ mod tests {
             .expect("rebound stream never reached the fresh session")
             .unwrap();
         let (mut reader, _) = migrating(accepted);
-        let drain = spawn_drain(mac2);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac2);
         let mut data = String::new();
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2509,8 +2537,9 @@ mod tests {
         .expect("rebound stream stalled")
         .unwrap();
         assert_eq!(data, "revived");
-        send.await.unwrap();
-        drain.abort();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2653,7 +2682,8 @@ mod tests {
                 w.finalize().await.unwrap();
             });
         }
-        let drain2 = spawn_drain(mac2);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac2);
         let mut readers: JoinSet<u64> = JoinSet::new();
         for _ in 0..STREAMS {
             let accepted = tokio::time::timeout(Duration::from_secs(30), mac1.accept())
@@ -2688,7 +2718,7 @@ mod tests {
                 id
             });
         }
-        let drain1 = spawn_drain(mac1);
+        spawn_drain(&mut drains, mac1);
         let mut seen = std::collections::HashSet::new();
         while let Some(id) = readers.join_next().await {
             assert!(seen.insert(id.unwrap()), "two readers claimed the same id");
@@ -2702,8 +2732,6 @@ mod tests {
             carried > STREAMS as usize * CHUNK,
             "the rebind target carried only {carried} bytes, so nothing rebound onto it"
         );
-        drain1.abort();
-        drain2.abort();
         driver.abort_all();
     }
 
@@ -2732,7 +2760,8 @@ mod tests {
             let handle = router.handle();
             clients.spawn(async move {
                 let request = body(id, request_byte);
-                let send = tokio::spawn(async move {
+                let mut send_tasks = JoinSet::new();
+                send_tasks.spawn(async move {
                     req_writer.write_all(&request[..8]).await.unwrap();
                     for c in 0..CHUNKS {
                         let at = 8 + c * CHUNK;
@@ -2768,7 +2797,9 @@ mod tests {
                 .await
                 .expect("a response stalled")
                 .unwrap();
-                send.await.unwrap();
+                while let Some(result) = send_tasks.join_next().await {
+                    result.unwrap();
+                }
                 assert_eq!(
                     got,
                     body(id, response_byte),
@@ -2817,7 +2848,8 @@ mod tests {
                 );
             });
         }
-        let drain = spawn_drain(mac);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac);
         let mut seen = std::collections::HashSet::new();
         while let Some(id) = clients.join_next().await {
             assert!(seen.insert(id.unwrap()), "two clients claimed the same id");
@@ -2826,7 +2858,6 @@ mod tests {
         while let Some(s) = servers.join_next().await {
             s.unwrap();
         }
-        drain.abort();
     }
 
     #[tokio::test]
@@ -2921,7 +2952,8 @@ mod tests {
         let (feed, mut driver) = spawn_splice_router();
         let mut mac1 = acc1.into_migrating_only_with_feed(feed.clone());
         let mac2 = acc2.into_migrating_only_with_feed(feed);
-        let drain2 = spawn_drain(mac2);
+        let mut drains = JoinSet::new();
+        spawn_drain(&mut drains, mac2);
         let (killed_tx, killed_rx) = tokio::sync::watch::channel(false);
         let (past_rebind_tx, mut past_rebind_rx) = tokio::sync::mpsc::channel(STREAMS as usize);
         let mut writers = JoinSet::new();
@@ -2998,7 +3030,6 @@ mod tests {
             dead.write_all(b"x").await.is_err(),
             "the old session still opens streams, so it was never killed"
         );
-        drain2.abort();
         driver.abort_all();
     }
 }

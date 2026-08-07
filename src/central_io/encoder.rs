@@ -246,7 +246,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::{
         io::{self, IoSlice},
@@ -519,10 +518,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut accept_tasks = tokio::task::JoinSet::new();
+        accept_tasks.spawn(async move { listener.accept().await.unwrap() });
 
         let b = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let a = accept.await.unwrap().0;
+        let a = accept_tasks.join_next().await.unwrap().unwrap().0;
 
         let mut tasks = tokio::task::JoinSet::new();
         let (a_r, a_w) = a.into_split();
@@ -560,14 +560,15 @@ mod tests {
             .collect();
         let expected = payload.clone();
 
-        let writer = tokio::spawn(async move {
+        let mut writer_tasks = tokio::task::JoinSet::new();
+        writer_tasks.spawn(async move {
             a_stream.write_all(&payload).await.unwrap();
             a_stream.shutdown().unwrap();
             a_stream
         });
         let mut received = Vec::new();
         b_stream.read_to_end(&mut received).await.unwrap();
-        writer.await.unwrap();
+        writer_tasks.join_next().await.unwrap().unwrap();
         assert_eq!(received, expected);
     }
 

@@ -490,7 +490,6 @@ impl DualMessageReceiver {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{
@@ -589,7 +588,8 @@ mod tests {
 
         // Send in background
         let tx = DualMessageSender::new(opener, DeliveryMode::Unordered);
-        let tx_handle = tokio::spawn(async move {
+        let mut tx_tasks = JoinSet::new();
+        tx_tasks.spawn(async move {
             tx.send(b"hello").await.unwrap();
             tx.send(b"world").await.unwrap();
         });
@@ -597,7 +597,9 @@ mod tests {
         let msg1 = rx.recv().await.unwrap().unwrap();
         let msg2 = rx.recv().await.unwrap().unwrap();
 
-        tx_handle.await.unwrap();
+        while let Some(result) = tx_tasks.join_next().await {
+            result.unwrap();
+        }
 
         // Unordered: both messages arrive; order not guaranteed
         let mut msgs = [msg1, msg2];
@@ -667,15 +669,15 @@ mod tests {
 
         // Send multiple messages concurrently
         let tx = Arc::new(tx);
-        let mut handles = vec![];
+        let mut send_tasks = JoinSet::new();
         for i in 0..10u8 {
             let tx = tx.clone();
-            handles.push(tokio::spawn(async move {
+            send_tasks.spawn(async move {
                 tx.send(&[i; 50]).await.unwrap();
-            }));
+            });
         }
-        for h in handles {
-            h.await.unwrap();
+        while let Some(result) = send_tasks.join_next().await {
+            result.unwrap();
         }
 
         let mut received = vec![];
@@ -733,10 +735,11 @@ mod tests {
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
         // Keep spawners alive so mux session tasks keep running.
-        tokio::task::spawn(async move {
+        let mut spawners = JoinSet::new();
+        spawners.spawn(async move {
             let _ = int_spawner.join_next().await;
         });
-        tokio::task::spawn(async move {
+        spawners.spawn(async move {
             let _ = bulk_spawner.join_next().await;
         });
 
@@ -750,17 +753,17 @@ mod tests {
         let finished = Arc::new(AtomicUsize::new(0));
         let payload = vec![0u8; 1 << 20]; // 1 MiB > all in-process buffering
 
-        let mut handles = Vec::new();
+        let mut handles = JoinSet::new();
         for _ in 0..10 {
             let tx = tx.clone();
             let barrier = barrier.clone();
             let finished = finished.clone();
             let payload = payload.clone();
-            handles.push(tokio::spawn(async move {
+            handles.spawn(async move {
                 barrier.wait().await;
                 let _ = tx.send(&payload).await;
                 finished.fetch_add(1, Ordering::SeqCst);
-            }));
+            });
         }
 
         // Wait for the admission to saturate — exactly 2 permits held.
@@ -786,8 +789,12 @@ mod tests {
         );
 
         drop(tx);
-        for h in handles {
-            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        while let Some(result) = tokio::time::timeout(Duration::from_secs(2), handles.join_next())
+            .await
+            .ok()
+            .flatten()
+        {
+            let _ = result;
         }
     }
 
@@ -812,10 +819,11 @@ mod tests {
         let mut bulk_spawner = JoinSet::new();
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
-        tokio::task::spawn(async move {
+        let mut spawners = JoinSet::new();
+        spawners.spawn(async move {
             let _ = int_spawner.join_next().await;
         });
-        tokio::task::spawn(async move {
+        spawners.spawn(async move {
             let _ = bulk_spawner.join_next().await;
         });
 
@@ -828,7 +836,8 @@ mod tests {
 
         // First send acquires the single permit and parks on the full
         // transport buffer.
-        let first = tokio::spawn({
+        let mut sends = JoinSet::new();
+        let first_abort = sends.spawn({
             let tx = tx.clone();
             let payload = payload.clone();
             async move { tx.send(&payload).await }
@@ -841,8 +850,12 @@ mod tests {
         .await
         .expect("the first send never acquired its permit");
 
-        first.abort();
-        let _ = first.await;
+        first_abort.abort();
+        while let Some(result) = sends.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "{error}");
+            }
+        }
 
         timeout(Duration::from_secs(5), async {
             while admission.inflight.load(Ordering::Acquire) != 0 {
@@ -854,7 +867,7 @@ mod tests {
 
         // The freed permit lets a second send acquire even though the
         // transport still cannot drain.
-        let second = tokio::spawn({
+        let second_abort = sends.spawn({
             let tx = tx.clone();
             let payload = payload.clone();
             async move { tx.send(&payload).await }
@@ -867,8 +880,12 @@ mod tests {
         .await
         .expect("a released permit did not let the second send acquire");
 
-        second.abort();
-        let _ = second.await;
+        second_abort.abort();
+        while let Some(result) = sends.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "{error}");
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1087,8 +1104,9 @@ mod tests {
         // `recv` should propagate the panic. Run it in a spawned task and
         // assert the spawn surfaces a `JoinError` (panic), since `recv`
         // itself is not `catch_unwind`-compatible without `futures`.
-        let handle = tokio::spawn(async move { rx.recv().await });
-        let join_result = handle.await;
+        let mut recv_tasks = JoinSet::new();
+        recv_tasks.spawn(async move { rx.recv().await });
+        let join_result = recv_tasks.join_next().await.unwrap();
         assert!(
             join_result.is_err(),
             "recv must propagate a panicked read task instead of swallowing it"

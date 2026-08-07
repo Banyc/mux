@@ -662,7 +662,6 @@ pub enum Initiation {
 pub struct TooManyOpenStreams {}
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod reassembly_tests {
     use super::*;
     use crate::central_io::{
@@ -755,17 +754,14 @@ mod reassembly_tests {
 
     fn make_control(
         frame_reassembly: bool,
-    ) -> (
-        MuxControl,
-        StreamCloseTxPrototype,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (MuxControl, StreamCloseTxPrototype, tokio::task::JoinSet<()>) {
         let (tx, mut rx) = crate::central_io::scheduler::write_data_channel();
         let control = MuxControl::new(Initiation::Server, tx, frame_reassembly);
         let (close_tx, _close_rx) = stream_close_channel();
         // Drain the write-data receiver so `derive` (which sends an Open
         // through the fair queue) never blocks.
-        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let mut drain = tokio::task::JoinSet::new();
+        drain.spawn(async move { while rx.recv().await.is_ok() {} });
         (control, close_tx, drain)
     }
 
@@ -1062,7 +1058,8 @@ mod reassembly_tests {
         use crate::stream::opener::stream_open_channel;
 
         let (tx, mut rx) = crate::central_io::scheduler::write_data_channel();
-        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let mut drain = tokio::task::JoinSet::new();
+        drain.spawn(async move { while rx.recv().await.is_ok() {} });
         let mut control = MuxControl::new(Initiation::Server, tx, true);
         let (close_tx, _close_rx) = stream_close_channel();
         let (_open_tx, open_rx) = stream_open_channel();
@@ -1125,7 +1122,8 @@ mod reassembly_tests {
         use crate::stream::opener::stream_open_channel;
 
         let (tx, mut rx) = crate::central_io::scheduler::write_data_channel();
-        let drain = tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        let mut drain = tokio::task::JoinSet::new();
+        drain.spawn(async move { while rx.recv().await.is_ok() {} });
         let mut control = MuxControl::new(Initiation::Server, tx, true);
         let (close_tx, _close_rx) = stream_close_channel();
         let (_open_tx, open_rx) = stream_open_channel();
@@ -1396,7 +1394,7 @@ mod reassembly_tests {
         write_control_tx: WriteControlTx,
         write_control_rx: crate::central_io::scheduler::WriteControlRx,
         _open_tx: crate::stream::opener::StreamOpenTx,
-        _drain: tokio::task::JoinHandle<()>,
+        _drain: tokio::task::JoinSet<()>,
     }
     impl CentralReadRig {
         fn drop_accepter(&mut self) {

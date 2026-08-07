@@ -222,7 +222,6 @@ impl CentralIoReadRx {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
@@ -236,7 +235,8 @@ mod tests {
 
         client.write_all(&[0x01]).await.unwrap();
 
-        let _handle = tokio::spawn(async move {
+        let mut reader_tasks = tokio::task::JoinSet::new();
+        reader_tasks.spawn(async move {
             let _ = reader
                 .recv_with_steady_deadline(
                     Duration::from_secs(5),
@@ -258,6 +258,9 @@ mod tests {
             Ok(Ok(())) => {}
             Ok(Err(_)) => panic!("ready_tx sender dropped without sending"),
             Err(_elapsed) => panic!("ready_tx did not resolve after complete frame"),
+        }
+        while let Some(result) = reader_tasks.join_next().await {
+            result.unwrap();
         }
     }
 }

@@ -526,7 +526,6 @@ struct NotClone<T>(pub T);
 pub struct QueueToken(pub usize);
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::task::Waker;
 
@@ -535,9 +534,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn open_send_close() {
         let (opener, mut receiver) = channel();
+        let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..24 {
             let opener = opener.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let sender = opener.open(0).await.unwrap();
                 sender.send(1).await.unwrap();
             });
@@ -562,6 +562,9 @@ mod tests {
             assert_eq!(token_1, token_2);
             assert_eq!(token_1, token_3);
         }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -572,16 +575,17 @@ mod tests {
             let mut cx = Context::from_waker(Waker::noop());
             assert!(cancelled.as_mut().poll(&mut cx).is_pending());
         }
-        let live = {
+        let mut live_tasks = tokio::task::JoinSet::new();
+        {
             let opener = opener.clone();
-            tokio::spawn(async move { opener.open(9).await })
-        };
+            live_tasks.spawn(async move { opener.open(9).await });
+        }
         let (token, res) = receiver.recv().await.unwrap();
         match res {
             ReceiverRecv::Open(value) => assert_eq!(value, 9, "a cancelled open was announced"),
             _ => panic!("expected an open"),
         }
-        drop(live.await.unwrap().unwrap());
+        drop(live_tasks.join_next().await.unwrap().unwrap().unwrap());
         let (close_token, res) = receiver.recv().await.unwrap();
         assert_eq!(close_token, token);
         assert!(matches!(res, ReceiverRecv::Close));

@@ -346,7 +346,6 @@ impl WriteControlRx {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::time::Duration;
 
@@ -788,7 +787,8 @@ mod tests {
         // the receiver, interleaving sends with drains — the contention
         // window in which the spurious scan abort strands later-ready
         // tokens.
-        let sender = tokio::spawn(async move {
+        let mut sender_tasks = tokio::task::JoinSet::new();
+        sender_tasks.spawn(async move {
             for _ in 0..CYCLES {
                 send_data_owned(a_tx.clone(), a_sid, vec![0u8; A_LEN]).await;
                 for _ in 0..5 {
@@ -818,7 +818,9 @@ mod tests {
         }
         assert_eq!(a_seen, a_total);
         assert_eq!(b_seen, b_total);
-        sender.await.unwrap();
+        while let Some(result) = sender_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // ---- Latency ramp tests ----
@@ -1013,7 +1015,8 @@ mod tests {
         let a_sid = stream_a.stream_id;
         let b_sid = stream_b.stream_id;
 
-        let sender = tokio::spawn(async move {
+        let mut sender_tasks = tokio::task::JoinSet::new();
+        sender_tasks.spawn(async move {
             for _ in 0..CYCLES {
                 send_data_owned(a_tx.clone(), a_sid, vec![0u8; A_LEN]).await;
                 for _ in 0..5 {
@@ -1046,6 +1049,8 @@ mod tests {
         }
         assert_eq!(a_seen, a_total);
         assert_eq!(b_seen, b_total);
-        sender.await.unwrap();
+        while let Some(result) = sender_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 }

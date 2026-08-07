@@ -67,13 +67,14 @@ mod benches {
     async fn get_tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let h = tokio::spawn(async move {
+        let mut accept = tokio::task::JoinSet::new();
+        accept.spawn(async move {
             let (a, _) = listener.accept().await.unwrap();
             a
         });
 
         let b = TcpStream::connect(addr).await.unwrap();
-        let a = h.await.unwrap();
+        let a = accept.join_next().await.unwrap().unwrap();
         // a.set_nodelay(true).unwrap();
         // b.set_nodelay(true).unwrap();
         (a, b)
