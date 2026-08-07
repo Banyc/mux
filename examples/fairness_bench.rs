@@ -208,7 +208,8 @@ async fn contended_ping(
     });
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    if bulk_client_set.is_empty() {
+    if let Some(result) = bulk_client_set.try_join_next() {
+        result.unwrap();
         panic!("bulk finished before ping contention; increase --bulk-mib");
     }
 
@@ -222,7 +223,7 @@ async fn contended_ping(
         latencies.push(start.elapsed().as_micros());
     }
 
-    let _ = ping_c_writer.shutdown();
+    AsyncWriteExt::shutdown(&mut ping_c_writer).await.unwrap();
     drop(ping_c_reader);
     while let Some(result) = workers.join_next().await {
         result.unwrap();
