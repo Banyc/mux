@@ -622,10 +622,9 @@ fn aggregate_dual_lane_result(
     };
     let source = match result {
         Some(Ok(error)) => error,
-        Some(Err(join_error)) if join_error.is_cancelled() => MuxError::TaskJoin {
-            task,
-            source: join_error,
-        },
+        Some(Err(join_error)) if join_error.is_cancelled() => {
+            panic!("{task} lane task cancelled: {join_error}")
+        }
         Some(Err(join_error)) => std::panic::resume_unwind(join_error.into_panic()),
         None => MuxError::TaskStopped { task },
     };

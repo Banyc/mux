@@ -60,10 +60,6 @@ pub enum MuxError {
         peer_lane_aborted: bool,
         source: Box<MuxError>,
     },
-    TaskJoin {
-        task: &'static str,
-        source: JoinError,
-    },
     TaskStopped {
         task: &'static str,
     },
@@ -302,17 +298,11 @@ where
         ControlJoin::Err(e) => e,
         ControlJoin::Cancelled(e) => {
             // The control task was cancelled (e.g. abort_all during reset).
-            // Tear down the remaining tasks and report the cancellation
-            // instead of panicking.
+            // Tear down the remaining tasks, then surface the cancellation
+            // as a panic — a cancelled supervisor is not a recoverable event.
             central_io_reader_spawner.abort_all();
             central_io_writer_spawner.abort_all();
-            return (
-                None,
-                MuxError::TaskJoin {
-                    task: "control",
-                    source: e,
-                },
-            );
+            panic!("control task cancelled: {e}");
         }
         ControlJoin::Stopped => {
             central_io_reader_spawner.abort_all();
@@ -326,10 +316,7 @@ where
             let err = match dead_central_io.side {
                 Side::Read => match join_central_io_reader(&mut central_io_reader_spawner).await {
                     ReaderJoin::Io(e) => MuxError::IoReader(e),
-                    ReaderJoin::Cancelled(e) => MuxError::TaskJoin {
-                        task: "central_io_reader",
-                        source: e,
-                    },
+                    ReaderJoin::Cancelled(e) => panic!("central_io_reader task cancelled: {e}"),
                     ReaderJoin::Stopped => MuxError::TaskStopped {
                         task: "central_io_reader",
                     },
@@ -339,10 +326,7 @@ where
                 },
                 Side::Write => match join_central_io_writer(&mut central_io_writer_spawner).await {
                     WriterJoin::Io(e) => MuxError::IoWriter(e),
-                    WriterJoin::Cancelled(e) => MuxError::TaskJoin {
-                        task: "central_io_writer",
-                        source: e,
-                    },
+                    WriterJoin::Cancelled(e) => panic!("central_io_writer task cancelled: {e}"),
                     WriterJoin::Stopped => MuxError::TaskStopped {
                         task: "central_io_writer",
                     },
@@ -371,8 +355,10 @@ enum ControlJoin {
 /// [`ControlJoin::Cancelled`]; every other `JoinError` (a panic, or any
 /// future non-cancel kind) is resumed here so the panic propagates with its
 /// original backtrace instead of being silently downgraded to an ordinary
-/// `MuxError::TaskJoin`. The supervised tasks only ever complete via
-/// `abort_all` (cancellation) — there is no benign non-cancel exit.
+/// a panic. The supervised tasks only ever complete via `abort_all`
+/// (cancellation) — there is no benign non-cancel exit, and a
+/// cancellation is surfaced as a panic rather than downgraded to an
+/// ordinary `MuxError`.
 async fn join_control(set: &mut JoinSet<Result<(), RunControlError>>) -> ControlJoin {
     match set.join_next().await {
         None => ControlJoin::Stopped,
