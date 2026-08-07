@@ -371,8 +371,15 @@ impl DualMessageReceiver {
                 }
                 res = self.read_tasks.join_next(), if self.inflight > 0 => {
                     match res {
-                        Some(Ok(Some(msg))) => {
+                        Some(joined) => {
                             self.inflight -= 1;
+                            // A panicked read task must not be mistaken for
+                            // an empty message — propagate the panic so the
+                            // bug surfaces instead of silently losing data.
+                            let Some(msg) = joined.expect("read task panicked or was cancelled")
+                            else {
+                                continue;
+                            };
                             match self.mode {
                                 DeliveryMode::Unordered => {
                                     return Ok(Some(msg.payload));
@@ -384,12 +391,6 @@ impl DualMessageReceiver {
                                     }
                                 }
                             }
-                        }
-                        Some(Ok(None)) => {
-                            self.inflight -= 1;
-                        }
-                        Some(Err(_)) => {
-                            self.inflight -= 1;
                         }
                         None => {
                             self.inflight = 0;
@@ -1066,6 +1067,32 @@ mod tests {
         assert!(rx.recv().await.unwrap().is_none());
         assert!(rx.recv().await.unwrap().is_none(), "second EOF panicked");
         assert!(rx.recv().await.unwrap().is_none(), "third EOF panicked");
+    }
+
+    /// Regression: a panicked read task used to be silently swallowed by the
+    /// `Some(Err(_))` arm in `recv` and decrement `inflight` like an empty
+    /// message, silently losing data. Now the panic is re-raised so the bug
+    /// surfaces at the call site instead of hiding as a missing message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recv_propagates_panic_from_a_read_task() {
+        let (_opener, accepter, _srv, _cli) = paired_sessions().await;
+        let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
+        // Inject a read task that panics. `spawn_read_task` is private, so
+        // drive one through `read_tasks` directly with the same task type.
+        rx.inflight += 1;
+        rx.read_tasks.spawn(async move {
+            panic!("simulated read-task panic");
+        });
+
+        // `recv` should propagate the panic. Run it in a spawned task and
+        // assert the spawn surfaces a `JoinError` (panic), since `recv`
+        // itself is not `catch_unwind`-compatible without `futures`.
+        let handle = tokio::spawn(async move { rx.recv().await });
+        let join_result = handle.await;
+        assert!(
+            join_result.is_err(),
+            "recv must propagate a panicked read task instead of swallowing it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
