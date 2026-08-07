@@ -38,7 +38,7 @@ pub use lane_message::{
 pub use migration_api::{
     AUTO_BULK_THRESHOLD as MIGRATING_AUTO_BULK_THRESHOLD, AcceptedStream, MigratingCapableAccepter,
     MigratingStreamError, MigratingStreamWriter, PendingResponseReader, ResponseRouter,
-    ResponseRouterHandle, StreamName, spawn_response_router,
+    ResponseRouterDriver, ResponseRouterHandle, StreamName, spawn_response_router,
 };
 pub use migration_wire::{
     DEFAULT_SUCCESSOR_DEADLINE, GenerationChain, MAX_PENDING_GENERATIONS, MigrationError,

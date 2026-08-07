@@ -839,22 +839,44 @@ impl DualStreamAccepter {
     }
 }
 
+/// A response router is split into a cheap, cloneable [`ResponseRouterHandle`]
+/// (handed out to sessions/streams) and a driver that owns the supervised
+/// accepter-task [`JoinSet`]. The driver is reaped by a long-lived owner —
+/// `rtp_mux::run_connector` — so completed-task and peek-task [`JoinError`]s
+/// are observed instead of being silently discarded (a panic in an accepter
+/// loop surfaces on reap rather than vanishing into a `try_join_next` drain).
+///
+/// This mirrors the [`SpliceRouter`]/[`SpliceRouterHandle`] split: the handle
+/// only carries mpsc senders, the driver owns the supervision.
 #[derive(Debug)]
 pub struct ResponseRouter {
     feed: SpliceRouter,
-    tasks: tokio::task::JoinSet<()>,
+}
+impl Default for ResponseRouter {
+    fn default() -> Self {
+        Self {
+            feed: spawn_splice_router(),
+        }
+    }
 }
 impl ResponseRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn handle(&self) -> ResponseRouterHandle {
         ResponseRouterHandle {
             feed: self.feed.handle(),
         }
     }
 
-    pub fn add_accepter(&mut self, mut accepter: DualStreamAccepter) {
-        while self.tasks.try_join_next().is_some() {}
+    pub fn add_accepter(
+        &self,
+        mut accepter: DualStreamAccepter,
+        driver: &mut ResponseRouterDriver,
+    ) {
         let feed = self.feed.handle();
-        self.tasks.spawn(async move {
+        driver.spawn(async move {
             let mut inner: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             inner.spawn(async move {
                 let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
@@ -880,13 +902,19 @@ impl ResponseRouter {
                             Err(_) => accepting = false,
                         },
                         joined = peeks.join_next(), if has_peeks => {
-                            if let Some(Ok(Some((header, reader)))) = joined
-                                && feed
-                                    .send_continuation(header, Box::pin(reader) as GenerationReader)
-                                    .await
-                                    .is_err()
-                            {
-                                break;
+                            match joined {
+                                Some(Ok(Some((header, reader)))) => {
+                                    if feed
+                                        .send_continuation(header, Box::pin(reader) as GenerationReader)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Some(Ok(None)) => {}
+                                Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
+                                None => {}
                             }
                         }
                     }
@@ -894,14 +922,48 @@ impl ResponseRouter {
             });
             match inner.join_next().await {
                 Some(Ok(())) => tracing::debug!("ResponseRouter accepter task stopped"),
-                Some(Err(error)) => {
-                    panic!("ResponseRouter accepter task panicked or was cancelled: {error:?}");
-                }
+                Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
                 None => unreachable!("one accepter task was inserted"),
             }
         });
     }
 }
+
+#[derive(Debug, Default)]
+pub struct ResponseRouterDriver {
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl ResponseRouterDriver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(task);
+    }
+
+    pub async fn join_next(&mut self) -> Option<Result<(), tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    pub fn try_join_next(&mut self) -> Option<Result<(), tokio::task::JoinError>> {
+        self.tasks.try_join_next()
+    }
+
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    pub fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseRouterHandle {
     feed: SpliceRouterHandle,
@@ -925,13 +987,14 @@ impl ResponseRouterHandle {
         Ok(rx)
     }
 }
-pub fn spawn_response_router(accepter: DualStreamAccepter) -> ResponseRouter {
-    let mut router = ResponseRouter {
-        feed: spawn_splice_router(),
-        tasks: tokio::task::JoinSet::new(),
-    };
-    router.add_accepter(accepter);
-    router
+
+pub fn spawn_response_router(
+    accepter: DualStreamAccepter,
+) -> (ResponseRouter, ResponseRouterDriver) {
+    let router = ResponseRouter::new();
+    let mut driver = ResponseRouterDriver::new();
+    router.add_accepter(accepter, &mut driver);
+    (router, driver)
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,7 +1114,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn duplex_response_migrates_independently_with_clean_eof() {
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let router = spawn_response_router(x_acc);
+        let (router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(42, LaneClass::Interactive);
         req_writer.write_all(b"request").await.unwrap();
@@ -1087,7 +1150,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn duplex_response_without_migration_needs_final_for_clean_eof() {
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let router = spawn_response_router(x_acc);
+        let (router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(7, LaneClass::Interactive);
         req_writer.write_all(b"ping").await.unwrap();
@@ -1113,7 +1176,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn duplex_bidirectional_migration_integrity() {
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let router = spawn_response_router(x_acc);
+        let (router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let upload = 512 * 1024;
         let download = 512 * 1024;
@@ -2041,8 +2104,8 @@ mod tests {
     async fn response_final_crossing_shared_feed_closes_cleanly() {
         let (x1_op, x1_acc, y1_op, y1_acc, _t1) = make_duplex_session().await;
         let (_x2_op, x2_acc, y2_op, _y2_acc, _t2) = make_duplex_session().await;
-        let mut router = spawn_response_router(x1_acc);
-        router.add_accepter(x2_acc);
+        let (router, mut driver) = spawn_response_router(x1_acc);
+        router.add_accepter(x2_acc, &mut driver);
         let mut mac1 = y1_acc.into_migrating_duplex(y1_op);
         let (mut req_writer, gen0_rx) = x1_op.open_migrating_with_reader(7, LaneClass::Interactive);
         req_writer.write_all(b"ping").await.unwrap();
@@ -2228,7 +2291,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn closing_a_never_announced_stream_tells_the_peer_nothing() {
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let _router = spawn_response_router(x_acc);
+        let (_router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let mut writer = x_op.open_migrating_manual(77, LaneClass::Interactive);
         writer
@@ -2248,7 +2311,7 @@ mod tests {
     async fn silent_substreams_do_not_block_accepting_others() {
         const SILENT: usize = 60;
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let _router = spawn_response_router(x_acc);
+        let (_router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let mut silent = Vec::new();
         for _ in 0..SILENT {
@@ -2281,7 +2344,7 @@ mod tests {
     async fn silent_substreams_do_not_block_the_response_router() {
         const SILENT: usize = 60;
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let router = spawn_response_router(x_acc);
+        let (router, _driver) = spawn_response_router(x_acc);
         let y_op2 = y_op.clone();
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(21, LaneClass::Interactive);
@@ -2326,7 +2389,7 @@ mod tests {
     async fn superseded_generations_release_their_readers() {
         const MIGRATIONS: usize = 24;
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let _router = spawn_response_router(x_acc);
+        let (_router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let (mut req_writer, gen0_rx) = x_op.open_migrating_with_reader(5, LaneClass::Interactive);
         req_writer.write_all(b"gen0").await.unwrap();
@@ -2400,17 +2463,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn add_accepter_reaps_finished_accepters() {
         let (_x_op, live, _y_op, _y_acc, live_tasks) = make_duplex_session().await;
-        let mut router = spawn_response_router(live);
+        let (router, mut driver) = spawn_response_router(live);
         for _ in 0..8 {
             let (_x_op, dead, _y_op, _y_acc, tasks) = make_duplex_session().await;
             drop(tasks);
-            router.add_accepter(dead);
+            router.add_accepter(dead, &mut driver);
             tokio::time::sleep(Duration::from_millis(20)).await;
+            while driver.try_join_next().is_some() {}
         }
         assert!(
-            router.tasks.len() <= 3,
+            driver.len() <= 3,
             "finished accepter tasks accumulate: {}",
-            router.tasks.len()
+            driver.len()
         );
         drop(live_tasks);
     }
@@ -2604,7 +2668,7 @@ mod tests {
             out
         }
         let (x_op, x_acc, y_op, y_acc, _tasks) = make_duplex_session().await;
-        let router = spawn_response_router(x_acc);
+        let (router, _driver) = spawn_response_router(x_acc);
         let mut mac = y_acc.into_migrating_duplex(y_op);
         let mut clients: JoinSet<u64> = JoinSet::new();
         for id in 0..STREAMS {
