@@ -520,10 +520,6 @@ mod tests {
             }
         }
 
-        fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
-            self.tasks.spawn(task);
-        }
-
         /// Spawn a task that must stay alive for the whole [`Self::run`] body.
         /// A normal completion while the body is still running panics the test
         /// with a message naming the task (the wrapper turns the completion
@@ -539,7 +535,7 @@ mod tests {
             });
         }
 
-        async fn run<F: std::future::Future>(&mut self, body: F) -> F::Output {
+        async fn run<F: std::future::Future>(mut self, body: F) -> F::Output {
             tokio::pin!(body);
             loop {
                 tokio::select! {
@@ -551,14 +547,14 @@ mod tests {
                         // supervision ending when the sessions end) and is
                         // drained silently.
                         let joined = joined.expect("background task exists");
-                        joined.expect("a background task panicked");
+                        joined.unwrap();
                     }
                     value = &mut body => {
                         // The body completed. Drain tasks that exited in the
                         // same poll cycle so a required task that ended right
                         // as the body finished still fails the test.
                         while let Some(joined) = self.tasks.try_join_next() {
-                            joined.expect("a background task panicked");
+                            joined.unwrap();
                         }
                         return value;
                     }
@@ -623,10 +619,10 @@ mod tests {
         // a panic inside a lane propagates through the unwrap in
         // `supervise_lanes` and aborts the wrapper task.
         let mut scope = TestScope::new();
-        scope.spawn(async move {
+        scope.spawn_required("server Lane supervisor", async move {
             let _ = supervise_lanes(srv_int, srv_bulk).await;
         });
-        scope.spawn(async move {
+        scope.spawn_required("client Lane supervisor", async move {
             let _ = supervise_lanes(cli_int, cli_bulk).await;
         });
 
@@ -665,7 +661,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn round_trip_unordered() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
@@ -696,7 +692,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn round_trip_ordered() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
@@ -717,7 +713,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn small_message_routes_interactive() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
@@ -735,7 +731,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn large_message_routes_bulk() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
@@ -757,7 +753,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unordered_concurrent_messages() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
@@ -791,7 +787,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_payload_rejected() {
-        let (opener, _accepter, mut scope) = paired_sessions().await;
+        let (opener, _accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let tx = DualMessageSender::new(opener, DeliveryMode::Unordered)
@@ -837,7 +833,7 @@ mod tests {
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
         let mut scope = TestScope::new();
-        scope.spawn(async move {
+        scope.spawn_required("server Lane supervisor", async move {
             let _ = supervise_lanes(int_spawner, bulk_spawner).await;
         });
 
@@ -924,7 +920,7 @@ mod tests {
         let (bulk_opener, _bulk_acc) =
             spawn_mux_no_reconnection(bulk_r, bulk_w, cfg.clone(), &mut bulk_spawner);
         let mut scope = TestScope::new();
-        scope.spawn(async move {
+        scope.spawn_required("server Lane supervisor", async move {
             let _ = supervise_lanes(int_spawner, bulk_spawner).await;
         });
 
@@ -1044,7 +1040,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_reorder_across_gap() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
@@ -1070,7 +1066,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_force_advance_on_full_buffer() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
@@ -1105,7 +1101,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ordered_force_advance_keeps_all_buffered_messages() {
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
@@ -1180,7 +1176,7 @@ mod tests {
     async fn a_length_prefix_alone_does_not_allocate_its_payload() {
         use tokio::io::AsyncWriteExt;
         const HUGE: usize = 1 << 30;
-        let (opener, accepter, mut scope) = paired_sessions().await;
+        let (opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
@@ -1229,7 +1225,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[should_panic(expected = "simulated read-task panic")]
     async fn recv_propagates_panic_from_a_read_task() {
-        let (_opener, accepter, mut scope) = paired_sessions().await;
+        let (_opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered);
@@ -1284,7 +1280,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_last_sequence_number_does_not_wrap_the_cursor() {
-        let (_opener, accepter, mut scope) = paired_sessions().await;
+        let (_opener, accepter, scope) = paired_sessions().await;
         scope
             .run(async {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
