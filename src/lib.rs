@@ -21,6 +21,7 @@ mod session;
 mod splice_feed;
 mod stream;
 mod traffic_class;
+mod udp_mux;
 
 pub use central_io::DeadCentralIo;
 pub use control::{ControlOpenError, DeadControl, Initiation, TooManyOpenStreams};
@@ -59,3 +60,4 @@ pub use stream::{
     writer::StreamWriter,
 };
 pub use traffic_class::LaneClass;
+pub use udp_mux::{MAX_UDP_MUX_DATAGRAM_LEN, UdpMuxReader, UdpMuxWriter, udp_mux};
