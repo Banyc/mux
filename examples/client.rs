@@ -58,29 +58,23 @@ async fn main() {
     // instead of letting the operation continue against a dead session.
     let operation = async {
         let mut res = args.file_transfer.perform(read, write).await.unwrap();
+        // Orderly shutdown: send our FIN, then wait for the peer's. The
+        // strict EOF wait below is the explicit close acknowledgement —
+        // the peer's EOF wait can only complete after our FIN was flushed
+        // and ours only after the peer's, so neither side exits (tearing
+        // down the transport) until the close has been acknowledged in both
+        // directions.
         res.write.shutdown().await.unwrap();
         println!("shutdown");
         let mut buf = [0; 1];
-        let n = match res.read.read(&mut buf).await {
-            Ok(n) => n,
-            // The peer exits right after its own EOF wait (the transport
-            // dies at process exit), so the stream FIN may be cut short by
-            // the connection teardown. The transfer itself already
-            // completed, so treat the session-death read errors as the peer
-            // having finished.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                0
-            }
-            Err(e) => panic!("EOF verification read failed: {e}"),
-        };
-        assert_eq!(n, 0);
+        // Require a clean EOF: a reset/broken-pipe/session-death read here
+        // is a failed close handshake, not a successful transfer.
+        let n = res
+            .read
+            .read(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("EOF verification read failed: {e}"));
+        assert_eq!(n, 0, "expected a clean EOF from the peer");
         println!("{}", res.stats);
     };
     tokio::pin!(operation);
@@ -101,10 +95,13 @@ async fn main() {
     }
 
     // The mux session only ends when the underlying transport dies (at
-    // process exit), so drain only what has ALREADY completed (surfacing any
-    // panic) instead of blocking forever; dropping the spawner at process
-    // exit aborts the rest.
-    while let Some(result) = mux_spawner.try_join_next() {
-        result.unwrap();
+    // process exit), so only ALREADY-completed results are reaped instead of
+    // blocking forever; dropping the spawner at process exit aborts the
+    // rest. Every completed result is a failure: the session must survive
+    // the whole operation, so a supervisor that ended (with a MuxError or a
+    // panic) is re-raised here instead of being discarded.
+    if let Some(result) = mux_spawner.try_join_next() {
+        let err = result.unwrap();
+        panic!("mux session ended before the process exited: {err:?}");
     }
 }

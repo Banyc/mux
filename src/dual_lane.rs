@@ -957,10 +957,13 @@ mod tests {
         }
         fn fold(&mut self, mut spawner: JoinSet<crate::session::MuxError>) {
             self.tasks.spawn(async move {
-                while let Some(result) = spawner.join_next().await {
-                    // An actor panic surfaces through the JoinError unwrap;
-                    // a MuxError session-end before the body completes is
-                    // equally a failure.
+                // A folded supervision wrapper only ever ends by panicking:
+                // an actor panic surfaces through the JoinError unwrap, and
+                // a MuxError session-end before the body completes is
+                // equally a failure. The fold therefore awaits exactly ONE
+                // completion (the loop it replaces was provably
+                // single-iteration).
+                if let Some(result) = spawner.join_next().await {
                     let err = result.unwrap();
                     panic!("mux session ended before the test body completed: {err:?}");
                 }
@@ -968,18 +971,18 @@ mod tests {
         }
         async fn run<F: std::future::Future>(mut self, body: F) -> F::Output {
             tokio::pin!(body);
-            loop {
-                tokio::select! {
-                    joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                        // A folded supervision wrapper only ever ends by
-                        // panicking: either a lane actor panic surfaced
-                        // through the fold's unwrap, or a session ended
-                        // with a MuxError before the body completed.
-                        // Re-raise the wrapper's panic here.
-                        joined.expect("supervision wrapper task exists").unwrap();
-                    }
-                    value = &mut body => return value,
+            // A single select: the supervision branch only ever ends in a
+            // panic (a folded wrapper completes only by panicking — either a
+            // lane actor panic surfaced through the fold's unwrap, or a
+            // session ended with a MuxError before the body completed), so
+            // the loop it replaces was provably single-iteration.
+            tokio::select! {
+                joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    // Re-raise the wrapper's panic here.
+                    joined.expect("supervision wrapper task exists").unwrap();
+                    unreachable!("a folded supervision wrapper can only end by panicking");
                 }
+                value = &mut body => value,
             }
         }
     }

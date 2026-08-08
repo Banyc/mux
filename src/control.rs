@@ -1531,16 +1531,18 @@ mod reassembly_tests {
         }
         async fn run<F: std::future::Future>(mut self, body: F) -> F::Output {
             tokio::pin!(body);
-            loop {
-                tokio::select! {
-                    joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                        // A folded drain ended before the body completed:
-                        // the write-data channel closed unexpectedly.
-                        joined.expect("control drain task exists").unwrap();
-                        panic!("control drain finished before the test body completed");
-                    }
-                    value = &mut body => return value,
+            // A single select: the drain branch only ever ends in a panic
+            // (a folded drain completing before the body means the
+            // write-data channel closed unexpectedly), so the loop it
+            // replaces was provably single-iteration.
+            tokio::select! {
+                joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    // Re-raise any panic surfaced through the fold; a
+                    // normally-completed drain is equally a failure.
+                    joined.expect("control drain task exists").unwrap();
+                    panic!("control drain finished before the test body completed");
                 }
+                value = &mut body => value,
             }
         }
     }
