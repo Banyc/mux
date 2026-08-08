@@ -875,26 +875,24 @@ impl DualStreamAccepter {
 ///
 /// This mirrors the [`SpliceRouterHandle`] split: the handle only carries mpsc
 /// senders, the driver owns the supervision. The splice-feed supervision
-/// [`JoinSet`] created by [`spawn_splice_router`] is folded into the driver on
-/// the first [`ResponseRouter::add_accepter`] call, so it is actively reaped
-/// alongside the accepter tasks instead of sitting un-polled in the router.
+/// [`JoinSet`] created by [`spawn_splice_router`] is folded into the driver at
+/// construction — the driver is created together with the router (see
+/// [`ResponseRouter::new`]) — so it is actively reaped alongside the accepter
+/// tasks instead of sitting un-polled in the router.
 #[derive(Debug)]
 pub struct ResponseRouter {
     feed: SpliceRouterHandle,
-    splice_driver: Option<JoinSet<()>>,
-}
-impl Default for ResponseRouter {
-    fn default() -> Self {
-        let (feed, splice_driver) = spawn_splice_router();
-        Self {
-            feed,
-            splice_driver: Some(splice_driver),
-        }
-    }
 }
 impl ResponseRouter {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct the router together with its driver. The splice-feed
+    /// supervision is folded into the driver IMMEDIATELY, so it is actively
+    /// reaped from the start instead of sitting un-polled in the router (a
+    /// splice-supervisor panic surfaces on the driver reap, never lost).
+    pub fn new() -> (Self, ResponseRouterDriver) {
+        let (feed, splice_driver) = spawn_splice_router();
+        let mut driver = ResponseRouterDriver::new();
+        driver.fold_supervision(splice_driver);
+        (Self { feed }, driver)
     }
 
     pub fn handle(&self) -> ResponseRouterHandle {
@@ -908,61 +906,51 @@ impl ResponseRouter {
         mut accepter: DualStreamAccepter,
         driver: &mut ResponseRouterDriver,
     ) {
-        if let Some(supervision) = self.splice_driver.take() {
-            driver.fold_supervision(supervision);
-        }
         let feed = self.feed.clone();
         driver.spawn(async move {
-            let mut inner: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-            inner.spawn(async move {
-                let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
-                let mut accepting = true;
-                loop {
-                    let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
-                    let has_peeks = !peeks.is_empty();
-                    if !can_accept && !has_peeks {
-                        break;
-                    }
-                    tokio::select! {
-                        accepted = accepter.accept(), if can_accept => match accepted {
-                            Ok((reader, _writer, _lane)) => {
-                                peeks.spawn(async move {
-                                    match MigratingCapableAccepter::peek_resume_header(reader).await {
-                                        Ok(Some((true, Some(header), reader))) if header.is_response => {
-                                            Some((header, reader))
-                                        }
-                                        _ => None,
+            let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
+            let mut accepting = true;
+            loop {
+                let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
+                let has_peeks = !peeks.is_empty();
+                if !can_accept && !has_peeks {
+                    break;
+                }
+                tokio::select! {
+                    accepted = accepter.accept(), if can_accept => match accepted {
+                        Ok((reader, _writer, _lane)) => {
+                            peeks.spawn(async move {
+                                match MigratingCapableAccepter::peek_resume_header(reader).await {
+                                    Ok(Some((true, Some(header), reader))) if header.is_response => {
+                                        Some((header, reader))
                                     }
-                                });
-                            }
-                            Err(_) => accepting = false,
-                        },
-                        joined = peeks.join_next(), if has_peeks => {
-                            match joined {
-                                Some(Ok(Some((header, reader)))) => {
-                                    if feed
-                                        .send_continuation(header, Box::pin(reader) as GenerationReader)
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
+                                    _ => None,
                                 }
-                                Some(Ok(None)) => {}
-                                Some(result) => {
-                                    result.unwrap();
+                            });
+                        }
+                        Err(_) => accepting = false,
+                    },
+                    joined = peeks.join_next(), if has_peeks => {
+                        match joined {
+                            Some(Ok(Some((header, reader)))) => {
+                                if feed
+                                    .send_continuation(header, Box::pin(reader) as GenerationReader)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
                                 }
-                                None => {}
                             }
+                            Some(Ok(None)) => {}
+                            Some(result) => {
+                                result.unwrap();
+                            }
+                            None => {}
                         }
                     }
                 }
-            });
-            match inner.join_next().await {
-                Some(Ok(())) => tracing::debug!("ResponseRouter accepter task stopped"),
-                Some(result) => result.unwrap(),
-                None => unreachable!("one accepter task was inserted"),
             }
+            tracing::debug!("ResponseRouter accepter task stopped");
         });
     }
 }
@@ -988,6 +976,17 @@ impl ResponseRouterDriver {
     pub fn fold_supervision(&mut self, mut supervision: JoinSet<()>) {
         self.tasks.spawn(async move {
             while let Some(result) = supervision.join_next().await {
+                result.unwrap();
+            }
+        });
+    }
+
+    /// Fold another driver's tasks into this driver so they are reaped
+    /// together: a wrapper task drains `other`'s `JoinSet`, unwrapping every
+    /// completion so a panicked task surfaces through this driver's reap.
+    pub fn fold_driver(&mut self, mut other: ResponseRouterDriver) {
+        self.tasks.spawn(async move {
+            while let Some(result) = other.join_next().await {
                 result.unwrap();
             }
         });
@@ -1041,8 +1040,7 @@ impl ResponseRouterHandle {
 pub fn spawn_response_router(
     accepter: DualStreamAccepter,
 ) -> (ResponseRouter, ResponseRouterDriver) {
-    let mut router = ResponseRouter::new();
-    let mut driver = ResponseRouterDriver::new();
+    let (mut router, mut driver) = ResponseRouter::new();
     router.add_accepter(accepter, &mut driver);
     (router, driver)
 }

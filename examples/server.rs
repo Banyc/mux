@@ -52,12 +52,32 @@ async fn main() {
     };
     println!("accepted");
 
-    let mut res = args.file_transfer.perform(read, write).await.unwrap();
+    let transfer_fut = args.file_transfer.perform(read, write);
+    tokio::pin!(transfer_fut);
+    let res = tokio::select! {
+        res = &mut transfer_fut => res,
+        joined = mux_spawner.join_next(), if !mux_spawner.is_empty() => {
+            // The mux session ended before the transfer completed: a
+            // panicked supervision task surfaces here (JoinError unwrapped
+            // directly), and a MuxError session-end is also a failure.
+            let err = joined.expect("mux supervision task exists").unwrap();
+            panic!("mux session ended before the transfer completed: {err:?}");
+        }
+    };
+    let mut res = res.unwrap();
     res.write.shutdown().await.unwrap();
     println!("shutdown");
     let mut buf = [0; 1];
     let n = res.read.read(&mut buf).await.unwrap();
     assert_eq!(n, 0);
+
+    // The mux session only ends when the underlying transport dies (at
+    // process exit), so drain only what has ALREADY completed (surfacing any
+    // panic) instead of blocking forever; dropping the spawner at process
+    // exit aborts the rest.
+    while let Some(result) = mux_spawner.try_join_next() {
+        result.unwrap();
+    }
 
     println!("{}", res.stats);
 }

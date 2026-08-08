@@ -892,7 +892,7 @@ mod tests {
     struct SessionEnds {
         opener: StreamOpener,
         accepter: StreamAccepter,
-        _spawner: JoinSet<MuxError>,
+        spawner: JoinSet<MuxError>,
     }
 
     async fn make_session_pair(
@@ -931,14 +931,49 @@ mod tests {
             SessionEnds {
                 opener: srv_opener,
                 accepter: srv_accepter,
-                _spawner: srv_spawner,
+                spawner: srv_spawner,
             },
             SessionEnds {
                 opener: cli_opener,
                 accepter: cli_accepter,
-                _spawner: cli_spawner,
+                spawner: cli_spawner,
             },
         )
+    }
+
+    /// Actively-reaped supervision for a test: every session-supervision
+    /// completion is joined and unwrapped directly, so a panicked lane
+    /// surfaces immediately instead of being stored until the scope drops.
+    struct DualLaneScope {
+        tasks: tokio::task::JoinSet<()>,
+    }
+    impl DualLaneScope {
+        fn new() -> Self {
+            Self {
+                tasks: tokio::task::JoinSet::new(),
+            }
+        }
+        fn fold(&mut self, mut spawner: JoinSet<crate::session::MuxError>) {
+            self.tasks.spawn(async move {
+                while let Some(result) = spawner.join_next().await {
+                    result.unwrap();
+                }
+            });
+        }
+        async fn run<F: std::future::Future>(mut self, body: F) -> F::Output {
+            tokio::pin!(body);
+            loop {
+                tokio::select! {
+                    joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                        // A folded supervision wrapper ended: unwrap so a
+                        // panicked lane surfaces now; a normal completion is
+                        // the session ending (a legitimate shutdown).
+                        joined.expect("supervision wrapper task exists").unwrap();
+                    }
+                    value = &mut body => return value,
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -951,29 +986,39 @@ mod tests {
             make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, mut cli_bulk) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (_reader, mut writer) = opener.open_auto();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (_reader, mut writer) = opener.open_auto();
+                // Small write → interactive lane
+                writer.write_all(&[0xAAu8; 100]).await.unwrap();
 
-        // Small write → interactive lane
-        writer.write_all(&[0xAAu8; 100]).await.unwrap();
+                // Should arrive on interactive lane within 500ms
+                let int_res =
+                    tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept())
+                        .await;
+                assert!(
+                    int_res.is_ok(),
+                    "small write should arrive on interactive lane"
+                );
 
-        // Should arrive on interactive lane within 500ms
-        let int_res =
-            tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept()).await;
-        assert!(
-            int_res.is_ok(),
-            "small write should arrive on interactive lane"
-        );
-
-        // Bulk lane should still be empty
-        let bulk_res =
-            tokio::time::timeout(Duration::from_millis(200), cli_bulk.accepter.accept()).await;
-        assert!(
-            bulk_res.is_err(),
-            "bulk lane should not have received the small write"
-        );
+                // Bulk lane should still be empty
+                let bulk_res =
+                    tokio::time::timeout(Duration::from_millis(200), cli_bulk.accepter.accept())
+                        .await;
+                assert!(
+                    bulk_res.is_err(),
+                    "bulk lane should not have received the small write"
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -982,26 +1027,36 @@ mod tests {
             make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, mut cli_bulk) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (_reader, mut writer) = opener.open_auto();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (_reader, mut writer) = opener.open_auto();
+                // Large write → bulk lane
+                writer.write_all(&[0xBBu8; 3000]).await.unwrap();
 
-        // Large write → bulk lane
-        writer.write_all(&[0xBBu8; 3000]).await.unwrap();
+                // Should arrive on bulk lane
+                let bulk_res =
+                    tokio::time::timeout(Duration::from_millis(500), cli_bulk.accepter.accept())
+                        .await;
+                assert!(bulk_res.is_ok(), "large write should arrive on bulk lane");
 
-        // Should arrive on bulk lane
-        let bulk_res =
-            tokio::time::timeout(Duration::from_millis(500), cli_bulk.accepter.accept()).await;
-        assert!(bulk_res.is_ok(), "large write should arrive on bulk lane");
-
-        // Interactive lane should be empty
-        let int_res =
-            tokio::time::timeout(Duration::from_millis(200), cli_int.accepter.accept()).await;
-        assert!(
-            int_res.is_err(),
-            "interactive lane should not have received the large write"
-        );
+                // Interactive lane should be empty
+                let int_res =
+                    tokio::time::timeout(Duration::from_millis(200), cli_int.accepter.accept())
+                        .await;
+                assert!(
+                    int_res.is_err(),
+                    "interactive lane should not have received the large write"
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1009,23 +1064,32 @@ mod tests {
         let (srv_int, mut cli_int) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (_reader, mut writer) = opener.open_auto();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (_reader, mut writer) = opener.open_auto();
+                // Exactly the threshold → not strictly larger → interactive
+                writer
+                    .write_all(&[0xCCu8; AUTO_BULK_THRESHOLD])
+                    .await
+                    .unwrap();
 
-        // Exactly the threshold → not strictly larger → interactive
-        writer
-            .write_all(&[0xCCu8; AUTO_BULK_THRESHOLD])
-            .await
-            .unwrap();
-
-        let int_res =
-            tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept()).await;
-        assert!(
-            int_res.is_ok(),
-            "exactly-threshold write should go to interactive lane"
-        );
+                let int_res =
+                    tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept())
+                        .await;
+                assert!(
+                    int_res.is_ok(),
+                    "exactly-threshold write should go to interactive lane"
+                );
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1038,28 +1102,38 @@ mod tests {
             make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, mut cli_bulk) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (_reader, mut writer) = opener.open_auto();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (_reader, mut writer) = opener.open_auto();
+                // First write small → interactive
+                writer.write_all(&[0x01u8; 200]).await.unwrap();
+                // Second write large → still interactive (sticky)
+                writer.write_all(&[0x02u8; 5000]).await.unwrap();
 
-        // First write small → interactive
-        writer.write_all(&[0x01u8; 200]).await.unwrap();
-        // Second write large → still interactive (sticky)
-        writer.write_all(&[0x02u8; 5000]).await.unwrap();
+                // Both writes appear on the interactive lane
+                let int_res =
+                    tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept())
+                        .await;
+                assert!(int_res.is_ok(), "sticky stream must stay on interactive");
 
-        // Both writes appear on the interactive lane
-        let int_res =
-            tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept()).await;
-        assert!(int_res.is_ok(), "sticky stream must stay on interactive");
-
-        // Bulk lane should have nothing
-        let bulk_res =
-            tokio::time::timeout(Duration::from_millis(200), cli_bulk.accepter.accept()).await;
-        assert!(
-            bulk_res.is_err(),
-            "bulk lane must be empty for sticky stream"
-        );
+                // Bulk lane should have nothing
+                let bulk_res =
+                    tokio::time::timeout(Duration::from_millis(200), cli_bulk.accepter.accept())
+                        .await;
+                assert!(
+                    bulk_res.is_err(),
+                    "bulk lane must be empty for sticky stream"
+                );
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1070,13 +1144,22 @@ mod tests {
     async fn killed_liveness_propagates_to_open() {
         let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(_cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener =
+                    DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
+                liveness.kill();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
-        liveness.kill();
-
-        let result = opener.open(LaneClass::Interactive).await;
-        assert!(matches!(result, Err(DualStreamOpenError::LaneDead)));
+                let result = opener.open(LaneClass::Interactive).await;
+                assert!(matches!(result, Err(DualStreamOpenError::LaneDead)));
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1087,17 +1170,26 @@ mod tests {
     async fn dual_accept_is_cancel_safe() {
         let (srv_int, cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let mut accepter =
+                    DualStreamAccepter::new(cli_int.accepter, cli_bulk.accepter, liveness);
 
-        let liveness = Liveness::new();
-        let mut accepter = DualStreamAccepter::new(cli_int.accepter, cli_bulk.accepter, liveness);
+                // Open one stream on each lane (server-side)
+                srv_int.opener.open().await.unwrap();
+                srv_bulk.opener.open().await.unwrap();
 
-        // Open one stream on each lane (server-side)
-        srv_int.opener.open().await.unwrap();
-        srv_bulk.opener.open().await.unwrap();
-
-        // Accept one — the other must still be available afterward
-        let (_, _, _) = accepter.accept().await.unwrap();
-        let (_, _, _) = accepter.accept().await.unwrap();
+                // Accept one — the other must still be available afterward
+                let (_, _, _) = accepter.accept().await.unwrap();
+                let (_, _, _) = accepter.accept().await.unwrap();
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1109,25 +1201,34 @@ mod tests {
         let (srv_int, mut cli_int) =
             make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (_reader, mut writer) = opener.open_auto();
 
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (_reader, mut writer) = opener.open_auto();
+                // Vectored write: 1000 + 1000 = 2000 (≤ threshold) → interactive
+                let bufs = [
+                    io::IoSlice::new(&[0x01u8; 1000]),
+                    io::IoSlice::new(&[0x02u8; 1000]),
+                ];
+                let n = writer.write_vectored(&bufs).await.unwrap();
+                assert_eq!(n, 2000);
 
-        // Vectored write: 1000 + 1000 = 2000 (≤ threshold) → interactive
-        let bufs = [
-            io::IoSlice::new(&[0x01u8; 1000]),
-            io::IoSlice::new(&[0x02u8; 1000]),
-        ];
-        let n = writer.write_vectored(&bufs).await.unwrap();
-        assert_eq!(n, 2000);
-
-        let int_res =
-            tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept()).await;
-        assert!(
-            int_res.is_ok(),
-            "vectored write ≤ threshold should go to interactive"
-        );
+                let int_res =
+                    tokio::time::timeout(Duration::from_millis(500), cli_int.accepter.accept())
+                        .await;
+                assert!(
+                    int_res.is_ok(),
+                    "vectored write ≤ threshold should go to interactive"
+                );
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1241,13 +1342,21 @@ mod tests {
     async fn failed_open_on_dead_lane() {
         let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(_cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                liveness.kill();
 
-        let liveness = Liveness::new();
-        liveness.kill();
-
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let result = opener.open(LaneClass::Interactive).await;
-        assert!(matches!(result, Err(DualStreamOpenError::LaneDead)));
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let result = opener.open(LaneClass::Interactive).await;
+                assert!(matches!(result, Err(DualStreamOpenError::LaneDead)));
+            })
+            .await;
     }
 
     // -------------------------------------------------------------------
@@ -1563,25 +1672,34 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
-        let (mut reader, writer) = opener.open_auto();
-        drop(writer);
-        let mut buf = [0u8; 8];
-        assert_eq!(
-            reader
-                .read(&mut buf)
-                .await
-                .expect("clean close reads as EOF"),
-            0
-        );
-        assert_eq!(
-            reader
-                .read(&mut buf)
-                .await
-                .expect("a second read after EOF must not error"),
-            0
-        );
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(_cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness);
+                let (mut reader, writer) = opener.open_auto();
+                drop(writer);
+                let mut buf = [0u8; 8];
+                assert_eq!(
+                    reader
+                        .read(&mut buf)
+                        .await
+                        .expect("clean close reads as EOF"),
+                    0
+                );
+                assert_eq!(
+                    reader
+                        .read(&mut buf)
+                        .await
+                        .expect("a second read after EOF must not error"),
+                    0
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1623,26 +1741,36 @@ mod tests {
         use std::task::Waker;
         let (srv_int, _cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
         let (srv_bulk, _cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
-        let liveness = Liveness::new();
-        let opener = DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
-        let (_reader, mut writer) = opener.open_auto();
-        writer
-            .shutdown()
-            .expect("closing before the first write is clean");
-        assert!(liveness.is_alive(), "both lanes are still up");
-        let mut cx = Context::from_waker(Waker::noop());
-        let error = match writer.poll_write(b"late", &mut cx) {
-            Poll::Ready(Err(e)) => e,
-            other => panic!("a write after the local close must fail: {other:?}"),
-        };
-        assert!(
-            !matches!(error, AutoWriteError::LaneDead),
-            "a locally-closed writer reported LaneDead while both lanes were alive: got {error:?}"
-        );
-        assert_eq!(
-            auto_write_to_io(error).kind(),
-            io::ErrorKind::NotConnected,
-            "a locally-closed writer must read the same as a StreamWriter's own local close"
-        );
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(_cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(_cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let opener =
+                    DualStreamOpener::new(srv_int.opener, srv_bulk.opener, liveness.clone());
+                let (_reader, mut writer) = opener.open_auto();
+                writer
+                    .shutdown()
+                    .expect("closing before the first write is clean");
+                assert!(liveness.is_alive(), "both lanes are still up");
+                let mut cx = Context::from_waker(Waker::noop());
+                let error = match writer.poll_write(b"late", &mut cx) {
+                    Poll::Ready(Err(e)) => e,
+                    other => panic!("a write after the local close must fail: {other:?}"),
+                };
+                assert!(
+                    !matches!(error, AutoWriteError::LaneDead),
+                    "a locally-closed writer reported LaneDead while both lanes were alive: got {error:?}"
+                );
+                assert_eq!(
+                    auto_write_to_io(error).kind(),
+                    io::ErrorKind::NotConnected,
+                    "a locally-closed writer must read the same as a StreamWriter's own local close"
+                );
+            })
+            .await;
     }
 }

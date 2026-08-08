@@ -841,45 +841,51 @@ mod reassembly_tests {
     #[tokio::test]
     async fn full_stream_read_queue_resets_only_that_stream() {
         let mut rig = central_read_rig(false);
-        let _blocked_rx = open_test_stream(&mut rig.control, 1).await;
-        let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
-        let mut queued = 0;
-        loop {
-            let result = rig
-                .control
-                .dispatcher(1)
-                .unwrap()
-                .try_send_data(buf(&[0xAA]));
-            match result {
-                Ok(()) => queued += 1,
-                Err(_) => break,
-            }
-        }
-        assert!(queued > 0);
-        rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[0xBB])))
-            .await
-            .unwrap();
-        assert!(!rig.control.stream_table.contains_key(&1));
-        assert!(matches!(
-            rig.write_control_rx.recv().await.unwrap(),
-            WriteControlMsg::CloseRead(1)
-        ));
-        assert!(matches!(
-            rig.write_control_rx.recv().await.unwrap(),
-            WriteControlMsg::ForceCloseWrite(1)
-        ));
-        assert!(
-            timeout(Duration::from_millis(10), rig.write_control_rx.recv())
-                .await
-                .is_err(),
-            "overflow abort must emit exactly CloseRead then ForceCloseWrite"
-        );
-        rig.control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
-        let msg = sibling_rx.try_recv().expect("sibling data must progress");
-        match msg {
-            StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
-            other => panic!("expected sibling Data, got {other:?}"),
-        }
+        let mut scope = TestScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                let _blocked_rx = open_test_stream(&mut rig.control, 1).await;
+                let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
+                let mut queued = 0;
+                loop {
+                    let result = rig
+                        .control
+                        .dispatcher(1)
+                        .unwrap()
+                        .try_send_data(buf(&[0xAA]));
+                    match result {
+                        Ok(()) => queued += 1,
+                        Err(_) => break,
+                    }
+                }
+                assert!(queued > 0);
+                rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[0xBB])))
+                    .await
+                    .unwrap();
+                assert!(!rig.control.stream_table.contains_key(&1));
+                assert!(matches!(
+                    rig.write_control_rx.recv().await.unwrap(),
+                    WriteControlMsg::CloseRead(1)
+                ));
+                assert!(matches!(
+                    rig.write_control_rx.recv().await.unwrap(),
+                    WriteControlMsg::ForceCloseWrite(1)
+                ));
+                assert!(
+                    timeout(Duration::from_millis(10), rig.write_control_rx.recv())
+                        .await
+                        .is_err(),
+                    "overflow abort must emit exactly CloseRead then ForceCloseWrite"
+                );
+                rig.control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
+                let msg = sibling_rx.try_recv().expect("sibling data must progress");
+                match msg {
+                    StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+                    other => panic!("expected sibling Data, got {other:?}"),
+                }
+            })
+            .await;
     }
 
     /// Stream A has a gap (frame at offset 0 missing); stream B's
@@ -1394,7 +1400,7 @@ mod reassembly_tests {
         write_control_tx: WriteControlTx,
         write_control_rx: crate::central_io::scheduler::WriteControlRx,
         _open_tx: crate::stream::opener::StreamOpenTx,
-        _drain: tokio::task::JoinSet<()>,
+        drain: tokio::task::JoinSet<()>,
     }
     impl CentralReadRig {
         fn drop_accepter(&mut self) {
@@ -1431,68 +1437,116 @@ mod reassembly_tests {
             write_control_tx,
             write_control_rx,
             _open_tx,
-            _drain,
+            drain: _drain,
+        }
+    }
+
+    /// Actively-reaped supervision for a test: every rig-supervision
+    /// completion is joined and unwrapped directly, so a panicked task
+    /// surfaces immediately instead of being stored until the scope drops.
+    struct TestScope {
+        tasks: tokio::task::JoinSet<()>,
+    }
+    impl TestScope {
+        fn new() -> Self {
+            Self {
+                tasks: tokio::task::JoinSet::new(),
+            }
+        }
+        fn fold(&mut self, mut drain: tokio::task::JoinSet<()>) {
+            self.tasks.spawn(async move {
+                while let Some(result) = drain.join_next().await {
+                    result.unwrap();
+                }
+            });
+        }
+        async fn run<F: std::future::Future>(mut self, body: F) -> F::Output {
+            tokio::pin!(body);
+            loop {
+                tokio::select! {
+                    joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                        // A folded supervision wrapper ended: unwrap so a
+                        // panicked task surfaces now; a normal completion is
+                        // a legitimate shutdown (e.g. the write-data drain
+                        // ending when the control is dropped).
+                        joined.expect("supervision wrapper task exists").unwrap();
+                    }
+                    value = &mut body => return value,
+                }
+            }
         }
     }
 
     #[tokio::test]
     async fn a_stalled_reader_does_not_freeze_the_other_streams() {
         let mut rig = central_read_rig(true);
-        rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
-        let _stalled = rig.accept_rx.recv().await.unwrap();
-        for i in 0..1100u32 {
-            timeout(
-                Duration::from_secs(3),
-                rig.deliver(CentralIoReadMsg::Data(1, i, buf(&[7]))),
-            )
-            .await
-            .expect("a stalled stream reader blocked the session control loop")
-            .unwrap();
-        }
-        rig.deliver(CentralIoReadMsg::Open(2)).await.unwrap();
-        let live = rig.accept_rx.recv().await.unwrap();
-        timeout(
-            Duration::from_secs(3),
-            rig.deliver(CentralIoReadMsg::Data(2, 0, buf(b"hello"))),
-        )
-        .await
-        .expect("a stalled stream reader blocked a sibling stream")
-        .unwrap();
-        let mut got = [0u8; 5];
-        let n = timeout(
-            Duration::from_secs(3),
-            tokio::io::AsyncReadExt::read(&mut { live }.reader, &mut got),
-        )
-        .await
-        .expect("the sibling stream's reader never woke")
-        .unwrap();
-        assert_eq!(&got[..n], b"hello");
+        let mut scope = TestScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
+                let _stalled = rig.accept_rx.recv().await.unwrap();
+                for i in 0..1100u32 {
+                    timeout(
+                        Duration::from_secs(3),
+                        rig.deliver(CentralIoReadMsg::Data(1, i, buf(&[7]))),
+                    )
+                    .await
+                    .expect("a stalled stream reader blocked the session control loop")
+                    .unwrap();
+                }
+                rig.deliver(CentralIoReadMsg::Open(2)).await.unwrap();
+                let live = rig.accept_rx.recv().await.unwrap();
+                timeout(
+                    Duration::from_secs(3),
+                    rig.deliver(CentralIoReadMsg::Data(2, 0, buf(b"hello"))),
+                )
+                .await
+                .expect("a stalled stream reader blocked a sibling stream")
+                .unwrap();
+                let mut got = [0u8; 5];
+                let n = timeout(
+                    Duration::from_secs(3),
+                    tokio::io::AsyncReadExt::read(&mut { live }.reader, &mut got),
+                )
+                .await
+                .expect("the sibling stream's reader never woke")
+                .unwrap();
+                assert_eq!(&got[..n], b"hello");
+            })
+            .await;
     }
 
     async fn drive_until_close(frames: usize) -> (Vec<u8>, io::Result<usize>) {
         let mut rig = central_read_rig(false);
-        rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
-        let mut reader = rig.accept_rx.recv().await.unwrap().reader;
-        for _ in 0..frames {
-            rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[7])))
+        let mut scope = TestScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
+                let mut reader = rig.accept_rx.recv().await.unwrap().reader;
+                for _ in 0..frames {
+                    rig.deliver(CentralIoReadMsg::Data(1, 0, buf(&[7])))
+                        .await
+                        .unwrap();
+                }
+                timeout(
+                    Duration::from_secs(3),
+                    rig.deliver(CentralIoReadMsg::Close(1, Side::Write, 0)),
+                )
                 .await
+                .expect("CloseWrite waited on a full read queue, freezing the session")
                 .unwrap();
-        }
-        timeout(
-            Duration::from_secs(3),
-            rig.deliver(CentralIoReadMsg::Close(1, Side::Write, 0)),
-        )
-        .await
-        .expect("CloseWrite waited on a full read queue, freezing the session")
-        .unwrap();
-        let mut got = Vec::new();
-        let res = timeout(
-            Duration::from_secs(3),
-            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut got),
-        )
-        .await
-        .expect("the reader never reached the end of its stream - it was told neither");
-        (got, res)
+                let mut got = Vec::new();
+                let res = timeout(
+                    Duration::from_secs(3),
+                    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut got),
+                )
+                .await
+                .expect("the reader never reached the end of its stream - it was told neither");
+                (got, res)
+            })
+            .await
     }
 
     #[tokio::test]
@@ -1562,74 +1616,94 @@ mod reassembly_tests {
     async fn stray_frame_for_a_local_id_fabricates_no_stream() {
         for reassembly in [true, false] {
             let mut rig = central_read_rig(reassembly);
-            let local_id: StreamId = 1 << (StreamId::BITS - 1);
-            assert!(rig.control.is_local_id_space(local_id));
-            for msg in [
-                CentralIoReadMsg::Open(local_id),
-                CentralIoReadMsg::Data(local_id, 0, buf(&[0xAA])),
-                CentralIoReadMsg::Close(local_id, Side::Write, 1),
-            ] {
-                let described = format!("{msg:?}");
-                rig.deliver(msg).await.unwrap();
-                assert!(
-                    !rig.control.stream_table.contains_key(&local_id),
-                    "{described} (reassembly={reassembly}) created a stream on an id only our own `open` allocates"
-                );
-                assert!(
-                    rig.accept_rx.try_recv().is_err(),
-                    "{described} (reassembly={reassembly}) handed the application a phantom accepted stream on an id it opens itself"
-                );
-            }
+            let mut scope = TestScope::new();
+            scope.fold(std::mem::take(&mut rig.drain));
+            scope
+                .run(async {
+                    let local_id: StreamId = 1 << (StreamId::BITS - 1);
+                    assert!(rig.control.is_local_id_space(local_id));
+                    for msg in [
+                        CentralIoReadMsg::Open(local_id),
+                        CentralIoReadMsg::Data(local_id, 0, buf(&[0xAA])),
+                        CentralIoReadMsg::Close(local_id, Side::Write, 1),
+                    ] {
+                        let described = format!("{msg:?}");
+                        rig.deliver(msg).await.unwrap();
+                        assert!(
+                            !rig.control.stream_table.contains_key(&local_id),
+                            "{described} (reassembly={reassembly}) created a stream on an id only our own `open` allocates"
+                        );
+                        assert!(
+                            rig.accept_rx.try_recv().is_err(),
+                            "{described} (reassembly={reassembly}) handed the application a phantom accepted stream on an id it opens itself"
+                        );
+                    }
+                })
+                .await;
         }
     }
 
     #[tokio::test]
     async fn peer_open_cannot_replace_a_live_local_stream() {
         let mut rig = central_read_rig(false);
-        let (tx, mut local_rx) = stream_read_data_channel();
-        let (local_id, _write_tx) = rig
-            .control
-            .open(StreamDispatcher::new(tx), PeerReadClosedFlag::new(), None)
-            .await
-            .unwrap();
-        assert!(rig.control.is_local_id_space(local_id));
-        rig.deliver(CentralIoReadMsg::Open(local_id)).await.unwrap();
-        assert!(
-            rig.accept_rx.try_recv().is_err(),
-            "a peer 'Open' for an id we allocated was accepted as a new inbound stream"
-        );
-        rig.control
-            .try_dispatch_data(local_id, buf(&[0xCC]))
-            .unwrap();
-        let msg = local_rx.try_recv().expect(
-            "the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
-        match msg {
-            StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
-            other => panic!("expected Data, got {other:?}"),
-        }
+        let mut scope = TestScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                let (tx, mut local_rx) = stream_read_data_channel();
+                let (local_id, _write_tx) = rig
+                    .control
+                    .open(StreamDispatcher::new(tx), PeerReadClosedFlag::new(), None)
+                    .await
+                    .unwrap();
+                assert!(rig.control.is_local_id_space(local_id));
+                rig.deliver(CentralIoReadMsg::Open(local_id)).await.unwrap();
+                assert!(
+                    rig.accept_rx.try_recv().is_err(),
+                    "a peer 'Open' for an id we allocated was accepted as a new inbound stream"
+                );
+                rig.control
+                    .try_dispatch_data(local_id, buf(&[0xCC]))
+                    .unwrap();
+                let msg = local_rx.try_recv().expect(
+                    "the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
+                match msg {
+                    StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+                    other => panic!("expected Data, got {other:?}"),
+                }
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn duplicate_peer_open_cannot_replace_a_live_stream() {
         for reassembly in [false, true] {
             let mut rig = central_read_rig(reassembly);
-            let peer_id: StreamId = 7;
-            assert!(!rig.control.is_local_id_space(peer_id));
-            let mut peer_rx = open_test_stream(&mut rig.control, peer_id).await;
-            rig.deliver(CentralIoReadMsg::Open(peer_id)).await.unwrap();
-            assert!(
-                rig.accept_rx.try_recv().is_err(),
-                "(reassembly={reassembly}) a duplicate peer 'Open' was accepted as a second inbound stream on an id that is already live"
-            );
-            rig.control
-                .try_dispatch_data(peer_id, buf(&[0xCC]))
-                .unwrap();
-            let msg = peer_rx.try_recv().unwrap_or_else(|_| panic!(
-                "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"));
-            match msg {
-                StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
-                other => panic!("expected Data, got {other:?}"),
-            }
+            let mut scope = TestScope::new();
+            scope.fold(std::mem::take(&mut rig.drain));
+            scope
+                .run(async {
+                    let peer_id: StreamId = 7;
+                    assert!(!rig.control.is_local_id_space(peer_id));
+                    let mut peer_rx = open_test_stream(&mut rig.control, peer_id).await;
+                    rig.deliver(CentralIoReadMsg::Open(peer_id))
+                        .await
+                        .unwrap();
+                    assert!(
+                        rig.accept_rx.try_recv().is_err(),
+                        "(reassembly={reassembly}) a duplicate peer 'Open' was accepted as a second inbound stream on an id that is already live"
+                    );
+                    rig.control
+                        .try_dispatch_data(peer_id, buf(&[0xCC]))
+                        .unwrap();
+                    let msg = peer_rx.try_recv().unwrap_or_else(|_| panic!(
+                        "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"));
+                    match msg {
+                        StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
+                        other => panic!("expected Data, got {other:?}"),
+                    }
+                })
+                .await;
         }
     }
 
@@ -1644,33 +1718,45 @@ mod reassembly_tests {
         ] {
             let described = format!("{msg:?}");
             let mut rig = central_read_rig(reassembly);
-            rig.drop_accepter();
-            let _ = rig.deliver(msg).await;
-            assert!(
-                !rig.control.stream_table.contains_key(&peer_id),
-                "{described} (reassembly={reassembly}) left a stream in the table that no reader or writer can ever close - the peer leaks one entry per stream it opens"
-            );
+            let mut scope = TestScope::new();
+            scope.fold(std::mem::take(&mut rig.drain));
+            scope
+                .run(async {
+                    rig.drop_accepter();
+                    let _ = rig.deliver(msg).await;
+                    assert!(
+                        !rig.control.stream_table.contains_key(&peer_id),
+                        "{described} (reassembly={reassembly}) left a stream in the table that no reader or writer can ever close - the peer leaks one entry per stream it opens"
+                    );
+                })
+                .await;
         }
     }
 
     #[tokio::test]
     async fn a_repeated_reassembly_error_emits_one_close_read() {
         let mut rig = central_read_rig(true);
-        let _reader_rx = open_test_stream(&mut rig.control, 7).await;
-        for _ in 0..3 {
-            rig.deliver(CentralIoReadMsg::Data(7, 0xFFFF_FFFF, buf(&[0xAA; 4])))
-                .await
-                .unwrap();
-        }
-        assert!(matches!(
-            rig.write_control_rx.recv().await.unwrap(),
-            WriteControlMsg::CloseRead(7)
-        ));
-        assert!(
-            timeout(Duration::from_millis(10), rig.write_control_rx.recv())
-                .await
-                .is_err(),
-            "every stray frame after the teardown amplified into another CloseRead on the session-wide control lane"
-        );
+        let mut scope = TestScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                let _reader_rx = open_test_stream(&mut rig.control, 7).await;
+                for _ in 0..3 {
+                    rig.deliver(CentralIoReadMsg::Data(7, 0xFFFF_FFFF, buf(&[0xAA; 4])))
+                        .await
+                        .unwrap();
+                }
+                assert!(matches!(
+                    rig.write_control_rx.recv().await.unwrap(),
+                    WriteControlMsg::CloseRead(7)
+                ));
+                assert!(
+                    timeout(Duration::from_millis(10), rig.write_control_rx.recv())
+                        .await
+                        .is_err(),
+                    "every stray frame after the teardown amplified into another CloseRead on the session-wide control lane"
+                );
+            })
+            .await;
     }
 }
