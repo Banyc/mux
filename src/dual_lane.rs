@@ -944,6 +944,8 @@ mod tests {
     /// Actively-reaped supervision for a test: every session-supervision
     /// completion is joined and unwrapped directly, so a panicked lane
     /// surfaces immediately instead of being stored until the scope drops.
+    /// A session ending with a MuxError before the body completes is
+    /// equally a failure: the folded supervision panics on it too.
     struct DualLaneScope {
         tasks: tokio::task::JoinSet<()>,
     }
@@ -956,7 +958,11 @@ mod tests {
         fn fold(&mut self, mut spawner: JoinSet<crate::session::MuxError>) {
             self.tasks.spawn(async move {
                 while let Some(result) = spawner.join_next().await {
-                    result.unwrap();
+                    // An actor panic surfaces through the JoinError unwrap;
+                    // a MuxError session-end before the body completes is
+                    // equally a failure.
+                    let err = result.unwrap();
+                    panic!("mux session ended before the test body completed: {err:?}");
                 }
             });
         }
@@ -965,9 +971,11 @@ mod tests {
             loop {
                 tokio::select! {
                     joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                        // A folded supervision wrapper ended: unwrap so a
-                        // panicked lane surfaces now; a normal completion is
-                        // the session ending (a legitimate shutdown).
+                        // A folded supervision wrapper only ever ends by
+                        // panicking: either a lane actor panic surfaced
+                        // through the fold's unwrap, or a session ended
+                        // with a MuxError before the body completed.
+                        // Re-raise the wrapper's panic here.
                         joined.expect("supervision wrapper task exists").unwrap();
                     }
                     value = &mut body => return value,
