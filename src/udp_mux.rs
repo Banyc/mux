@@ -113,14 +113,24 @@ pub struct UdpMuxWriter<W> {
     /// Encoded bytes of a frame whose write was cancelled partway. The
     /// next `send` (or `shutdown`) finishes this frame before writing the
     /// next one, so the peer never continues a damaged frame with a fresh
-    /// length prefix.
+    /// length prefix. Bytes already flushed are tracked by
+    /// [`Self::pending_offset`] and never moved.
     pending: Vec<u8>,
+    /// Number of bytes of `pending` already written to `inner`. Persists
+    /// across cancelled flushes; reset to zero once the frame is done.
+    pending_offset: usize,
+    /// Set once a non-`Interrupted` I/O error was observed while flushing.
+    /// The in-flight frame is unrecoverable, so future sends are rejected
+    /// instead of transmitting a datagram whose caller already got `Err`.
+    poisoned: bool,
 }
 impl<W> UdpMuxWriter<W> {
     pub fn new(inner: W) -> Self {
         Self {
             inner,
             pending: Vec::new(),
+            pending_offset: 0,
+            poisoned: false,
         }
     }
     pub fn into_inner(self) -> W {
@@ -132,24 +142,36 @@ where
     W: AsyncWrite + Unpin,
 {
     /// Write out the bytes of a frame whose write was cancelled partway,
-    /// resuming from where it stopped. No-op when nothing is pending.
-    /// Written bytes are drained from `self.pending` as they go, so a
-    /// cancelled call leaves only the unsent tail behind.
+    /// resuming from `self.pending_offset`. No-op when nothing is pending.
+    /// Only `Interrupted` is retried; any other error poisons the writer
+    /// and is returned so the caller never retransmits a frame whose
+    /// failure it has already been told about.
     async fn flush_pending(&mut self) -> io::Result<()> {
-        while !self.pending.is_empty() {
-            let n = self.inner.write(&self.pending).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "UDP mux stream rejected a frame write",
-                ));
-            }
-            if n == self.pending.len() {
-                self.pending.clear();
-            } else {
-                self.pending.drain(..n);
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UDP mux writer poisoned by a previous I/O error",
+            ));
+        }
+        while self.pending_offset < self.pending.len() {
+            match self.inner.write(&self.pending[self.pending_offset..]).await {
+                Ok(0) => {
+                    self.poisoned = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "UDP mux stream rejected a frame write",
+                    ));
+                }
+                Ok(n) => self.pending_offset += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
             }
         }
+        self.pending.clear();
+        self.pending_offset = 0;
         Ok(())
     }
 
@@ -168,8 +190,9 @@ where
         self.flush_pending().await?;
         // Encode the whole frame up front: there is no await point between
         // the length prefix and the payload, and cancellation only ever
-        // discards progress recorded in `self.pending`.
+        // discards progress recorded in `self.pending`/`self.pending_offset`.
         self.pending.clear();
+        self.pending_offset = 0;
         self.pending.extend_from_slice(&len.to_be_bytes());
         self.pending.extend_from_slice(payload);
         self.flush_pending().await?;
@@ -183,7 +206,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
     use tokio::io::duplex;
     #[tokio::test]
     async fn preserves_empty_and_non_empty_datagram_boundaries() {
@@ -374,7 +401,8 @@ mod tests {
         }
         // The next send finishes the damaged frame first, then writes the
         // new one; the peer must see two intact datagrams.
-        let send_task = tokio::spawn(async move { tx.send(b"x").await.unwrap() });
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { tx.send(b"x").await.unwrap() });
         let mut buf = [0; 16];
         let n = rx.recv(&mut buf).await.unwrap();
         assert_eq!(n, 5);
@@ -382,7 +410,35 @@ mod tests {
         let n = rx.recv(&mut buf).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(&buf[..n], b"x");
-        assert_eq!(send_task.await.unwrap(), 1);
+        // Unwrap join_next so a panicked or cancelled task cascades into
+        // this test instead of being silently dropped.
+        assert_eq!(tasks.join_next().await.unwrap().unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn interrupted_writes_are_retried_without_poisoning() {
+        let mut tx = UdpMuxWriter::new(RecordingWriter {
+            written: Vec::new(),
+            interrupt_once: true,
+            hard_fail: false,
+        });
+        tx.send(b"x").await.unwrap();
+        let writer = tx.into_inner();
+        assert_eq!(writer.written, [0, 1, b'x']);
+    }
+    #[tokio::test]
+    async fn a_writer_is_poisoned_after_a_non_interrupted_error() {
+        let mut tx = UdpMuxWriter::new(RecordingWriter {
+            written: Vec::new(),
+            interrupt_once: false,
+            hard_fail: true,
+        });
+        // The first send reports the underlying failure...
+        let error = tx.send(b"x").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        // ...and future sends are rejected instead of retransmitting the
+        // damaged frame whose caller already saw the error.
+        let error = tx.send(b"y").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
     #[tokio::test]
     async fn rejects_a_datagram_larger_than_udp_can_carry() {
@@ -394,5 +450,36 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Records written bytes and can inject a single `Interrupted` or a
+    /// hard failure, to exercise the writer's retry/poisoning policy.
+    struct RecordingWriter {
+        written: Vec<u8>,
+        interrupt_once: bool,
+        hard_fail: bool,
+    }
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.hard_fail {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")));
+            }
+            if self.interrupt_once {
+                self.interrupt_once = false;
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted, "try again")));
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }
