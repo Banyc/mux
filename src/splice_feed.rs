@@ -255,9 +255,11 @@ mod tests {
     }
 
     // A panic in a supervised child propagates through the supervisor (via
-    // unwrap on the joined result) and surfaces as a panic on the outer
-    // JoinSet reap, instead of being downgraded to a state observation.
+    // unwrap on the joined result) and cascades into this test with the
+    // child's original message, instead of being downgraded to a state
+    // observation or inspected as a JoinError.
     #[tokio::test]
+    #[should_panic(expected = "intentional splice supervisor child panic")]
     async fn splice_child_panic_propagates_through_the_supervisor() {
         let (state_tx, _state_rx) = watch::channel(SpliceRouterState::Running);
         let child: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> = Box::pin(async move {
@@ -266,15 +268,7 @@ mod tests {
             SpliceTaskExit::MatcherDone
         });
         let mut supervision = spawn_splice_supervisor(vec![child], state_tx);
-        let joined = supervision
-            .join_next()
-            .await
-            .expect("the supervisor task never produced a result");
-        let err = joined.expect_err("a panicked child must surface as a JoinError");
-        assert!(
-            err.is_panic(),
-            "the supervisor's reap must surface the child's panic"
-        );
+        supervision.join_next().await.unwrap().unwrap();
     }
 
     // A closed registration channel surfaces as an Err from await_gene so

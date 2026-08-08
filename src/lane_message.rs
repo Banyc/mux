@@ -524,11 +524,26 @@ mod tests {
             self.tasks.spawn(task);
         }
 
+        /// Spawn a task that must stay alive for the whole [`Self::run`] body.
+        /// A normal completion while the body is still running panics the test
+        /// with a message naming the task (the wrapper turns the completion
+        /// into a panic); a panic inside the future propagates unchanged.
+        fn spawn_required(
+            &mut self,
+            name: &'static str,
+            future: impl std::future::Future<Output = ()> + Send + 'static,
+        ) {
+            self.tasks.spawn(async move {
+                future.await;
+                panic!("required task '{name}' exited before the test body completed");
+            });
+        }
+
         async fn run<F: std::future::Future>(&mut self, body: F) -> F::Output {
             tokio::pin!(body);
             loop {
                 tokio::select! {
-                    value = &mut body => return value,
+                    biased;
                     joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
                         // A background task exited before the body. Re-raise
                         // any panic it surfaced immediately; a normal
@@ -537,6 +552,15 @@ mod tests {
                         // drained silently.
                         let joined = joined.expect("background task exists");
                         joined.expect("a background task panicked");
+                    }
+                    value = &mut body => {
+                        // The body completed. Drain tasks that exited in the
+                        // same poll cycle so a required task that ended right
+                        // as the body finished still fails the test.
+                        while let Some(joined) = self.tasks.try_join_next() {
+                            joined.expect("a background task panicked");
+                        }
+                        return value;
                     }
                 }
             }
@@ -1203,6 +1227,7 @@ mod tests {
     /// message, silently losing data. Now the panic is re-raised so the bug
     /// surfaces at the call site instead of hiding as a missing message.
     #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(expected = "simulated read-task panic")]
     async fn recv_propagates_panic_from_a_read_task() {
         let (_opener, accepter, mut scope) = paired_sessions().await;
         scope
@@ -1216,17 +1241,9 @@ mod tests {
                     panic!("simulated read-task panic");
                 });
 
-                // `recv` should propagate the panic. Run it in a spawned task
-                // and assert the spawn surfaces a `JoinError` (panic), since
-                // `recv` itself is not `catch_unwind`-compatible without
-                // `futures`.
-                let mut recv_tasks = JoinSet::new();
-                recv_tasks.spawn(async move { rx.recv().await });
-                let join_result = recv_tasks.join_next().await.unwrap();
-                assert!(
-                    join_result.is_err(),
-                    "recv must propagate a panicked read task instead of swallowing it"
-                );
+                // `recv` re-raises the panicked read task, so the panic
+                // cascades into this test with the original message.
+                let _ = rx.recv().await;
             })
             .await;
     }
