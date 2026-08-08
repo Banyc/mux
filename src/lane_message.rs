@@ -637,21 +637,16 @@ mod tests {
         mut int: JoinSet<crate::session::MuxError>,
         mut bulk: JoinSet<crate::session::MuxError>,
     ) -> crate::session::MuxError {
-        loop {
-            if int.is_empty() && bulk.is_empty() {
-                break;
-            }
-            tokio::select! {
-                joined = int.join_next(), if !int.is_empty() => {
-                    return joined.unwrap().unwrap();
-                }
-                joined = bulk.join_next(), if !bulk.is_empty() => {
-                    return joined.unwrap().unwrap();
-                }
-            }
+        // Every select branch returns, so this runs at most once; the only
+        // non-returning path is both lanes already drained.
+        if int.is_empty() && bulk.is_empty() {
+            return crate::session::MuxError::TaskStopped {
+                task: "test_session",
+            };
         }
-        crate::session::MuxError::TaskStopped {
-            task: "test_session",
+        tokio::select! {
+            joined = int.join_next(), if !int.is_empty() => joined.unwrap().unwrap(),
+            joined = bulk.join_next(), if !bulk.is_empty() => joined.unwrap().unwrap(),
         }
     }
 
