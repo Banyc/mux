@@ -21,51 +21,71 @@ impl<R> UdpMuxReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    /// Read exactly `buf.len()` bytes, distinguishing a clean close from
-    /// truncated framing.
-    ///
-    /// Returns `UnexpectedEof` only when EOF arrives *before any byte* of
-    /// the requested slice, i.e. the peer closed its write half at a
-    /// datagram boundary. EOF after a partial read means the frame was cut
-    /// short (a cancelled send, a killed peer, or a mangled stream) and is
-    /// reported as `InvalidData` so callers can tell truncation apart from
-    /// a clean close instead of silently dropping a corrupt datagram.
-    async fn read_exact_frame(&mut self, buf: &mut [u8]) -> io::Result<()> {
+    /// Read exactly `buf.len()` bytes, returning how many were read if EOF
+    /// arrived first (`< buf.len()`). Non-EOF I/O errors propagate. The
+    /// caller decides whether an early EOF is a clean close or truncated
+    /// framing based on how much of a datagram was already committed.
+    async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut filled = 0;
         while filled < buf.len() {
             let n = self.inner.read(&mut buf[filled..]).await?;
             if n == 0 {
-                return if filled == 0 {
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "UDP mux stream closed between datagrams",
-                    ))
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "truncated UDP mux datagram: read {filled} of {} bytes before EOF",
-                            buf.len()
-                        ),
-                    ))
-                };
+                return Ok(filled);
             }
             filled += n;
         }
-        Ok(())
+        Ok(buf.len())
     }
 
     pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut len = [0; LENGTH_PREFIX_LEN];
-        self.read_exact_frame(&mut len).await?;
+        let n = self.read_exact(&mut len).await?;
+        if n < LENGTH_PREFIX_LEN {
+            // The clean-close check happens only here, before any byte of
+            // a new datagram is committed: EOF at the start of the length
+            // prefix is a clean close at a datagram boundary, while EOF
+            // after a partial prefix already truncated the datagram.
+            return Err(if n == 0 {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "UDP mux stream closed between datagrams",
+                )
+            } else {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "truncated UDP mux datagram length prefix: read {n} of {LENGTH_PREFIX_LEN} bytes before EOF"
+                    ),
+                )
+            });
+        }
         let datagram_len = u16::from_be_bytes(len) as usize;
         let copied = datagram_len.min(buf.len());
-        self.read_exact_frame(&mut buf[..copied]).await?;
+        // The datagram is committed: any EOF from here on, including
+        // before the first payload byte or at a discard-chunk boundary,
+        // is truncated framing, never a clean close.
+        let n = self.read_exact(&mut buf[..copied]).await?;
+        if n < copied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "truncated UDP mux datagram: read {n} of {copied} payload bytes before EOF"
+                ),
+            ));
+        }
         let mut remaining = datagram_len - copied;
         let mut discard = [0; 2048];
         while remaining > 0 {
             let chunk = remaining.min(discard.len());
-            self.read_exact_frame(&mut discard[..chunk]).await?;
+            let n = self.read_exact(&mut discard[..chunk]).await?;
+            if n < chunk {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "truncated UDP mux datagram: read {n} of {chunk} tail bytes before EOF"
+                    ),
+                ));
+            }
             remaining -= chunk;
         }
         Ok(copied)
@@ -194,6 +214,38 @@ mod tests {
         left_write.shutdown().await.unwrap();
         drop(left_write);
         let error = rx.recv(&mut [0; 8]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    #[tokio::test]
+    async fn eof_after_full_length_prefix_but_before_payload_is_truncation() {
+        let (left, right) = duplex(128);
+        let (_left_read, mut left_write) = tokio::io::split(left);
+        let (right_read, _right_write) = tokio::io::split(right);
+        let mut rx = UdpMuxReader::new(right_read);
+        // Full length prefix claiming 5 bytes, then the writer dies before
+        // any payload byte arrives: committed to a datagram, so this must
+        // be truncation, not a clean close.
+        left_write.write_all(&[0, 5]).await.unwrap();
+        left_write.shutdown().await.unwrap();
+        drop(left_write);
+        let error = rx.recv(&mut [0; 8]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    #[tokio::test]
+    async fn eof_between_payload_and_tail_bytes_is_truncation() {
+        let (left, right) = duplex(128);
+        let (_left_read, mut left_write) = tokio::io::split(left);
+        let (right_read, _right_write) = tokio::io::split(right);
+        let mut rx = UdpMuxReader::new(right_read);
+        // Datagram of 5 bytes with a 4-byte caller buffer: 4 payload bytes
+        // arrive, then the writer dies before the 5th (discarded tail)
+        // byte. EOF lands exactly at a discard-chunk boundary and must
+        // still be truncation.
+        left_write.write_all(&[0, 5]).await.unwrap();
+        left_write.write_all(b"abcd").await.unwrap();
+        left_write.shutdown().await.unwrap();
+        drop(left_write);
+        let error = rx.recv(&mut [0; 4]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
     #[tokio::test]
