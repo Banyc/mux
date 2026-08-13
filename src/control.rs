@@ -22,7 +22,7 @@ use crate::{
         DeadStreamInit, StreamCloseMsg, StreamCloseTxPrototype, StreamInitChannels,
         accepter::StreamPair,
         opener::StreamOpenMsg,
-        reader::{StreamReadDataMsg, StreamReadDataTx, stream_read_data_channel},
+        reader::{StreamDispatcher, StreamReadQueueFull, stream_read_channel},
         stream_close_channel,
         writer::LiveStreamWriter,
     },
@@ -230,7 +230,7 @@ async fn handle_central_read(
                         .send(WriteControlMsg::CloseRead(stream_id))
                         .await;
                 }
-            } else if control.try_dispatch_data(stream_id, data_buf).is_err() {
+            } else if control.dispatch_data(stream_id, data_buf).is_err() {
                 let _ = write_control_tx
                     .send(WriteControlMsg::CloseRead(stream_id))
                     .await;
@@ -247,53 +247,15 @@ enum HandleCentralReadError {
     DeadCentralIo(DeadCentralIo),
     DeadStreamInit(DeadStreamInit),
 }
-#[derive(Debug)]
-struct StreamReadQueueFull;
-
-/// A stream read dispatcher that owns the FIN-headroom reservation
-/// structurally. `try_send_data` refuses once only one slot remains, so a
-/// terminal `try_send_terminal` always fits — `Full` there would mean the
-/// reservation was broken, which panics as a backstop rather than as the
-/// normal failure path.
-#[derive(Debug, Clone)]
-pub struct StreamDispatcher {
-    tx: StreamReadDataTx,
-}
-impl StreamDispatcher {
-    fn new(tx: StreamReadDataTx) -> Self {
-        Self { tx }
-    }
-    fn try_send_data(&self, data: crate::central_io::DataBuf) -> Result<(), StreamReadQueueFull> {
-        if self.tx.capacity() <= 1 {
-            return Err(StreamReadQueueFull);
-        }
-        match self.tx.try_send(StreamReadDataMsg::Data(data)) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
-        }
-    }
-    fn try_send_terminal(&self, msg: StreamReadDataMsg) {
-        match self.tx.try_send(msg) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => panic!(
-                "terminal Fin/Error must fit: try_send_data reserves one headroom slot for it"
-            ),
-        }
-    }
-}
 async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
     stream_id: Option<StreamId>,
 ) -> Result<(StreamId, StreamPair), ControlOpenError> {
     let peer_read_closed = PeerReadClosedFlag::new();
-    let (stream_read_data_tx, stream_read_data_rx) = stream_read_data_channel();
+    let (stream_read_dispatcher, stream_read_data_rx) = stream_read_channel();
     let (stream_id, stream_write_data_tx) = control
-        .open(
-            StreamDispatcher::new(stream_read_data_tx),
-            peer_read_closed.clone(),
-            stream_id,
-        )
+        .open(stream_read_dispatcher, peer_read_closed.clone(), stream_id)
         .await?;
     let stream_reader = StreamReader::new(
         stream_read_data_rx,
@@ -429,7 +391,7 @@ impl MuxControl {
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamDispatcher> {
         self.stream_table.get(&stream_id)?.open_read_sink()
     }
-    fn try_dispatch_data(
+    fn dispatch_data(
         &mut self,
         stream_id: StreamId,
         data: crate::central_io::DataBuf,
@@ -440,7 +402,7 @@ impl MuxControl {
         let Some(dispatcher) = self.dispatcher(stream_id) else {
             return Ok(());
         };
-        match dispatcher.try_send_data(data) {
+        match dispatcher.send_data(data) {
             Ok(()) => Ok(()),
             Err(StreamReadQueueFull) => {
                 self.retire_stream(stream_id);
@@ -496,13 +458,11 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            dispatcher.try_send_data(chunk).map_err(|_| ())?;
+            dispatcher.send_data(chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             stream.is_peer_write_closed = true;
-            stream
-                .read_dispatcher
-                .try_send_terminal(StreamReadDataMsg::Fin);
+            stream.read_dispatcher.finish();
         }
         Ok(())
     }
@@ -527,13 +487,11 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            dispatcher.try_send_data(chunk).map_err(|_| ())?;
+            dispatcher.send_data(chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() {
             stream.is_peer_write_closed = true;
-            stream
-                .read_dispatcher
-                .try_send_terminal(StreamReadDataMsg::Fin);
+            stream.read_dispatcher.finish();
         }
         Ok(())
     }
@@ -545,11 +503,10 @@ impl MuxControl {
         if stream.local_read_closed {
             return false;
         }
-        stream.read_dispatcher.try_send_terminal(StreamReadDataMsg::Error(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
-            )),
-        );
+        stream.read_dispatcher.fail(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "mux stream read side closed - reassembly protocol error, or the reader stopped draining its queue",
+        ));
         stream.reassembly = None;
         stream.local_read_closed = true;
         stream.is_peer_write_closed = true;
@@ -607,8 +564,7 @@ impl StreamState {
                     return;
                 }
                 self.is_peer_write_closed = true;
-                self.read_dispatcher
-                    .try_send_terminal(StreamReadDataMsg::Fin);
+                self.read_dispatcher.finish();
             }
         }
     }
@@ -755,7 +711,7 @@ mod reassembly_tests {
     // ---- End-to-end reassembly tests via MuxControl ----
 
     use crate::control::PeerReadClosedFlag;
-    use crate::stream::reader::{StreamReadDataMsg, StreamReadDataRx, stream_read_data_channel};
+    use crate::stream::reader::{StreamReadDataMsg, StreamReadDataRx, stream_read_channel};
     use crate::stream::stream_close_channel;
 
     fn make_control(
@@ -773,12 +729,9 @@ mod reassembly_tests {
 
     /// Open a stream with a fresh (dispatcher, receiver) pair we control.
     async fn open_test_stream(control: &mut MuxControl, stream_id: StreamId) -> StreamReadDataRx {
-        let (tx, rx) = stream_read_data_channel();
+        let (dispatcher, rx) = stream_read_channel();
         let bp = PeerReadClosedFlag::new();
-        control
-            .open(StreamDispatcher::new(tx), bp, Some(stream_id))
-            .await
-            .unwrap();
+        control.open(dispatcher, bp, Some(stream_id)).await.unwrap();
         rx
     }
 
@@ -795,11 +748,7 @@ mod reassembly_tests {
                 let (_, pair1) = open_stream(&mut control, &_close_tx, None).await.unwrap();
                 let (_, pair2) = open_stream(&mut control, &_close_tx, None).await.unwrap();
                 let local = control
-                    .open(
-                        StreamDispatcher::new(stream_read_data_channel().0),
-                        PeerReadClosedFlag::new(),
-                        None,
-                    )
+                    .open(stream_read_channel().0, PeerReadClosedFlag::new(), None)
                     .await;
                 assert!(
                     matches!(local, Err(ControlOpenError::TooManyOpenStreams(_))),
@@ -816,11 +765,7 @@ mod reassembly_tests {
                     .await
                     .unwrap();
                 let peer = peer_control
-                    .open(
-                        StreamDispatcher::new(stream_read_data_channel().0),
-                        PeerReadClosedFlag::new(),
-                        Some(11),
-                    )
+                    .open(stream_read_channel().0, PeerReadClosedFlag::new(), Some(11))
                     .await;
                 assert!(
                     matches!(peer, Err(ControlOpenError::TooManyOpenStreams(_))),
@@ -868,11 +813,7 @@ mod reassembly_tests {
                 let mut sibling_rx = open_test_stream(&mut rig.control, 2).await;
                 let mut queued = 0;
                 loop {
-                    let result = rig
-                        .control
-                        .dispatcher(1)
-                        .unwrap()
-                        .try_send_data(buf(&[0xAA]));
+                    let result = rig.control.dispatcher(1).unwrap().send_data(buf(&[0xAA]));
                     match result {
                         Ok(()) => queued += 1,
                         Err(_) => break,
@@ -897,7 +838,7 @@ mod reassembly_tests {
                         .is_err(),
                     "overflow abort must emit exactly CloseRead then ForceCloseWrite"
                 );
-                rig.control.try_dispatch_data(2, buf(&[0xCC])).unwrap();
+                rig.control.dispatch_data(2, buf(&[0xCC])).unwrap();
                 let msg = sibling_rx.try_recv().expect("sibling data must progress");
                 match msg {
                     StreamReadDataMsg::Data(data) => assert_eq!(&data[..], &[0xCC]),
@@ -1619,7 +1560,7 @@ mod reassembly_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reader_a_queue_behind_still_gets_the_end_of_its_stream() {
         let frames = crate::stream::reader::CHANNEL_SIZE - 1;
         let (got, res) = drive_until_close(frames).await;
@@ -1630,13 +1571,61 @@ mod reassembly_tests {
         assert_eq!(got, vec![7; frames]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reader_that_overruns_its_queue_still_reaches_an_end() {
         let (_got, res) = drive_until_close(crate::stream::reader::CHANNEL_SIZE).await;
         assert!(
             res.is_err(),
             "the stream outran its read queue, so its reader owes an error, not a clean EOF"
         );
+    }
+
+    /// A reassembly burst that spills past the old 1024-item soft watermark
+    /// into the new hard headroom must not block the session control loop,
+    /// and a sibling stream must keep flowing throughout.
+    #[tokio::test]
+    async fn reassembly_burst_uses_hard_headroom_without_blocking_control() {
+        let mut rig = central_read_rig(true);
+        let mut scope = ControlScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                rig.deliver(CentralIoReadMsg::Open(1)).await.unwrap();
+                let _stalled = rig.accept_rx.recv().await.unwrap();
+                // Far more frames than the 1024-slot soft watermark, far
+                // fewer than the 8 KiB hard headroom: every ingest must
+                // complete without waiting on reader progress.
+                let burst = crate::stream::reader::STREAM_READ_SOFT_DATA_LIMIT + 256;
+                for i in 0..burst {
+                    timeout(
+                        Duration::from_secs(3),
+                        rig.deliver(CentralIoReadMsg::Data(1, (i as u32) * 4, buf(&[0xAA; 4]))),
+                    )
+                    .await
+                    .expect("a stalled stream reader blocked the session control loop")
+                    .unwrap();
+                }
+                // A sibling stream is served immediately afterwards.
+                rig.deliver(CentralIoReadMsg::Open(2)).await.unwrap();
+                let live = rig.accept_rx.recv().await.unwrap();
+                timeout(
+                    Duration::from_secs(3),
+                    rig.deliver(CentralIoReadMsg::Data(2, 0, buf(b"hello"))),
+                )
+                .await
+                .expect("a stalled stream reader blocked a sibling stream")
+                .unwrap();
+                let mut got = [0u8; 5];
+                let n = timeout(
+                    Duration::from_secs(3),
+                    tokio::io::AsyncReadExt::read(&mut { live }.reader, &mut got),
+                )
+                .await
+                .expect("the sibling stream's reader never woke")
+                .unwrap();
+                assert_eq!(&got[..n], b"hello");
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1683,12 +1672,12 @@ mod reassembly_tests {
         scope
             .run(async {
                 let mut rx = open_test_stream(&mut control, 7).await;
-                control.try_dispatch_data(7, buf(&[])).unwrap();
+                control.dispatch_data(7, buf(&[])).unwrap();
                 match rx.try_recv() {
                     Err(()) => {}
                     Ok(msg) => panic!("an empty frame reached the reader as a forged EOF: {msg:?}"),
                 }
-                control.try_dispatch_data(7, buf(&[0xCC; 4])).unwrap();
+                control.dispatch_data(7, buf(&[0xCC; 4])).unwrap();
                 match rx
                     .try_recv()
                     .expect("the real frame after it must still arrive")
@@ -1738,10 +1727,10 @@ mod reassembly_tests {
         scope.fold(std::mem::take(&mut rig.drain));
         scope
             .run(async {
-                let (tx, mut local_rx) = stream_read_data_channel();
+                let (dispatcher, mut local_rx) = stream_read_channel();
                 let (local_id, _write_tx) = rig
                     .control
-                    .open(StreamDispatcher::new(tx), PeerReadClosedFlag::new(), None)
+                    .open(dispatcher, PeerReadClosedFlag::new(), None)
                     .await
                     .unwrap();
                 assert!(rig.control.is_local_id_space(local_id));
@@ -1751,7 +1740,7 @@ mod reassembly_tests {
                     "a peer 'Open' for an id we allocated was accepted as a new inbound stream"
                 );
                 rig.control
-                    .try_dispatch_data(local_id, buf(&[0xCC]))
+                    .dispatch_data(local_id, buf(&[0xCC]))
                     .unwrap();
                 let msg = local_rx.try_recv().expect(
                     "the peer 'Open' replaced the live local stream's state, so its reader no longer receives data");
@@ -1782,7 +1771,7 @@ mod reassembly_tests {
                         "(reassembly={reassembly}) a duplicate peer 'Open' was accepted as a second inbound stream on an id that is already live"
                     );
                     rig.control
-                        .try_dispatch_data(peer_id, buf(&[0xCC]))
+                        .dispatch_data(peer_id, buf(&[0xCC]))
                         .unwrap();
                     let msg = peer_rx.try_recv().unwrap_or_else(|_| panic!(
                         "(reassembly={reassembly}) the duplicate peer 'Open' replaced the live stream's state, so its reader no longer receives data"));
