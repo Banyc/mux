@@ -358,6 +358,7 @@ dependencies = [
  "async_smux",
  "clap",
  "file_transfer",
+ "futures-util",
  "getrandom 0.4.3",
  "primitive",
  "tokio",

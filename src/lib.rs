@@ -20,6 +20,7 @@ mod reassembly;
 mod session;
 mod splice_feed;
 mod stream;
+mod task_scope;
 mod traffic_class;
 mod udp_mux;
 

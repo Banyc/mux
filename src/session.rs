@@ -297,8 +297,8 @@ where
     let control_err = match join_control(&mut control_spawner).await {
         ControlJoin::Err(e) => e,
         ControlJoin::Stopped => {
-            central_io_reader_spawner.abort_all();
-            central_io_writer_spawner.abort_all();
+            crate::task_scope::abort_and_reap(&mut central_io_reader_spawner).await;
+            crate::task_scope::abort_and_reap(&mut central_io_writer_spawner).await;
             return (None, MuxError::TaskStopped { task: "control" });
         }
     };
@@ -328,9 +328,11 @@ where
             (err, Some(stream_init_handle))
         }
     };
-    // Abort any remaining tasks on the other side so they don't linger.
-    central_io_reader_spawner.abort_all();
-    central_io_writer_spawner.abort_all();
+    // Abort and reap any remaining tasks on the other side so they don't
+    // linger — and so a sibling panic that beat the abort still crosses
+    // the session boundary instead of being hidden by a bare `abort_all`.
+    crate::task_scope::abort_and_reap(&mut central_io_reader_spawner).await;
+    crate::task_scope::abort_and_reap(&mut central_io_writer_spawner).await;
     (stream_init_handle, err)
 }
 

@@ -116,7 +116,7 @@ fn spawn_splice_supervisor(
             match exit {
                 SpliceTaskExit::DriverDone(Err(_)) => {
                     let _ = state_tx.send(SpliceRouterState::DriverFailed);
-                    inner.abort_all();
+                    crate::task_scope::abort_and_reap(&mut inner).await;
                     return;
                 }
                 SpliceTaskExit::DriverDone(Ok(())) => saw_driver_done = true,

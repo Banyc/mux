@@ -116,18 +116,19 @@ impl Liveness {
         mut int_s: JoinSet<MuxError>,
         mut bulk_s: JoinSet<MuxError>,
     ) -> MuxError {
-        tokio::select! {
-            res = int_s.join_next() => {
-                bulk_s.abort_all();
-                self.kill();
-                aggregate_dual_lane_result(LaneClass::Interactive, res)
-            }
-            res = bulk_s.join_next() => {
-                int_s.abort_all();
-                self.kill();
-                aggregate_dual_lane_result(LaneClass::Bulk, res)
-            }
-        }
+        // The winner is known: kill the shared liveness before waiting on
+        // either epilog so every extant stream handle fails fast, then
+        // abort/reap BOTH lane scopes — the winner's remaining tasks and the
+        // whole opposite lane — so a sibling panic that beat the abort still
+        // crosses the boundary instead of being hidden by a bare JoinSet drop.
+        let (lane, result) = tokio::select! {
+            result = int_s.join_next() => (LaneClass::Interactive, result),
+            result = bulk_s.join_next() => (LaneClass::Bulk, result),
+        };
+        self.kill();
+        crate::task_scope::abort_and_reap(&mut int_s).await;
+        crate::task_scope::abort_and_reap(&mut bulk_s).await;
+        aggregate_dual_lane_result(lane, result)
     }
 }
 

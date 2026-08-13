@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::task::JoinSet;
@@ -500,7 +502,7 @@ pub struct MigratingCapableAccepter {
     response_opener: Option<DualStreamOpener>,
     feed: SpliceRouterHandle,
     own_feed_driver: Option<JoinSet<()>>,
-    peeks: JoinSet<PeekedStream>,
+    peeks: FuturesUnordered<Pin<Box<dyn Future<Output = PeekedStream> + Send>>>,
 }
 
 const MAX_CONCURRENT_PEEKS: usize = 256;
@@ -525,7 +527,7 @@ struct PeekedStream {
 
 enum AcceptStep {
     Accepted(Result<(StreamReader, StreamWriter, LaneClass), crate::dual_lane::DualAcceptError>),
-    Peeked(Option<Result<PeekedStream, tokio::task::JoinError>>),
+    Peeked(Option<PeekedStream>),
     FeedDone(Option<Result<(), tokio::task::JoinError>>),
 }
 
@@ -561,7 +563,7 @@ impl MigratingCapableAccepter {
             response_opener: None,
             feed,
             own_feed_driver: Some(own_feed_driver),
-            peeks: JoinSet::new(),
+            peeks: FuturesUnordered::new(),
         }
     }
 
@@ -572,7 +574,7 @@ impl MigratingCapableAccepter {
             response_opener: None,
             feed,
             own_feed_driver: None,
-            peeks: JoinSet::new(),
+            peeks: FuturesUnordered::new(),
         }
     }
 
@@ -609,7 +611,7 @@ impl MigratingCapableAccepter {
             let has_own_feed = self.own_feed_driver.is_some();
             let step = tokio::select! {
                 accepted = self.inner.accept(), if can_accept => AcceptStep::Accepted(accepted),
-                joined = self.peeks.join_next(), if has_peeks => AcceptStep::Peeked(joined),
+                peeked = self.peeks.next(), if has_peeks => AcceptStep::Peeked(peeked),
                 drained = drain_feed_driver(&mut self.own_feed_driver), if has_own_feed => {
                     AcceptStep::FeedDone(drained)
                 }
@@ -619,17 +621,17 @@ impl MigratingCapableAccepter {
                     let (reader, writer, lane) =
                         accepted.map_err(|_| MigratingStreamError::LaneDead)?;
                     let feed = self.feed.clone();
-                    self.peeks.spawn(async move {
+                    self.peeks.push(Box::pin(async move {
                         PeekedStream {
                             outcome: Self::peek_and_dispatch(reader, feed).await,
                             writer,
                             lane,
                         }
-                    });
+                    }));
                     continue;
                 }
-                AcceptStep::Peeked(None) => unreachable!("peek JoinSet was nonempty"),
-                AcceptStep::Peeked(Some(result)) => result.unwrap(),
+                AcceptStep::Peeked(None) => unreachable!("peek set was nonempty"),
+                AcceptStep::Peeked(Some(peek)) => peek,
                 AcceptStep::FeedDone(Some(result)) => {
                     result.unwrap();
                     continue;
@@ -956,6 +958,7 @@ impl ResponseRouter {
 }
 
 #[derive(Debug, Default)]
+#[must_use = "the response-router driver must be actively polled and shut down"]
 pub struct ResponseRouterDriver {
     tasks: tokio::task::JoinSet<()>,
 }
@@ -1008,8 +1011,8 @@ impl ResponseRouterDriver {
         self.tasks.is_empty()
     }
 
-    pub fn abort_all(&mut self) {
-        self.tasks.abort_all();
+    pub async fn shutdown(&mut self) {
+        crate::task_scope::abort_and_reap(&mut self.tasks).await;
     }
 }
 
@@ -2460,6 +2463,22 @@ mod tests {
         assert_eq!(resp, "pong-across");
         req_writer.finalize().await.unwrap();
         drop(silent);
+    }
+
+    #[tokio::test]
+    async fn response_router_shutdown_empties_its_driver() {
+        let (_x_op, x_acc, _y_op, _y_acc, _tasks) = make_duplex_session().await;
+        let (router, mut driver) = spawn_response_router(x_acc);
+        let _handle = router.handle();
+        assert!(
+            !driver.is_empty(),
+            "a freshly spawned response router owns no supervised tasks"
+        );
+        driver.shutdown().await;
+        assert!(
+            driver.is_empty(),
+            "shutdown must abort and reap every supervised task"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
