@@ -15,6 +15,7 @@ mod lane_hello;
 mod lane_message;
 mod migration_api;
 mod migration_wire;
+mod padding;
 mod protocol;
 mod reassembly;
 mod session;

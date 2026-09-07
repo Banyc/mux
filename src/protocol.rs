@@ -53,7 +53,7 @@ impl StreamIdMsg {
     pub const SIZE: usize = core::mem::size_of::<StreamId>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
-        let mut stream = [0; 4];
+        let mut stream = [0; core::mem::size_of::<StreamId>()];
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
@@ -78,10 +78,10 @@ impl DataHeader {
     pub const SIZE: usize = core::mem::size_of::<StreamId>() + core::mem::size_of::<BodyLen>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
-        let mut stream = [0; 4];
+        let mut stream = [0; core::mem::size_of::<StreamId>()];
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
-        let mut body_len = [0; 2];
+        let mut body_len = [0; core::mem::size_of::<BodyLen>()];
         rdr.read_exact(&mut body_len).unwrap();
         let body_len = BodyLen::from_be_bytes(body_len);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
@@ -126,13 +126,13 @@ impl DataHeaderExt {
         + core::mem::size_of::<Offset>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
-        let mut stream = [0; 4];
+        let mut stream = [0; core::mem::size_of::<StreamId>()];
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
-        let mut body_len = [0; 2];
+        let mut body_len = [0; core::mem::size_of::<BodyLen>()];
         rdr.read_exact(&mut body_len).unwrap();
         let body_len = BodyLen::from_be_bytes(body_len);
-        let mut offset = [0; 4];
+        let mut offset = [0; core::mem::size_of::<Offset>()];
         rdr.read_exact(&mut offset).unwrap();
         let offset = Offset::from_be_bytes(offset);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);
@@ -167,10 +167,10 @@ impl CloseWriteExtMsg {
     pub const SIZE: usize = core::mem::size_of::<StreamId>() + core::mem::size_of::<Offset>();
     pub fn decode(buf: [u8; Self::SIZE]) -> Self {
         let mut rdr = io::Cursor::new(&buf[..]);
-        let mut stream = [0; 4];
+        let mut stream = [0; core::mem::size_of::<StreamId>()];
         rdr.read_exact(&mut stream).unwrap();
         let stream = StreamId::from_be_bytes(stream);
-        let mut final_offset = [0; 4];
+        let mut final_offset = [0; core::mem::size_of::<Offset>()];
         rdr.read_exact(&mut final_offset).unwrap();
         let final_offset = Offset::from_be_bytes(final_offset);
         assert_eq!(rdr.read(&mut [0]).unwrap(), 0);

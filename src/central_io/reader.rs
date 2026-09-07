@@ -108,19 +108,27 @@ where
             )
         })?;
         Ok(match hdr {
-            Header::Heartbeat => None,
-            Header::Open => Some(CentralIoReadMsg::Open(self.recv_stream_id().await?)),
+            Header::Heartbeat => {
+                crate::padding::skip_tail(&mut self.io_reader).await?;
+                None
+            }
+            Header::Open => {
+                let stream = self.recv_stream_id().await?;
+                crate::padding::skip_tail(&mut self.io_reader).await?;
+                Some(CentralIoReadMsg::Open(stream))
+            }
             Header::Data => {
                 let (stream, offset, pkt) = self.recv_data().await?;
                 Some(CentralIoReadMsg::Data(stream, offset, pkt))
             }
-            Header::CloseRead => Some(CentralIoReadMsg::Close(
-                self.recv_stream_id().await?,
-                Side::Read,
-                0,
-            )),
+            Header::CloseRead => {
+                let stream = self.recv_stream_id().await?;
+                crate::padding::skip_tail(&mut self.io_reader).await?;
+                Some(CentralIoReadMsg::Close(stream, Side::Read, 0))
+            }
             Header::CloseWrite => {
                 let (stream, final_offset) = self.recv_close_write().await?;
+                crate::padding::skip_tail(&mut self.io_reader).await?;
                 Some(CentralIoReadMsg::Close(stream, Side::Write, final_offset))
             }
         })
@@ -253,6 +261,8 @@ mod tests {
         }
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
+        // The Open frame carries a padding tail; a zero-length tail completes it.
+        client.write_all(&0u16.to_be_bytes()).await.unwrap();
 
         match tokio::time::timeout(Duration::from_secs(1), &mut ready_rx).await {
             Ok(Ok(())) => {}

@@ -41,11 +41,30 @@ where
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
                 io_writer.send_data(msg).await.map_err(RunCentralIoWriterError::IoWriter)?;
             }
-            () = tokio::time::sleep(heartbeat_interval) => {
+            () = tokio::time::sleep(heartbeat_interval + heartbeat_jitter(heartbeat_interval)) => {
                 io_writer.send_heartbeat().await.map_err(RunCentralIoWriterError::IoWriter)?;
             }
         }
     }
+}
+
+/// Write a heartbeat frame with a random-length zero-filled padding tail:
+/// `[Header 1][pad_len u16][padding pad_len]`, so the heartbeat does not
+/// fingerprint as a fixed 1-byte frame. Built in a buffer and written
+/// atomically so the transport sees one frame. Shared by the periodic
+/// heartbeat and the birth liveness heartbeat.
+pub(crate) async fn write_heartbeat_frame<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
+    let mut frame = Vec::with_capacity(crate::padding::MAX_PAD + 2);
+    frame.push(Header::Heartbeat.encode()[0]);
+    crate::padding::append_tail(&mut frame);
+    writer.write_all(&frame).await
+}
+
+/// Random jitter on the heartbeat interval (0..=20% of the interval) so the
+/// keepalive cadence does not fingerprint as a fixed period.
+fn heartbeat_jitter(interval: Duration) -> Duration {
+    let max_ms = (interval.as_millis() / 5) as u64;
+    Duration::from_millis(crate::padding::random_u64() % (max_ms + 1))
 }
 #[derive(Debug)]
 pub enum RunCentralIoWriterError {
@@ -86,10 +105,7 @@ where
     W: AsyncWrite + Unpin,
 {
     pub async fn send_heartbeat(&mut self) -> io::Result<()> {
-        let hdr = Header::Heartbeat;
-        let hdr = hdr.encode();
-        self.io_writer.write_all(&hdr).await?;
-        Ok(())
+        write_heartbeat_frame(&mut self.io_writer).await
     }
     pub async fn send_control(&mut self, msg: WriteControlMsg) -> io::Result<()> {
         match msg {
@@ -111,28 +127,24 @@ where
         stream_id: StreamId,
         final_offset: Offset,
     ) -> io::Result<()> {
-        let hdr = Header::CloseWrite;
         let payload = CloseWriteExtMsg {
             stream_id,
             final_offset,
         };
-        let hdr = hdr.encode();
-        let payload = payload.encode();
-        let mut concat = hdr.into_iter().chain(payload);
-        let buf: [u8; Header::SIZE + CloseWriteExtMsg::SIZE] =
-            core::array::from_fn(|_| concat.next().unwrap());
-        self.io_writer.write_all(&buf).await?;
-        Ok(())
+        let frame = &mut self.frame_buf;
+        frame.clear();
+        frame.push(Header::CloseWrite.encode()[0]);
+        frame.extend_from_slice(&payload.encode());
+        crate::padding::append_tail(frame);
+        self.io_writer.write_all(frame).await
     }
     async fn send_control_(&mut self, hdr: Header, stream_id: u32) -> io::Result<()> {
-        let stream_id_msg = StreamIdMsg { stream_id };
-        let hdr = hdr.encode();
-        let stream_id_msg = stream_id_msg.encode();
-        let mut concat = hdr.into_iter().chain(stream_id_msg);
-        let buf: [u8; Header::SIZE + StreamIdMsg::SIZE] =
-            core::array::from_fn(|_| concat.next().unwrap());
-        self.io_writer.write_all(&buf).await?;
-        Ok(())
+        let frame = &mut self.frame_buf;
+        frame.clear();
+        frame.push(hdr.encode()[0]);
+        frame.extend_from_slice(&StreamIdMsg { stream_id }.encode());
+        crate::padding::append_tail(frame);
+        self.io_writer.write_all(frame).await
     }
     pub async fn send_data(&mut self, msg: WriteDataMsg) -> io::Result<()> {
         let data_buf = match msg.data {
@@ -261,6 +273,35 @@ mod tests {
     use super::{CentralIoEncoder, REASSEMBLY_MAX_BODY};
     use crate::central_io::scheduler::{StreamWriteData, WriteControlMsg, WriteDataMsg};
     use crate::protocol::{BodyLen, DataHeader, DataHeaderExt, Header};
+
+    /// Assert `bytes` is exactly `prefix` followed by a valid padding tail.
+    fn assert_tailed(bytes: &[u8], prefix: &[u8], msg: &str) {
+        assert!(
+            bytes.len() >= prefix.len() + 2,
+            "{msg}: frame too short: {bytes:?}"
+        );
+        assert_eq!(
+            &bytes[..prefix.len()],
+            prefix,
+            "{msg}: frame prefix mismatch"
+        );
+        let pad_len =
+            u16::from_be_bytes(bytes[prefix.len()..prefix.len() + 2].try_into().unwrap()) as usize;
+        assert_eq!(
+            bytes.len(),
+            prefix.len() + 2 + pad_len,
+            "{msg}: padding tail length mismatch"
+        );
+    }
+
+    /// Strip the padding tail following `prefix` at the start of `bytes`,
+    /// returning the remainder.
+    fn strip_tail<'a>(bytes: &'a [u8], prefix: &[u8]) -> &'a [u8] {
+        assert_eq!(&bytes[..prefix.len()], prefix, "frame prefix mismatch");
+        let pad_len =
+            u16::from_be_bytes(bytes[prefix.len()..prefix.len() + 2].try_into().unwrap()) as usize;
+        &bytes[prefix.len() + 2 + pad_len..]
+    }
 
     /// A mock writer that records every byte and can simulate partial vectored
     /// writes. `max_per_write` caps the number of bytes any single `write` /
@@ -653,7 +694,11 @@ mod tests {
         let mut expected = Vec::new();
         expected.push(Header::CloseWrite.encode()[0]);
         expected.extend_from_slice(&9u32.to_be_bytes());
-        assert_eq!(central.io_writer.0, expected);
+        assert_tailed(
+            &central.io_writer.0,
+            &expected,
+            "legacy abort must emit a stock CloseWrite",
+        );
         assert_eq!(
             central.next_offset.get(&9),
             None,
@@ -727,9 +772,10 @@ mod tests {
         expected3.push(Header::CloseWrite.encode()[0]);
         expected3.extend_from_slice(&7u32.to_be_bytes());
         expected3.extend_from_slice(&100u32.to_be_bytes());
-        assert_eq!(
-            central.io_writer.0, expected3,
-            "mode-on must end in exactly one extended CloseWrite"
+        assert_tailed(
+            &central.io_writer.0,
+            &expected3,
+            "mode-on must end in exactly one extended CloseWrite",
         );
     }
 
@@ -783,13 +829,16 @@ mod tests {
         let mut expected = Vec::new();
         expected.push(Header::Open.encode()[0]);
         expected.extend_from_slice(&7u32.to_be_bytes());
+        let open = expected.clone();
         expected.push(0x02);
         expected.extend_from_slice(&7u32.to_be_bytes());
         expected.extend_from_slice(&50u16.to_be_bytes());
         expected.extend_from_slice(&0u32.to_be_bytes());
         expected.extend_from_slice(&body);
+        let rest = strip_tail(&central.io_writer.0, &open);
         assert_eq!(
-            central.io_writer.0, expected,
+            rest,
+            &expected[open.len()..],
             "a recycled id must not inherit its predecessor's wire offset"
         );
         central.io_writer.0.clear();
@@ -815,9 +864,10 @@ mod tests {
         expected.push(Header::CloseWrite.encode()[0]);
         expected.extend_from_slice(&7u32.to_be_bytes());
         expected.extend_from_slice(&0u32.to_be_bytes());
-        assert_eq!(
-            central.io_writer.0, expected,
-            "the final offset must count only the recycled stream's own bytes"
+        assert_tailed(
+            &central.io_writer.0,
+            &expected,
+            "the final offset must count only the recycled stream's own bytes",
         );
     }
 

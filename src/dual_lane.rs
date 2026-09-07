@@ -12,15 +12,15 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::oneshot,
     task::JoinSet,
 };
 
 use crate::{
     StreamAccepter, StreamReader,
+    central_io::encoder::write_heartbeat_frame,
     lane_hello::{GroupToken, LaneHelloError, PairingNonce, read_lane_hello, write_lane_hello},
-    protocol::Header,
     session::{MuxConfig, MuxError, spawn_mux_no_reconnection},
     stream::{
         opener::{StreamOpenError, StreamOpener},
@@ -47,7 +47,7 @@ pub const AUTO_BULK_THRESHOLD: usize = crate::traffic_class::BULK_THRESHOLD;
 /// [`spawn_mux_no_reconnection_with_first_receive_deadline`] so the
 /// receiver switches off its shorter first-receive deadline.
 pub async fn write_liveness_heartbeat<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(&Header::Heartbeat.encode()).await
+    write_heartbeat_frame(writer).await
 }
 
 // ---------------------------------------------------------------------------
