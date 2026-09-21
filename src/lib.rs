@@ -25,6 +25,13 @@ mod task_scope;
 mod traffic_class;
 mod udp_mux;
 
+// The mux layer-testing kit (`mux::testkit`, behind `testing`): re-exported
+// for the cooperation crate's scenario targets. The feature stays OFF for
+// plain library builds so the kit's optional `netem-test` dependency does not
+// drag into the normal dependency graph.
+#[cfg(feature = "testing")]
+pub mod testkit;
+
 pub use central_io::DeadCentralIo;
 pub use control::{ControlOpenError, DeadControl, Initiation, TooManyOpenStreams};
 pub use dual_lane::{

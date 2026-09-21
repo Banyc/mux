@@ -10,15 +10,42 @@ getrandom = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
+# The mux layer-testing kit (`mux::testkit`, behind `testing`) consumes the
+# generic scenario helpers and the impairment instrument from the local
+# harness checkout (behind its `test-kit` feature). The optional dependency is
+# activated by the same feature so the kit compiles both in-crate
+# (`cargo test --features testing`) and when mux is itself a dependency with
+# `testing` enabled. The kit is transport-free: the transport-mediated
+# mux-over-rtp scaffolding lives in the cooperation crate, which is the one
+# place that sees both layers together. Imports only ever go downward
+# (mux kit → harness kit); the harness stays a leaf, so no cycle contains a
+# normal edge.
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"], optional = true }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
+# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.90", features = ["testing"], optional = true }
+# rtp = { path = "../rtp", features = ["testing"], optional = true }
 
 [dev-dependencies]
 async_smux = "0.3"
 clap = { version = "4", features = ["derive"] }
 file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.7" }
+# Self dev-dependency, mirroring netem-test's pattern: the library's
+# own test targets are built with the `testing` feature enabled, so the kit
+# (and every scenario target that imports `mux::testkit`) compiles in mux's
+# default test invocation (`cargo test -p mux`) instead of only under an
+# explicit `--features testing`. A plain `cargo build` of the library, and
+# every consumer that does not request the feature itself, still compiles
+# without `testing`, so mux's lean dependency graph stays lean.
+mux = { path = ".", features = ["testing"] }
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"] }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
+# rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.90", features = ["testing"] }
+# rtp = { path = "../rtp", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 nightly = []
+testing = ["dep:netem-test"]
 
 [lints.clippy]
 disallowed_methods = "deny"
