@@ -3,7 +3,7 @@
 //! `[pad_len u16][padding pad_len]` appended after a control frame's
 //! payload; the reader skips it.
 
-use std::io;
+use std::{cell::Cell, io};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 /// Maximum padding tail: sized to reach a full transport datagram (MSS),
@@ -44,9 +44,36 @@ pub(crate) async fn skip_tail<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Re
     Ok(())
 }
 
-/// Random u64 from the OS.
+// Per-thread state for [`random_u64`], seeded from the OS once per thread.
+thread_local! {
+    static WIRE_RANDOM: Cell<u64> = Cell::new(seed_from_os());
+}
+
+/// Random u64 for wire-shaping values: a padding length or a heartbeat
+/// jitter. Neither is a secret — both are observable on the wire — and their
+/// only job is to keep a cadence from fingerprinting as fixed. They come from
+/// a per-thread PRNG seeded once from the OS instead of one OS entropy
+/// syscall per value, because the central-IO egress loop draws a heartbeat
+/// jitter on every iteration and an entropy syscall there sits on the
+/// per-frame path.
 pub(crate) fn random_u64() -> u64 {
+    WIRE_RANDOM.with(|state| {
+        let counter = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        state.set(counter);
+        avalanche(counter)
+    })
+}
+
+fn seed_from_os() -> u64 {
     let mut buf = [0u8; core::mem::size_of::<u64>()];
     getrandom::fill(&mut buf).expect("operating-system randomness unavailable");
     u64::from_le_bytes(buf)
+}
+
+/// The splitmix64 finalizer: a bijective avalanche over the counter, so
+/// consecutive draws are uncorrelated without carrying a generator.
+fn avalanche(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
