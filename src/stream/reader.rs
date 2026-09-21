@@ -3,7 +3,10 @@ use std::{
     io,
     ops::DerefMut,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -171,19 +174,31 @@ impl StreamReadDataTx {
 #[derive(Debug)]
 pub(crate) struct StreamReadDataRx {
     rx: tokio::sync::mpsc::Receiver<StreamReadDataMsg>,
+    /// Monotonic count of messages this reader has dequeued, shared with the
+    /// dispatcher so it can tell a slow-but-progressing reader (which must be
+    /// backpressured, never severed) from one that has stopped draining.
+    progress: Arc<AtomicUsize>,
 }
 impl StreamReadDataRx {
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StreamReadDataMsg, DeadControl>> {
-        ready!(self.rx.poll_recv(cx)).ok_or(DeadControl {}).into()
+        match ready!(self.rx.poll_recv(cx)) {
+            Some(msg) => {
+                self.progress.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(msg))
+            }
+            None => Poll::Ready(Err(DeadControl {})),
+        }
     }
     /// Non-blocking receive: returns `Ok(msg)` if one is ready, `Err` if
     /// the channel is empty or closed. Used by reassembly tests.
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<StreamReadDataMsg, ()> {
-        self.rx.try_recv().map_err(|_| ())
+        let msg = self.rx.try_recv().map_err(|_| ())?;
+        self.progress.fetch_add(1, Ordering::Relaxed);
+        Ok(msg)
     }
 }
 
@@ -191,21 +206,42 @@ impl StreamReadDataRx {
 /// structurally. `send_data` refuses once only one slot remains, so a
 /// terminal `send_terminal` always fits — `Full` there would mean the
 /// reservation was broken, which panics as a backstop rather than as the
-/// normal failure path. Sustained occupancy at or above
-/// [`STREAM_READ_SOFT_DATA_LIMIT`] is refused once
-/// [`STREAM_READ_DRAIN_GRACE`] elapses; physical fullness
-/// ([`STREAM_READ_HARD_DATA_LIMIT`]) is refused immediately.
+/// normal failure path.
+///
+/// The soft limit is a liveness probe, not a timer: when occupancy reaches
+/// [`STREAM_READ_SOFT_DATA_LIMIT`] the dispatcher waits
+/// [`STREAM_READ_DRAIN_GRACE`] for the reader to drain at least one item. A
+/// reader that makes that progress is trusted for as long as the backlog
+/// stays above the soft limit, so a merely slow reader is backpressured
+/// rather than severed; only a reader that drains nothing within the grace is
+/// refused. Physical fullness ([`STREAM_READ_HARD_DATA_LIMIT`]) is always
+/// refused immediately, which is what eventually reclaims a reader that
+/// proves liveness once and then stalls for good.
 #[derive(Debug)]
 pub struct StreamDispatcher {
     tx: StreamReadDataTx,
+    /// Shared with [`StreamReadDataRx`]: the reader's dequeue count.
+    progress: Arc<AtomicUsize>,
+    /// `progress` as observed at the previous dispatch, used to detect a
+    /// dequeue between dispatches.
+    last_progress_count: Cell<usize>,
+    /// When occupancy first rose to (or above) the soft limit, cleared when it
+    /// falls back below.
     overloaded_since: Cell<Option<tokio::time::Instant>>,
+    /// Whether the reader has drained since the current overload began. Once
+    /// set the time-based refusal is disabled until occupancy falls back below
+    /// the soft limit; the hard limit remains the backstop.
+    progress_since_overload: Cell<bool>,
     terminal_sent: AtomicBool,
 }
 impl StreamDispatcher {
-    fn new(tx: StreamReadDataTx) -> Self {
+    fn new(tx: StreamReadDataTx, progress: Arc<AtomicUsize>) -> Self {
         Self {
             tx,
+            progress,
+            last_progress_count: Cell::new(0),
             overloaded_since: Cell::new(None),
+            progress_since_overload: Cell::new(false),
             terminal_sent: AtomicBool::new(false),
         }
     }
@@ -219,25 +255,37 @@ impl StreamDispatcher {
         }
         let mut queued_data = CHANNEL_SIZE - capacity;
         let now = tokio::time::Instant::now();
+        self.observe_reader_progress();
         if queued_data < STREAM_READ_SOFT_DATA_LIMIT {
             self.overloaded_since.set(None);
-        } else if let Some(overloaded_since) = self.overloaded_since.get() {
-            if now.duration_since(overloaded_since) >= STREAM_READ_DRAIN_GRACE {
-                if self.tx.is_closed() {
-                    return Ok(());
+            self.progress_since_overload.set(false);
+        } else if !self.progress_since_overload.get() {
+            match self.overloaded_since.get() {
+                None => self.overloaded_since.set(Some(now)),
+                Some(overloaded_since) => {
+                    if now.duration_since(overloaded_since) >= STREAM_READ_DRAIN_GRACE {
+                        // Re-read the queue and progress before refusing: a
+                        // drain that landed after the first read must still
+                        // rescue the stream.
+                        if self.tx.is_closed() {
+                            return Ok(());
+                        }
+                        self.observe_reader_progress();
+                        capacity = self.tx.capacity();
+                        if capacity <= 1 {
+                            return Err(StreamReadQueueFull);
+                        }
+                        queued_data = CHANNEL_SIZE - capacity;
+                        if queued_data >= STREAM_READ_SOFT_DATA_LIMIT
+                            && !self.progress_since_overload.get()
+                        {
+                            return Err(StreamReadQueueFull);
+                        }
+                        self.overloaded_since.set(None);
+                        self.progress_since_overload.set(false);
+                    }
                 }
-                capacity = self.tx.capacity();
-                if capacity <= 1 {
-                    return Err(StreamReadQueueFull);
-                }
-                queued_data = CHANNEL_SIZE - capacity;
-                if queued_data >= STREAM_READ_SOFT_DATA_LIMIT {
-                    return Err(StreamReadQueueFull);
-                }
-                self.overloaded_since.set(None);
             }
-        } else {
-            self.overloaded_since.set(Some(now));
         }
         match self.tx.try_send(StreamReadDataMsg::Data(data)) {
             Ok(()) => {
@@ -250,6 +298,16 @@ impl StreamDispatcher {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
+        }
+    }
+    /// Records a dequeue observed since the previous dispatch as reader
+    /// progress. The `progress` counter is bumped by the receiver, so a change
+    /// between dispatches is proof the reader drained its queue.
+    fn observe_reader_progress(&self) {
+        let progress = self.progress.load(Ordering::Relaxed);
+        if progress != self.last_progress_count.get() {
+            self.last_progress_count.set(progress);
+            self.progress_since_overload.set(true);
         }
     }
     pub(crate) fn finish(&self) {
@@ -274,8 +332,12 @@ impl StreamDispatcher {
 pub(crate) fn stream_read_channel() -> (StreamDispatcher, StreamReadDataRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
     let tx = StreamReadDataTx { tx };
-    let rx = StreamReadDataRx { rx };
-    (StreamDispatcher::new(tx), rx)
+    let progress = Arc::new(AtomicUsize::new(0));
+    let rx = StreamReadDataRx {
+        rx,
+        progress: progress.clone(),
+    };
+    (StreamDispatcher::new(tx, progress), rx)
 }
 
 #[cfg(test)]
@@ -387,6 +449,37 @@ mod tests {
             dispatcher.send_data(buf(&[0xEE])),
             Err(StreamReadQueueFull)
         ));
+    }
+
+    /// A reader that keeps draining its queue (progress) while the writer
+    /// holds a sustained backlog above the soft limit must never be
+    /// refused: the refusal keys on lack of reader progress, not on a
+    /// progress-blind timer. The backlog stays above the soft limit the
+    /// whole time, so it never even reaches the drain-below-soft reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_progressing_reader_behind_a_sustained_backlog_is_not_refused() {
+        let (dispatcher, mut rx) = stream_read_channel();
+        // A sustained backlog well above the soft limit but far below the
+        // hard limit, so only the soft-limit rule could refuse.
+        let backlog = STREAM_READ_SOFT_DATA_LIMIT * 4;
+        for _ in 0..backlog {
+            dispatcher.send_data(buf(&[0xAA])).unwrap();
+        }
+        // The reader is slow but keeps making progress: it drains a few
+        // items every few ms while the writer refills, holding the backlog
+        // steady above the soft limit. Total elapsed time far exceeds the
+        // grace period.
+        for _ in 0..5 {
+            time::advance(Duration::from_millis(5)).await;
+            for _ in 0..8 {
+                rx.try_recv().unwrap();
+            }
+            for _ in 0..8 {
+                dispatcher
+                    .send_data(buf(&[0xBB]))
+                    .expect("a reader that keeps draining must not be refused");
+            }
+        }
     }
 
     /// Physical fullness refuses immediately, even entirely inside the

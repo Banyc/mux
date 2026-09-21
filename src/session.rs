@@ -33,7 +33,8 @@ pub struct MuxConfig {
     /// Data frames carry a per-stream u32 byte offset and CloseWrite
     /// carries the stream's final offset, so the central reader can
     /// reassemble each stream independently from a transport that delivers
-    /// complete frames out of order (e.g. `rtp`'s frame-delivery mode).
+    /// complete frames out of order (e.g. the transport's frame-delivery
+    /// mode).
     /// Default off = wire byte-identical to the stock protocol and zero
     /// extra cost. Both peers must enable it together; there is no
     /// in-band negotiation.
@@ -561,6 +562,52 @@ mod tests {
         }
     }
 
+    // The steady receive deadline must still fire when the peer genuinely
+    // goes silent: a lane whose reader sees no frame for
+    // `heartbeat_interval * RECEIVE_DEADLINE_INTERVALS` ends with the
+    // `receive deadline - session timed out` `IoReader` error.  This pins the
+    // deadline's real purpose so a liveness fix elsewhere cannot silently
+    // neuter it; `first_receive_deadline_widens_after_birth_heartbeat` is the
+    // paired negative control (a live peer keeps the session open).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dead_peer_trips_the_receive_deadline() {
+        let heartbeat_interval = Duration::from_millis(100);
+        // A large duplex buffer holds every heartbeat the local writer emits
+        // over the short test window, so the writer never blocks; the peer
+        // half is held open but never written to.
+        let (server_side, _peer_side) = tokio::io::duplex(1 << 20);
+        let (server_r, server_w) = tokio::io::split(server_side);
+
+        let mut spawner: JoinSet<MuxError> = JoinSet::new();
+        let (_opener, _accepter) = spawn_mux_no_reconnection(
+            server_r,
+            server_w,
+            MuxConfig::new(Initiation::Server, heartbeat_interval),
+            &mut spawner,
+        );
+
+        // Steady deadline = heartbeat_interval * RECEIVE_DEADLINE_INTERVALS
+        // (4) = 400 ms; the session must end once the peer has been silent
+        // for that long.  The generous outer bound keeps the assertion about
+        // the error, not the timing.
+        let err = tokio::time::timeout(Duration::from_secs(5), spawner.join_next())
+            .await
+            .expect("the session did not end when the receive deadline elapsed")
+            .expect("the session task disappeared")
+            .expect("the session task panicked");
+        match err {
+            MuxError::IoReader(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::TimedOut, "wrong error kind: {e:?}");
+                assert!(
+                    e.to_string().contains("receive deadline"),
+                    "wrong error: {e}"
+                );
+            }
+            other => panic!("expected IoReader(TimedOut), got {other:?}"),
+        }
+        spawner.abort_all();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnection_reports_the_latest_failure() {
         use std::pin::Pin;
@@ -626,4 +673,186 @@ mod tests {
             other => panic!("expected IoReader, got {other:?}"),
         }
     }
+
+    // A failure on the writer half is reported as `IoWriter`, not
+    // `IoReader`: the session must name the side that actually failed so a
+    // caller (or reconnect decision) can tell a dead peer from a dead sink.
+    // The reader is parked forever so only the writer can fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_half_failure_is_reported_as_io_writer() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        struct PendingReader;
+
+        impl AsyncRead for PendingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        struct FailingWriter(Option<io::Error>);
+
+        impl AsyncWrite for FailingWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(self.0.take().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "writer already failed")
+                })))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut tasks: JoinSet<MuxError> = JoinSet::new();
+        let (_opener, _accepter) = spawn_mux_no_reconnection(
+            PendingReader,
+            FailingWriter(Some(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "writer boom",
+            ))),
+            MuxConfig::new(Initiation::Server, Duration::from_millis(10)),
+            &mut tasks,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), tasks.join_next())
+            .await
+            .expect("the session did not end after the writer failed")
+            .expect("the session task disappeared")
+            .expect("the session task panicked");
+        match err {
+            MuxError::IoWriter(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset,
+                "wrong error: {e:?}"
+            ),
+            other => panic!("a writer-half failure was classified as {other:?}"),
+        }
+        tasks.abort_all();
+    }
+}
+/// Gate: the memory footprint of an idle mux stream is amortized-constant
+/// in the number of open streams and bounded per stream.
+///
+/// Per the constitution's tier rule this is a **default-tier** gate (a
+/// plain `cargo test -p mux` runs it): the measured quantity is a
+/// deterministic allocation count over a fixed open sequence on a
+/// single-threaded runtime, not wall-clock. The instrument is the lib's
+/// own `test_alloc` live-byte counter; a `current_thread` runtime puts
+/// every allocation both endpoints of a stream make on the driving test
+/// thread, so the reading is exact and isolated from the other tests
+/// running in parallel on other threads.
+///
+/// Bound derivation (measured on the stock tree, debug lib test, three
+/// repeated runs): the live bytes held while `S` idle streams are open
+/// on a fresh warm session, minus the same session with zero streams
+/// open, divided by `S`, reads **10.7-11.6 KiB** per stream at S = 8,
+/// 32 and 128 with <= 1.5 % run-to-run variance. The per-stream state is
+/// the endpoint pair (client open + server accept) of one idle stream:
+/// table entries, the stream channels and the reader/writer state
+/// machines on both sides.
+///
+/// - **floor** `>= 1 KiB/stream`: an open path that holds no per-stream
+///   state (e.g. lazy buffer deferral) would read ~0 and every ratio
+///   below would pass vacuously; an idle stream must hold real state.
+/// - **budget** `<= 24 KiB/stream` (2x the measured band): a change that
+///   adds >= ~13 KiB of held per-stream state (say a per-stream 16 KiB
+///   buffer) fails, while allocator/ordering variance (~100-200 bytes)
+///   cannot trip it.
+/// - **amortized-constant** `per_stream(128) <= 3.0 x per_stream(8)`:
+///   the measured ratio is ~0.99; a per-stream cost that grows with the
+///   number of already-open streams (a linear scan in the open path, an
+///   O(S) held structure) reads >= 8 and fails at the 3.0 ceiling
+///   (3x headroom over ~1.0).
+#[tokio::test(flavor = "current_thread")]
+async fn idle_stream_memory_is_amortized_constant_and_budget_bounded() {
+    /// Fresh session pair; returns the live bytes held on this thread
+    /// while `streams` idle streams are open (pre-allocated handle vecs
+    /// so the window only sees stream state, not Vec growth).
+    async fn footprint(joins: &mut JoinSet<MuxError>, streams: usize) -> usize {
+        let buf = 1 << 20;
+        let (c2s, s2c) = tokio::io::duplex(buf);
+        let (cli_r, cli_w) = tokio::io::split(c2s);
+        let (srv_r, srv_w) = tokio::io::split(s2c);
+        let (opener, _) = spawn_mux_no_reconnection(
+            srv_r,
+            srv_w,
+            MuxConfig::new(Initiation::Server, Duration::from_secs(60)),
+            joins,
+        );
+        let (_, mut accepter) = spawn_mux_no_reconnection(
+            cli_r,
+            cli_w,
+            MuxConfig::new(Initiation::Client, Duration::from_secs(60)),
+            joins,
+        );
+        // Warm one stream so the session-level structures settle before
+        // the baseline snapshot; the warm stream's own footprint is
+        // present on both sides of the window and cancels out.
+        let (_warm_r, _warm_w) = opener.open().await.unwrap();
+        let (_warm_sr, _warm_sw) = accepter.accept().await.unwrap();
+        let mut writers = Vec::with_capacity(streams);
+        let mut readers = Vec::with_capacity(streams);
+        tokio::task::yield_now().await;
+
+        let before = crate::test_alloc::thread_live_bytes();
+        for _ in 0..streams {
+            let (_r, w) = opener.open().await.unwrap();
+            writers.push(w);
+        }
+        for _ in 0..streams {
+            let (r, _w) = accepter.accept().await.unwrap();
+            readers.push(r);
+        }
+        tokio::task::yield_now().await;
+        let after = crate::test_alloc::thread_live_bytes();
+        after.saturating_sub(before)
+    }
+
+    const FLOOR_BYTES_PER_STREAM: usize = 1024;
+    const BUDGET_BYTES_PER_STREAM: usize = 24 * 1024;
+    const RATIO_CEILING: f64 = 3.0;
+
+    let mut joins = JoinSet::new();
+    let f0 = footprint(&mut joins, 0).await;
+    let f8 = footprint(&mut joins, 8).await;
+    let f128 = footprint(&mut joins, 128).await;
+    joins.abort_all();
+
+    let per_stream_8 = (f8 - f0) / 8;
+    let per_stream_128 = (f128 - f0) / 128;
+
+    assert!(
+        per_stream_8 >= FLOOR_BYTES_PER_STREAM,
+        "idle-stream memory floor: opening a stream holds {per_stream_8} bytes/stream at \
+             8 streams, below the {FLOOR_BYTES_PER_STREAM} byte floor; an idle mux stream \
+             must hold real state (table entry + endpoint channels), otherwise the scaling \
+             ratios below pass vacuously"
+    );
+    assert!(
+        per_stream_128 <= BUDGET_BYTES_PER_STREAM,
+        "idle-stream memory budget: {per_stream_128} bytes/stream at 128 streams exceeds \
+             the {BUDGET_BYTES_PER_STREAM} byte budget (measured band 10.7-11.6 KiB/stream, \
+             the budget is 2x the measured band); a per-stream memory addition of \
+             >= ~13 KiB fails"
+    );
+    let ratio = per_stream_128 as f64 / per_stream_8 as f64;
+    assert!(
+        ratio <= RATIO_CEILING,
+        "idle-stream memory is not amortized-constant: per-stream cost at 128 streams \
+             is {ratio:.2}x the 8-stream cost, above the {RATIO_CEILING:.1}x ceiling \
+             (measured ~0.99); per-stream memory must not grow with the number of open \
+             streams"
+    );
 }

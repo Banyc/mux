@@ -7,7 +7,7 @@ use crate::protocol::{Offset, StreamId};
 /// out-of-order delivery — one lost packet holds everything past it
 /// until repair; a 1 MiB bound is below one RTT of bulk data and kills
 /// healthy streams on the first loss. 16 MiB absorbs ~0.8 s at 20 MiB/s,
-/// comfortably above typical rtp repair times under burst loss.
+/// comfortably above typical transport repair times under burst loss.
 pub const REASSEMBLY_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum byte range (highest buffered offset − next-expected offset)
@@ -349,6 +349,27 @@ mod reassembly_tests {
             ),
             "expected range/out-of-window error, got {err:?}"
         );
+    }
+
+    /// Both caps are inclusive: a frame whose byte range is exactly
+    /// `REASSEMBLY_MAX_RANGE_BYTES` and a buffered total of exactly
+    /// `REASSEMBLY_MAX_BUFFERED_BYTES` must still be accepted. Pins the strict
+    /// `>` in `ingest`'s range and buffered checks — the existing bound test
+    /// only pushes `+1` past each, leaving the exact boundary unpinned.
+    #[tokio::test]
+    async fn byte_and_range_caps_are_inclusive_at_the_exact_bound() {
+        let mut rb = ReorderBuffer::new();
+        // A frame one byte short of the cap, one byte ahead of the cursor:
+        // its byte range spans exactly REASSEMBLY_MAX_RANGE_BYTES.
+        let wide = vec![0u8; REASSEMBLY_MAX_RANGE_BYTES - 1];
+        rb.ingest(1, buf(&wide)).unwrap();
+        // A one-byte frame at the cursor closes the gap and brings the
+        // buffered total to exactly REASSEMBLY_MAX_BUFFERED_BYTES.
+        rb.ingest(0, buf(&[0xAA])).unwrap();
+        let out = collect(rb.drain_contiguous());
+        assert_eq!(out.len(), REASSEMBLY_MAX_BUFFERED_BYTES);
+        assert_eq!(out[0], 0xAA);
+        assert_eq!(rb.cursor as usize, REASSEMBLY_MAX_BUFFERED_BYTES);
     }
 
     /// Wraparound offset comparison: offsets near the u32 boundary compare

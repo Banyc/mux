@@ -1204,6 +1204,141 @@ mod tests {
             .await;
     }
 
+    /// The dual accepter labels each accepted stream with the lane it
+    /// actually arrived on. `dual_accept_is_cancel_safe` discards the class,
+    /// leaving the select's per-lane label unpinned.
+    #[tokio::test]
+    async fn dual_accept_labels_the_lane_each_stream_arrived_on() {
+        let (srv_int, cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let mut accepter =
+                    DualStreamAccepter::new(cli_int.accepter, cli_bulk.accepter, liveness);
+
+                // Only the bulk lane has a stream, so the select can only
+                // complete through the bulk arm and must label it Bulk.
+                srv_bulk.opener.open().await.unwrap();
+                let (_reader, _writer, class) = accepter.accept().await.unwrap();
+                assert_eq!(
+                    class,
+                    LaneClass::Bulk,
+                    "a bulk-lane stream was labelled as the wrong lane"
+                );
+            })
+            .await;
+    }
+
+    /// The interactive-lane arm of `DualStreamAccepter::accept`'s select is
+    /// labelled independently of the bulk arm. The sibling above only puts a
+    /// stream on the bulk lane, so it never exercises the interactive arm;
+    /// swapping that arm's label is otherwise uncaught.
+    #[tokio::test]
+    async fn dual_accept_labels_an_interactive_lane_stream() {
+        let (srv_int, cli_int) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let (srv_bulk, cli_bulk) = make_session_pair(Initiation::Server, Initiation::Client).await;
+        let mut scope = DualLaneScope::new();
+        scope.fold(srv_int.spawner);
+        scope.fold(cli_int.spawner);
+        scope.fold(srv_bulk.spawner);
+        scope.fold(cli_bulk.spawner);
+        scope
+            .run(async {
+                let liveness = Liveness::new();
+                let mut accepter =
+                    DualStreamAccepter::new(cli_int.accepter, cli_bulk.accepter, liveness);
+
+                // Only the interactive lane has a stream, so the select can
+                // only complete through the interactive arm and must label
+                // it Interactive.
+                srv_int.opener.open().await.unwrap();
+                let (_reader, _writer, class) = accepter.accept().await.unwrap();
+                assert_eq!(
+                    class,
+                    LaneClass::Interactive,
+                    "an interactive-lane stream was labelled as the wrong lane"
+                );
+            })
+            .await;
+    }
+
+    /// The lane that finished is the lane the joint-liveness supervisor
+    /// reports. `aggregate_dual_lane_result_preserves_trigger_context` calls
+    /// that helper directly, so the select's arm-to-lane assignment in
+    /// `watch_dual_lanes` is otherwise unpinned.
+    #[tokio::test]
+    async fn watch_dual_lanes_reports_the_lane_that_finished() {
+        let liveness = Liveness::new();
+        let mut int_s: JoinSet<MuxError> = JoinSet::new();
+        let mut bulk_s: JoinSet<MuxError> = JoinSet::new();
+        // The interactive lane stays pending forever, so the select can only
+        // observe the bulk lane's completion.
+        int_s.spawn(async { std::future::pending::<MuxError>().await });
+        bulk_s.spawn(async {
+            MuxError::TaskStopped {
+                task: "bulk_finished",
+            }
+        });
+        let error = liveness.watch_dual_lanes(int_s, bulk_s).await;
+        match error {
+            MuxError::DualLane { lane, source, .. } => {
+                assert_eq!(
+                    lane,
+                    LaneClass::Bulk,
+                    "the supervisor reported the lane that did not finish"
+                );
+                assert!(matches!(
+                    *source,
+                    MuxError::TaskStopped {
+                        task: "bulk_finished"
+                    }
+                ));
+            }
+            other => panic!("expected a DualLane aggregate, got {other:?}"),
+        }
+    }
+
+    /// The interactive-lane arm of `watch_dual_lanes`'s select is labelled
+    /// independently of the bulk arm. The sibling above leaves the
+    /// interactive lane pending, so it only exercises the bulk arm; swapping
+    /// the *interactive* arm's label is otherwise uncaught. Here the bulk
+    /// lane stays pending so only the interactive arm can fire.
+    #[tokio::test]
+    async fn watch_dual_lanes_reports_the_interactive_lane_that_finished() {
+        let liveness = Liveness::new();
+        let mut int_s: JoinSet<MuxError> = JoinSet::new();
+        let mut bulk_s: JoinSet<MuxError> = JoinSet::new();
+        int_s.spawn(async {
+            MuxError::TaskStopped {
+                task: "interactive_finished",
+            }
+        });
+        bulk_s.spawn(async { std::future::pending::<MuxError>().await });
+        let error = liveness.watch_dual_lanes(int_s, bulk_s).await;
+        match error {
+            MuxError::DualLane { lane, source, .. } => {
+                assert_eq!(
+                    lane,
+                    LaneClass::Interactive,
+                    "the supervisor reported the lane that did not finish"
+                );
+                assert!(matches!(
+                    *source,
+                    MuxError::TaskStopped {
+                        task: "interactive_finished"
+                    }
+                ));
+            }
+            other => panic!("expected a DualLane aggregate, got {other:?}"),
+        }
+    }
+
     // -------------------------------------------------------------------
     // open_auto vectored write (AsyncWrite::write_vectored classification)
     // -------------------------------------------------------------------

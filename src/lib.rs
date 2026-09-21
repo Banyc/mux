@@ -22,6 +22,8 @@ mod session;
 mod splice_feed;
 mod stream;
 mod task_scope;
+#[cfg(test)]
+mod test_alloc;
 mod traffic_class;
 mod udp_mux;
 

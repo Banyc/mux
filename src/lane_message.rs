@@ -795,6 +795,33 @@ mod tests {
             .await;
     }
 
+    /// The receiver's payload bound is inclusive: a message whose payload is
+    /// exactly `max_message_len` bytes must be delivered, not dropped. Pins
+    /// the `>` in `spawn_read_task`'s length check — a `>=` there silently
+    /// discards every max-length message (the read task returns `None`), so
+    /// the bounded `recv` below fails instead of the suite wedging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receiver_accepts_a_payload_exactly_at_max_message_len() {
+        let (opener, accepter, scope) = paired_sessions().await;
+        scope
+            .run(async {
+                const MAX: usize = 64;
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
+                    .with_max_message_len(MAX);
+                let tx = DualMessageSender::new(opener, DeliveryMode::Unordered)
+                    .with_max_message_len(MAX);
+                let payload = vec![0xCDu8; MAX];
+                tx.send(&payload).await.unwrap();
+                let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("a payload exactly at the receiver limit was dropped (recv hung)")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(msg, payload);
+            })
+            .await;
+    }
+
     // -------------------------------------------------------------------
     // Sender admission backpressure
     // -------------------------------------------------------------------
@@ -1136,36 +1163,47 @@ mod tests {
             .await;
     }
 
-    struct MaxAllocRecorder;
-
-    static MAX_SINGLE_ALLOC: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-
-    unsafe impl std::alloc::GlobalAlloc for MaxAllocRecorder {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            MAX_SINGLE_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
-            unsafe { std::alloc::System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-            MAX_SINGLE_ALLOC.fetch_max(layout.size(), Ordering::Relaxed);
-            unsafe { std::alloc::System.alloc_zeroed(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
-        }
-        unsafe fn realloc(
-            &self,
-            ptr: *mut u8,
-            layout: std::alloc::Layout,
-            new_size: usize,
-        ) -> *mut u8 {
-            MAX_SINGLE_ALLOC.fetch_max(new_size, Ordering::Relaxed);
-            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
-        }
+    /// The reorder buffer force-advances a permanent gap at *exactly* the
+    /// cap: with `reorder_cap` messages buffered and the next expected
+    /// sequence permanently missing, the receiver must deliver the lowest
+    /// buffered message rather than wait forever. Drives the real `recv`
+    /// path with hand-built frames (the public `DualMessageSender` assigns
+    /// contiguous sequence numbers, so it cannot create the gap these
+    /// force-advance guards exist for). Pins the `>=` in
+    /// [`DualMessageReceiver::pop_ordered`].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_force_advance_fires_at_exactly_the_reorder_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (opener, accepter, scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                // A small cap keeps the test cheap; the force-advance logic
+                // and the `recv` path are identical at any cap.
+                rx.reorder_cap = 4;
+                // Send seq 1..=4, leaving seq 0 permanently missing.
+                for seq in 1..=4u64 {
+                    let (_reader, mut writer) = opener
+                        .open(crate::traffic_class::LaneClass::Interactive)
+                        .await
+                        .unwrap();
+                    let payload = [0xAAu8; 8];
+                    let mut frame = Vec::new();
+                    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    frame.extend_from_slice(&seq.to_le_bytes());
+                    frame.extend_from_slice(&payload);
+                    writer.write_all(&frame).await.unwrap();
+                    writer.shutdown().unwrap();
+                }
+                let msg = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("the reorder buffer never force-advanced a permanent gap at the cap")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(msg, vec![0xAAu8; 8]);
+            })
+            .await;
     }
-
-    #[global_allocator]
-    static MAX_ALLOC_RECORDER: MaxAllocRecorder = MaxAllocRecorder;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_length_prefix_alone_does_not_allocate_its_payload() {
@@ -1177,7 +1215,7 @@ mod tests {
                 let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Unordered)
                     .with_max_message_len(2 * HUGE);
                 let (_reader, mut writer) = opener.open_auto();
-                MAX_SINGLE_ALLOC.store(0, Ordering::Relaxed);
+                crate::test_alloc::MAX_SINGLE_ALLOC.store(0, Ordering::Relaxed);
                 writer
                     .write_all(&(HUGE as u32).to_le_bytes())
                     .await
@@ -1189,7 +1227,7 @@ mod tests {
                         .is_err(),
                     "recv yielded a message that was never sent",
                 );
-                let peak = MAX_SINGLE_ALLOC.load(Ordering::Relaxed);
+                let peak = crate::test_alloc::MAX_SINGLE_ALLOC.load(Ordering::Relaxed);
                 assert!(
                     peak < HUGE / 2,
                     "a bare length prefix caused a {peak}-byte allocation - a peer sending nothing but \

@@ -1580,6 +1580,50 @@ mod reassembly_tests {
         );
     }
 
+    /// The product contract behind the read-queue soft limit: a reader that is
+    /// merely *slow* but keeps draining must never have its stream retired
+    /// (which reaches the peer as `BrokenPipe`). Only a reader that drains
+    /// nothing is refused. This drives the real
+    /// `MuxControl::dispatch_data` -> `retire_stream` path across several
+    /// grace periods while the backlog stays above the soft limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_transiently_slow_but_progressing_reader_keeps_its_stream() {
+        let (mut control, _close_tx, drain) = make_control(false);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                let mut rx = open_test_stream(&mut control, 1).await;
+                let backlog = crate::stream::reader::STREAM_READ_SOFT_DATA_LIMIT * 4;
+                for _ in 0..backlog {
+                    control
+                        .dispatcher(1)
+                        .unwrap()
+                        .send_data(buf(&[0xAA]))
+                        .unwrap();
+                }
+                // Each round the reader drains a few items and the writer
+                // refills them, holding the backlog above the soft limit
+                // across several grace periods.
+                for _ in 0..5 {
+                    tokio::time::advance(Duration::from_millis(5)).await;
+                    for _ in 0..8 {
+                        rx.try_recv().unwrap();
+                    }
+                    for _ in 0..8 {
+                        control
+                            .dispatch_data(1, buf(&[0xBB]))
+                            .expect("a reader that keeps draining must not be retired");
+                    }
+                }
+                assert!(
+                    control.stream_table.contains_key(&1),
+                    "the stream was retired despite the reader making progress"
+                );
+            })
+            .await;
+    }
+
     /// A reassembly burst that spills past the old 1024-item soft watermark
     /// into the new hard headroom must not block the session control loop,
     /// and a sibling stream must keep flowing throughout.
@@ -1832,6 +1876,68 @@ mod reassembly_tests {
                         .await
                         .is_err(),
                     "every stray frame after the teardown amplified into another CloseRead on the session-wide control lane"
+                );
+            })
+            .await;
+    }
+
+    /// When a stream's last outstanding side closes, its table entry and its
+    /// local-id slot must be released. The peer sides are closed FIRST so the
+    /// retire can only be triggered by `local_close` (a peer-first ordering
+    /// followed by the final local close), not by the peer close path.
+    #[tokio::test]
+    async fn a_fully_closed_stream_releases_its_table_entry_and_slot() {
+        let (mut control, _close_tx, drain) = make_control(false);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                let (dispatcher, _rx) = stream_read_channel();
+                let bp = PeerReadClosedFlag::new();
+                let (id, _tx) = control.open(dispatcher, bp, None).await.unwrap();
+                assert_eq!(control.local_opened_streams, 1, "local slot not counted");
+                control.peer_close(id, Side::Read);
+                control.peer_close(id, Side::Write);
+                control.local_close(id, Side::Read);
+                control.local_close(id, Side::Write);
+                assert!(
+                    !control.stream_table.contains_key(&id),
+                    "a fully-closed stream was left in the stream table"
+                );
+                assert_eq!(
+                    control.local_opened_streams, 0,
+                    "the local-id slot of a fully-closed stream was not released"
+                );
+            })
+            .await;
+    }
+
+    /// Once the peer's write side is closed, the stream must stop offering a
+    /// read sink: a late Data frame after the FIN would append bytes past the
+    /// peer's declared end-of-stream. The peer close is delivered through the
+    /// real control path, and the late frame through the real dispatch path.
+    #[tokio::test]
+    async fn data_after_the_peer_fin_is_not_dispatched() {
+        let mut rig = central_read_rig(false);
+        let mut scope = ControlScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                let mut rx = open_test_stream(&mut rig.control, 3).await;
+                rig.deliver(CentralIoReadMsg::Close(3, Side::Write, 0))
+                    .await
+                    .unwrap();
+                assert!(matches!(rx.try_recv(), Ok(StreamReadDataMsg::Fin)));
+                assert!(
+                    rig.control.dispatcher(3).is_none(),
+                    "a peer-write-closed stream still exposed a read sink"
+                );
+                rig.deliver(CentralIoReadMsg::Data(3, 0, buf(&[0xAA])))
+                    .await
+                    .unwrap();
+                assert!(
+                    rx.try_recv().is_err(),
+                    "data after the peer's FIN was dispatched to the reader"
                 );
             })
             .await;

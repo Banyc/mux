@@ -172,14 +172,21 @@ mod tests {
         for _ in 0..expected.len() {
             got.push(close_rx.recv().await.unwrap());
         }
-        assert_eq!(
-            got.len(),
-            expected.len(),
-            "a close notification was lost to the queue"
-        );
         for msg in expected {
             assert!(got.contains(&msg), "missing close notification {msg:?}");
         }
+        // The drain loop fixes `got.len()` at `expected.len()`, so a count
+        // equality could never fail (and a *lost* notification makes
+        // `contains` fail instead). What the loop cannot observe is an
+        // *extra* notification beyond the expected set: poll the channel
+        // once (a zero-duration timeout performs a single poll with no
+        // wall-clock dependence) and require it to be empty.
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, close_rx.recv())
+                .await
+                .is_err(),
+            "a close notification beyond the expected set leaked from the queue"
+        );
     }
 
     #[tokio::test]

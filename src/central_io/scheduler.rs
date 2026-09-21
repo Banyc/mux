@@ -46,12 +46,18 @@ pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
         token_to_stream: HashMap::new(),
         heads: BTreeMap::new(),
         head_pick_start: fair_queue::QueueToken(0),
+        deficit: HashMap::new(),
         rx_closed: false,
         split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
         latency: LatencyControl::new(),
     };
     (tx, rx)
 }
+/// Sole authority for egress dispatch: which cached head is sent and how many
+/// bytes. Control heads win; data heads use deficit round robin with
+/// `(remaining length, round-robin distance)` as the latency-preemption and
+/// rotation tie-break. The upstream [`fair_queue::Receiver`] supplies ready
+/// heads only (admission/FIFO); its scan order is never consulted here.
 #[derive(Debug)]
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
@@ -62,6 +68,12 @@ pub struct WriteDataRx {
     heads: BTreeMap<fair_queue::QueueToken, HeadEntry>,
     /// Round-robin cursor for selecting among cached heads.
     head_pick_start: fair_queue::QueueToken,
+    /// Per-token byte credit for the current round. A ready data head may
+    /// dispatch while its credit covers the next chunk; each round every ready
+    /// head is credited one quantum, so a stream with many small messages is
+    /// served several times in a round instead of moving one chunk against a
+    /// peer's full quantum. Control heads are exempt.
+    deficit: HashMap<fair_queue::QueueToken, usize>,
     /// Set once the underlying fair-queue receiver reports closure.
     rx_closed: bool,
     /// Pool for prefix buffers produced by splitting a large Data head.
@@ -114,6 +126,7 @@ impl WriteDataRx {
                                 continue;
                             };
                             self.latency.close(token);
+                            self.deficit.remove(&token);
                             WriteDataMsg {
                                 stream_id,
                                 data: StreamWriteData::Fin,
@@ -132,27 +145,18 @@ impl WriteDataRx {
                 }
             }
         }
-        // Select the best cached head: smallest (priority_size), then
-        // round-robin distance from `head_pick_start`.
+        // Select the best cached head: control frames first, then round-robin
+        // across streams in arrival-cursor order.
         if self.heads.is_empty() {
             if self.rx_closed {
                 return Err(DeadControl {}).into();
             }
             return Poll::Pending;
         }
-        let chosen = self.pick_head();
+        let (chosen, cap) = self.pick_head();
         let (_, mut entry) = self.heads.remove_entry(&chosen).unwrap();
         self.head_pick_start = fair_queue::QueueToken(chosen.0.wrapping_add(1));
         if let StreamWriteData::Data(ref data) = entry.msg.data {
-            let cap = if self.latency.any_latency_sensitive() {
-                if self.heads.is_empty() {
-                    DATA_MEDIUM_CAP
-                } else {
-                    DATA_CONTENDED_CAP
-                }
-            } else {
-                DATA_BULK_CAP
-            };
             if entry.offset == 0 || data.len() >= DATA_BULK_CAP {
                 // Record once at first dispatch, and additionally on every
                 // dispatch for heads whose original length is at least
@@ -195,26 +199,107 @@ impl WriteDataRx {
         }
         Ok(entry.msg).into()
     }
-    /// Pick the next token to dispatch from `heads`.
+    /// Pick the next head to dispatch from `heads`, returning its token and
+    /// the dispatch cap to apply.
     ///
-    /// Selection key: `(priority_size, round_robin_distance_from_head_pick_start)`.
-    /// `priority_size`: Open = 0, Fin = 0, Data = remaining data length.
-    /// Equal-size tie-breaking is round-robin by distance from
-    /// `head_pick_start` (with wraparound), not lowest-token-first.
-    fn pick_head(&self) -> fair_queue::QueueToken {
+    /// Control heads (`Open`, `Fin`) always win. Among data heads the round is
+    /// byte-fair deficit round robin: each ready stream is credited one
+    /// `quantum` per round and keeps its turn while its credit covers the next
+    /// chunk. A stream whose head is a single small chunk (e.g. a 4 KiB message
+    /// beside 64 KiB messages) is therefore dispatched again within the same
+    /// round instead of moving one chunk against a peer's full-budget chunk.
+    /// Within a round the smallest remaining head is picked first (round-robin
+    /// on ties), so a newly ready small message still preempts a cached large
+    /// tail. Every ready stream is credited at least one quantum per round, so
+    /// no stream can be pinned at zero bytes.
+    fn pick_head(&mut self) -> (fair_queue::QueueToken, usize) {
         let start = self.head_pick_start;
-        let mut best: Option<(fair_queue::QueueToken, (usize, usize))> = None;
+        let mut best_control: Option<(fair_queue::QueueToken, (usize, usize))> = None;
         for (&token, entry) in &self.heads {
-            let priority = priority_size(entry);
-            let distance = round_robin_distance(start, token);
-            let key = (priority, distance);
-            match best {
-                Some((_, best_key)) if best_key <= key => {}
-                _ => best = Some((token, key)),
+            if matches!(entry.msg.data, StreamWriteData::Data(_)) {
+                continue;
+            }
+            let key = (priority_size(entry), round_robin_distance(start, token));
+            if best_control.is_none_or(|(_, best_key)| key < best_key) {
+                best_control = Some((token, key));
             }
         }
-        best.unwrap().0
+        if let Some((token, _)) = best_control {
+            return (token, 0);
+        }
+
+        let sensitive = self.latency.any_latency_sensitive();
+        // One quantum is at least the largest cap any dispatch can use, so a
+        // single replenish always leaves at least one head dispatchable and the
+        // round cannot stall.
+        let quantum = if sensitive {
+            DATA_MEDIUM_CAP
+        } else {
+            DATA_BULK_CAP
+        };
+        // A stream that is the only ready head keeps the larger medium cap;
+        // with peers present a latency-sensitive dispatch is held to the
+        // contended cap.
+        let cap = if sensitive {
+            if self.heads.len() == 1 {
+                DATA_MEDIUM_CAP
+            } else {
+                DATA_CONTENDED_CAP
+            }
+        } else {
+            DATA_BULK_CAP
+        };
+
+        // Credit every newly-active data head a full quantum so a stream that
+        // becomes ready mid-round is served promptly rather than waiting for
+        // the current round to drain. A head that replaces an already-active
+        // token keeps the carried credit, which is what makes the accounting
+        // byte-fair for a stream that sends many small messages.
+        for (&token, entry) in &self.heads {
+            if matches!(entry.msg.data, StreamWriteData::Data(_)) {
+                self.deficit.entry(token).or_insert(quantum);
+            }
+        }
+
+        let any_dispatchable = self.heads.iter().any(|(&token, entry)| {
+            matches!(entry.msg.data, StreamWriteData::Data(_))
+                && self.deficit.get(&token).copied().unwrap_or(0) >= candidate_emit(entry, cap)
+        });
+        if !any_dispatchable {
+            // New round: replenish every ready data head by one quantum.
+            for (&token, entry) in &self.heads {
+                if matches!(entry.msg.data, StreamWriteData::Data(_)) {
+                    *self.deficit.entry(token).or_insert(0) += quantum;
+                }
+            }
+        }
+
+        let mut best: Option<(fair_queue::QueueToken, (usize, usize))> = None;
+        for (&token, entry) in &self.heads {
+            if !matches!(entry.msg.data, StreamWriteData::Data(_)) {
+                continue;
+            }
+            if self.deficit.get(&token).copied().unwrap_or(0) < candidate_emit(entry, cap) {
+                continue;
+            }
+            let key = (priority_size(entry), round_robin_distance(start, token));
+            if best.is_none_or(|(_, best_key)| key < best_key) {
+                best = Some((token, key));
+            }
+        }
+        let (token, _) = best.expect("a replenished round always has a dispatchable data head");
+        let cost = candidate_emit(&self.heads[&token], cap);
+        if let Some(deficit) = self.deficit.get_mut(&token) {
+            *deficit -= cost;
+        }
+        (token, cap)
     }
+}
+
+/// Bytes a dispatch of `entry` would move under `cap`: its whole remaining
+/// head, or one capped chunk of it.
+fn candidate_emit(entry: &HeadEntry, cap: usize) -> usize {
+    priority_size(entry).min(cap)
 }
 
 fn priority_size(entry: &HeadEntry) -> usize {
@@ -506,6 +591,106 @@ mod tests {
         assert_eq!(sixth.stream_id, 3);
     }
 
+    /// Deficit round robin is byte-fair: beside full-quantum bulk peers, a
+    /// stream whose head is a single 4 KiB chunk is dispatched repeatedly
+    /// within the round instead of moving one chunk per peer chunk. The earlier
+    /// one-chunk-per-round scheduler moved 4 KiB against 32 KiB; here every
+    /// stream ends the round within one quantum of the others.
+    #[test]
+    fn pick_head_is_byte_fair_across_chunk_sizes() {
+        let (_tx, mut rx) = write_data_channel();
+        let chunk = [4096usize, DATA_BULK_CAP, DATA_BULK_CAP];
+        for (i, &size) in chunk.iter().enumerate() {
+            rx.heads.insert(
+                fair_queue::QueueToken(i),
+                HeadEntry {
+                    msg: WriteDataMsg {
+                        stream_id: i as u32,
+                        data: StreamWriteData::Data(make_data(&vec![0u8; size])),
+                    },
+                    offset: 0,
+                },
+            );
+        }
+        rx.head_pick_start = fair_queue::QueueToken(0);
+
+        let mut moved = [0usize; 3];
+        for _ in 0..chunk.len() * 32 {
+            let (token, cap) = rx.pick_head();
+            let mut entry = rx.heads.remove(&token).unwrap();
+            let stream_id = entry.msg.stream_id as usize;
+            let StreamWriteData::Data(ref data) = entry.msg.data else {
+                panic!("expected a data head");
+            };
+            let remaining = data.len() - entry.offset;
+            let emit = remaining.min(cap);
+            moved[stream_id] += emit;
+            entry.offset += emit;
+            let total = data.len();
+            let refill = if entry.offset < total {
+                entry
+            } else {
+                // Keep the stream backlogged with another same-size message,
+                // like a producer that never runs dry.
+                HeadEntry {
+                    msg: WriteDataMsg {
+                        stream_id: stream_id as u32,
+                        data: StreamWriteData::Data(make_data(&vec![0u8; chunk[stream_id]])),
+                    },
+                    offset: 0,
+                }
+            };
+            rx.heads.insert(token, refill);
+        }
+        let min = *moved.iter().min().unwrap();
+        let max = *moved.iter().max().unwrap();
+        assert!(
+            max - min <= DATA_BULK_CAP,
+            "per-stream bytes must stay within one quantum across chunk sizes: {moved:?}"
+        );
+        assert!(
+            moved.iter().all(|&b| b > 0),
+            "no stream may be starved: {moved:?}"
+        );
+    }
+
+    /// The smaller ready data head still wins the first pick of a round, so a
+    /// newly ready small message preempts a cached large tail.
+    #[test]
+    fn pick_head_smallest_remaining_wins_first_pick() {
+        let (_tx, mut rx) = write_data_channel();
+        rx.heads.insert(
+            fair_queue::QueueToken(0),
+            HeadEntry {
+                msg: WriteDataMsg {
+                    stream_id: 1,
+                    data: StreamWriteData::Data(make_data(&[0u8; DATA_BULK_CAP])),
+                },
+                offset: 0,
+            },
+        );
+        rx.heads.insert(
+            fair_queue::QueueToken(1),
+            HeadEntry {
+                msg: WriteDataMsg {
+                    stream_id: 2,
+                    data: StreamWriteData::Data(make_data(&[1u8; 10])),
+                },
+                offset: 0,
+            },
+        );
+        rx.head_pick_start = fair_queue::QueueToken(0);
+        assert_eq!(
+            rx.pick_head().0,
+            fair_queue::QueueToken(1),
+            "the smaller ready head wins the first pick"
+        );
+    }
+
+    /// Control heads (`Open`, `Fin`) sort before data; among data the
+    /// remaining length is the latency-preemption ordering hint, refined by
+    /// [`WriteDataRx::pick_head`]'s byte-credit accounting so equal-length
+    /// peers still rotate and no stream can be starved.
     #[test]
     fn priority_size_open_and_fin_are_zero() {
         let open = HeadEntry {
@@ -1052,5 +1237,107 @@ mod tests {
         while let Some(result) = sender_tasks.join_next().await {
             result.unwrap();
         }
+    }
+    /// Send one `data` message on `stream` from a caller-owned data pool
+    /// and drain every dispatch it produces, returning `(dispatches, bytes
+    /// seen)`. The caller owns `data` (built once, outside any measured
+    /// region) and the shared pool means the transported buffer is reused
+    /// across messages (a fresh pool per call would allocate a fresh buffer
+    /// in the measured region and pollute the allocation count).
+    async fn send_and_drain_counting(
+        pool: &primitive::arena::obj_pool::ArcObjPool<Vec<u8>>,
+        data: &[u8],
+        stream: &StreamWriteDataTx,
+        rx: &mut WriteDataRx,
+    ) -> (usize, usize) {
+        let tx = stream.tx.clone();
+        let sid = stream.stream_id;
+        let size = data.len();
+        let mut sent = false;
+        let mut seen = 0usize;
+        let mut dispatches = 0usize;
+        while !sent || seen < size {
+            tokio::join!(
+                async {
+                    if !sent {
+                        let mut scoped = pool.take_scoped();
+                        scoped.clear();
+                        scoped.extend_from_slice(data);
+                        tx.send(WriteDataMsg {
+                            stream_id: sid,
+                            data: StreamWriteData::Data(scoped),
+                        })
+                        .await
+                        .unwrap();
+                        sent = true;
+                    }
+                },
+                async {
+                    if seen < size {
+                        let msg = rx.recv().await.unwrap();
+                        assert_eq!(msg.stream_id, sid);
+                        if let StreamWriteData::Data(data) = msg.data {
+                            seen += data.len();
+                            dispatches += 1;
+                        }
+                    }
+                }
+            );
+        }
+        (dispatches, seen)
+    }
+
+    // ---- Pooled-buffer allocation pins ----
+
+    /// The prefix buffers a large head is chopped into come from the
+    /// scheduler's `split_pool` and the split copies the *minimum* bytes on
+    /// each dispatch, so a steady split-heavy round does not allocate: the
+    /// only allocations in the drain are the fair-queue ready-count node and
+    /// the cached-head BTreeMap node per message (one each), plus one cached
+    /// head node per split dispatch. Regression guard for the pooled reuse
+    /// (replacing `split_pool.take_scoped()` with a fresh `Vec` allocates a
+    /// new buffer per split dispatch and must fail here).
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_prefix_buffers_are_pooled_not_allocated_per_dispatch() {
+        let (tx, mut rx) = write_data_channel();
+        let stream = open_stream(&tx, &mut rx, 1).await;
+        let pool = arc_buf_pool::<u8>(None, std::num::NonZeroUsize::new(1).unwrap());
+
+        // Classification warm-up: three > BULK_THRESHOLD messages flip the
+        // fresh stream from latency-sensitive (2 KiB caps) to bulk, so the
+        // measured cycle below splits at the uniform DATA_BULK_CAP only.
+        let classify = [0u8; 4097];
+        for _ in 0..3 {
+            send_and_drain_counting(&pool, &classify, &stream, &mut rx).await;
+        }
+        assert!(
+            !rx.latency.any_latency_sensitive(),
+            "the stream must be bulk before the measured cycle"
+        );
+
+        // Bulk-capped split heads: 16 full DATA_BULK_CAP dispatches plus a
+        // 7-byte tail = 17 dispatches, 16 of which split. Run the identical
+        // big message twice: the first warms the split pool with exactly
+        // sized 32 KiB prefix buffers (and the deficit/heads/ready maps), the
+        // second is the measured cycle.
+        const BIG: usize = DATA_BULK_CAP * 16 + 7;
+        let big_data = vec![0u8; BIG];
+        let (warm_dispatches, warm_seen) =
+            send_and_drain_counting(&pool, &big_data, &stream, &mut rx).await;
+        assert_eq!(warm_seen, BIG);
+        assert_eq!(warm_dispatches, 17);
+
+        let before = crate::test_alloc::thread_alloc_count();
+        let (dispatches, seen) = send_and_drain_counting(&pool, &big_data, &stream, &mut rx).await;
+        let allocated = crate::test_alloc::thread_alloc_count() - before;
+        assert_eq!(seen, BIG);
+        assert_eq!(dispatches, 17);
+        assert_eq!(
+            allocated, 0,
+            "a warm split-heavy round allocated {allocated} times; every split \
+             dispatch must take its prefix from the split pool and reuse the \
+             original head in place (the fair-queue ready-count and cached-head \
+             BTreeMaps reuse their nodes, so nothing else may allocate)",
+        );
     }
 }

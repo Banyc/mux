@@ -177,37 +177,36 @@ where
         while body_offset != data_buf.len() {
             let body_len = (data_buf.len() - body_offset).min(max_body);
             let body_len_u16 = BodyLen::try_from(body_len).unwrap();
-            let fixed_buf: Vec<u8>;
-            if self.frame_reassembly {
+            // Build the fixed header on the stack: both the stock and the
+            // extended Data header fit in `Header::SIZE +
+            // DataHeaderExt::SIZE`, so the per-frame encode never allocates a
+            // heap buffer.
+            let mut fixed = [0u8; Header::SIZE + DataHeaderExt::SIZE];
+            fixed[..Header::SIZE].copy_from_slice(&hdr.encode());
+            let fixed_len = if self.frame_reassembly {
                 let cur_offset_64 = *self.next_offset.get(&msg.stream_id).unwrap_or(&0);
                 let data_hdr = DataHeaderExt {
                     stream_id: msg.stream_id,
                     body_len: body_len_u16,
                     offset: cur_offset_64 as Offset,
                 };
-                let hdr_bytes = hdr.encode();
-                let data_hdr_bytes = data_hdr.encode();
-                let mut concat = hdr_bytes.into_iter().chain(data_hdr_bytes);
-                let buf: [u8; Header::SIZE + DataHeaderExt::SIZE] =
-                    core::array::from_fn(|_| concat.next().unwrap());
-                fixed_buf = buf.to_vec();
+                fixed[Header::SIZE..Header::SIZE + DataHeaderExt::SIZE]
+                    .copy_from_slice(&data_hdr.encode());
                 self.next_offset
                     .insert(msg.stream_id, cur_offset_64 + body_len as u64);
+                Header::SIZE + DataHeaderExt::SIZE
             } else {
                 let data_hdr = DataHeader {
                     stream_id: msg.stream_id,
                     body_len: body_len_u16,
                 };
-                let hdr_bytes = hdr.encode();
-                let data_hdr_bytes = data_hdr.encode();
-                let mut concat = hdr_bytes.into_iter().chain(data_hdr_bytes);
-                let buf: [u8; Header::SIZE + DataHeader::SIZE] =
-                    core::array::from_fn(|_| concat.next().unwrap());
-                fixed_buf = buf.to_vec();
-            }
+                fixed[Header::SIZE..Header::SIZE + DataHeader::SIZE]
+                    .copy_from_slice(&data_hdr.encode());
+                Header::SIZE + DataHeader::SIZE
+            };
             let body = &data_buf[body_offset..body_offset + body_len];
             body_offset += body_len;
-            self.write_all_frame(&fixed_buf, body).await?;
+            self.write_all_frame(&fixed[..fixed_len], body).await?;
         }
         Ok(())
     }
@@ -927,5 +926,155 @@ mod tests {
             pos += frame_total;
         }
         assert_eq!(pos, out.len());
+    }
+
+    /// A warm, non-vectored encoder must encode and emit a Data frame without
+    /// any heap allocation on the current thread. Regression for the
+    /// per-frame `buf.to_vec()` fixed-header allocation: the header is now
+    /// assembled on the stack, so a frame costs no allocation at all.
+    #[tokio::test]
+    async fn data_frames_do_not_allocate_a_fixed_header() {
+        struct DiscardWriter;
+        impl AsyncWrite for DiscardWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+
+        let mut central = CentralIoEncoder::new(DiscardWriter, false);
+        let body = vec![0xABu8; 1024];
+        // One pool for the whole test so the pooled `Vec<u8>` is reused across
+        // frames; otherwise the pool itself would allocate inside the measured
+        // loop.
+        let pool = arc_buf_pool::<u8>(None, std::num::NonZeroUsize::new(1).unwrap());
+        let make = |bytes: &[u8]| {
+            let mut buf = pool.take_scoped();
+            buf.clear();
+            buf.extend_from_slice(bytes);
+            buf
+        };
+
+        // Warm `frame_buf` and the pool so the measured loop's only possible
+        // allocation is the encoder's own per-frame header buffer.
+        for _ in 0..8 {
+            central
+                .send_data(WriteDataMsg {
+                    stream_id: 1,
+                    data: StreamWriteData::Data(make(&body)),
+                })
+                .await
+                .unwrap();
+        }
+
+        const FRAMES: usize = 64;
+        let before = crate::test_alloc::thread_alloc_count();
+        for _ in 0..FRAMES {
+            central
+                .send_data(WriteDataMsg {
+                    stream_id: 1,
+                    data: StreamWriteData::Data(make(&body)),
+                })
+                .await
+                .unwrap();
+        }
+        let allocated = crate::test_alloc::thread_alloc_count() - before;
+        assert_eq!(
+            allocated, 0,
+            "the encoder made {allocated} allocations across {FRAMES} Data frames; \
+             the fixed header must be assembled on the stack"
+        );
+    }
+
+    /// A vectored transport receives a Data frame as separate `(fixed header,
+    /// body)` `IoSlice`s with the payload passed by reference: the encoder
+    /// must not coalesce the frame into its staging `frame_buf` (which would
+    /// copy every payload byte). A non-vectored `poll_write` receiving a Data
+    /// frame proves a coalesce copy. Regression guard for the coalesce-only
+    /// fast path that predated the vectored write.
+    #[tokio::test]
+    async fn vectored_data_frames_pass_the_payload_by_reference() {
+        struct SliceRecorder {
+            plain_writes: usize,
+            slices: Vec<Vec<u8>>,
+        }
+        impl AsyncWrite for SliceRecorder {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.plain_writes += 1;
+                this.slices.push(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bufs: &[IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                this.slices
+                    .push(bufs.iter().flat_map(|b| b.iter().copied()).collect());
+                Poll::Ready(Ok(bufs.iter().map(|b| b.len()).sum()))
+            }
+        }
+
+        let body = vec![0x42u8; 4096];
+        let mut central = CentralIoEncoder::new(
+            SliceRecorder {
+                plain_writes: 0,
+                slices: Vec::new(),
+            },
+            false,
+        );
+        central
+            .send_data(WriteDataMsg {
+                stream_id: 1,
+                data: StreamWriteData::Data(make_data_buf(&body)),
+            })
+            .await
+            .unwrap();
+        let recorder = &central.io_writer;
+        assert_eq!(
+            recorder.plain_writes, 0,
+            "a vectored transport was handed the Data frame as a single \
+             non-vectored buffer: the payload was coalesce-copied through \
+             frame_buf instead of passed by reference",
+        );
+        assert_eq!(
+            recorder.slices.len(),
+            1,
+            "expected exactly one vectored write for one Data frame"
+        );
+        let written = &recorder.slices[0];
+        assert_eq!(written.len(), Header::SIZE + DataHeader::SIZE + body.len());
+        assert_eq!(
+            &written[Header::SIZE + DataHeader::SIZE..],
+            &body[..],
+            "the body the writer received is not the caller's payload bytes"
+        );
     }
 }

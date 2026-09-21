@@ -871,7 +871,8 @@ impl DualStreamAccepter {
 /// A response router is split into a cheap, cloneable [`ResponseRouterHandle`]
 /// (handed out to sessions/streams) and a driver that owns the supervised
 /// accepter-task [`JoinSet`]. The driver is reaped by a long-lived owner —
-/// `rtp_mux::run_connector` — so completed-task and peek-task [`JoinError`]s
+/// the cooperation crate's `run_connector` — so completed-task and peek-task
+/// [`JoinError`]s
 /// are observed instead of being silently discarded (a panic in an accepter
 /// loop surfaces on reap rather than vanishing into a `try_join_next` drain).
 ///
@@ -2213,6 +2214,106 @@ mod tests {
         .unwrap();
         assert_eq!(resp, "pong-across");
         req_writer.finalize().await.unwrap();
+    }
+
+    /// The auto-classification gate is selected by the OPEN call site, not
+    /// only by the mirrored classifier: `open_migrating` classifies each
+    /// write and promotes before sending a bulk write, while
+    /// `open_migrating_manual` must never auto-migrate. Observing the
+    /// writer's lane proves the gate itself, not just `SizeMix` in
+    /// isolation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_auto_gate_is_selected_by_the_open_call_site() {
+        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let bulk_sized = vec![0u8; 33 * 1024];
+
+        let mut auto = opener.open_migrating(31, LaneClass::Interactive);
+        auto.write_all(&bulk_sized).await.unwrap();
+        match &auto.state {
+            WriterState::Active { lane, .. } if *lane == LaneClass::Bulk => {}
+            _ => panic!("open_migrating did not promote a bulk write before sending it"),
+        }
+        auto.finalize().await.unwrap();
+
+        let mut manual = opener.open_migrating_manual(32, LaneClass::Interactive);
+        manual.write_all(&bulk_sized).await.unwrap();
+        match &manual.state {
+            WriterState::Active { lane, .. } if *lane == LaneClass::Interactive => {}
+            _ => panic!("open_migrating_manual auto-migrated despite the manual call site"),
+        }
+        manual.finalize().await.unwrap();
+    }
+
+    /// `flush`'s state machine: a never-opened writer flushes without
+    /// opening a stream, while a migrating writer must open its target lane
+    /// before returning Ok (so the flushed bytes reach the wire).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_opens_a_migrating_writer_and_no_ops_a_pending_one() {
+        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+
+        let mut pending = opener.open_migrating_manual(41, LaneClass::Interactive);
+        assert!(matches!(pending.state, WriterState::PendingOpen { .. }));
+        pending.flush().await.unwrap();
+        assert!(
+            matches!(pending.state, WriterState::PendingOpen { .. }),
+            "flush must not open a stream that has nothing to flush"
+        );
+
+        pending.force_migrate(LaneClass::Bulk).await.unwrap();
+        assert!(matches!(
+            pending.state,
+            WriterState::Migrating {
+                target_lane: LaneClass::Bulk
+            }
+        ));
+        pending.flush().await.unwrap();
+        match &pending.state {
+            WriterState::Active { lane, .. } if *lane == LaneClass::Bulk => {}
+            _ => panic!("flush on a migrating writer did not open the target lane"),
+        }
+        pending.finalize().await.unwrap();
+    }
+
+    /// A substream that never emits a resume header must be DROPPED once
+    /// the header deadline elapses, never surfaced as a plain application
+    /// stream: `into_migrating_capable` passes genuine plain streams, so the
+    /// deadline is the only thing keeping a silent peer from injecting a
+    /// bogus raw substream into the application.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_substream_is_dropped_at_the_header_deadline() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+        let _silent = opener.open(LaneClass::Interactive).await.unwrap();
+        let mut accept = JoinSet::new();
+        accept.spawn(async move { mac.accept().await });
+        tokio::time::sleep(RESUME_HEADER_DEADLINE * 10).await;
+        assert!(
+            accept.try_join_next().is_none(),
+            "a silent substream was surfaced as an application stream instead of being dropped at the header deadline"
+        );
+        accept.abort_all();
+    }
+
+    /// A dead splice feed must surface as `LaneDead` rather than being
+    /// skipped: swallowing `FeedDead` leaves the accepter waiting forever
+    /// while every stream the peer opens is dropped on the floor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_splice_feed_surfaces_lane_dead() {
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let (feed, mut driver) = spawn_splice_router();
+        let mut mac = accepter.into_migrating_only_with_feed(feed);
+        driver.abort_all();
+        while driver.join_next().await.is_some() {}
+        let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+        writer.write_all(b"x").await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), mac.accept())
+            .await
+            .expect("the accepter hung on a dead splice feed instead of reporting LaneDead");
+        assert!(
+            matches!(result, Err(MigratingStreamError::LaneDead)),
+            "a dead splice feed produced {result:?}"
+        );
+        let _ = writer.finalize().await;
     }
 
     fn migrating(accepted: AcceptedStream) -> (SplicedReader, StreamWriter) {

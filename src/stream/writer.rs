@@ -371,4 +371,63 @@ mod tests {
         assert_eq!(&staged[..DATA_STAGING_CAP - 2], &first);
         assert_eq!(&staged[DATA_STAGING_CAP - 2..], &[0xBB; 2]);
     }
+
+    /// Staging reuses the writer's pooled buffer: after one warm chunk the
+    /// pool holds a capacity-matched buffer, so a second staged chunk copies
+    /// the caller's bytes without allocating a staging `Vec`. The only
+    /// allocations a staged chunk may make are the fair-queue ready-count node
+    /// and the cached-head BTreeMap node (one each, per chunk). Regression
+    /// guard for the pooled reuse: replacing `buf_pool.take_scoped()` with a
+    /// fresh `Vec` adds one allocation per staged chunk and must fail here.
+    #[tokio::test]
+    async fn staging_buffers_reuse_the_pool_after_warmup() {
+        let (mut writer, mut data_tx, mut rx) = stream_writer_state(2).await;
+        let chunk = vec![0xCCu8; 1024];
+        let mut cx = Context::from_waker(Waker::noop());
+
+        async fn stage_and_drain(
+            writer: &mut StreamWriterState,
+            data_tx: &mut PollStreamWriteDataTx,
+            rx: &mut crate::central_io::scheduler::WriteDataRx,
+            chunk: &[u8],
+            cx: &mut Context<'_>,
+        ) -> usize {
+            let n = match writer.poll_write(data_tx, chunk, cx) {
+                Poll::Ready(Ok(n)) => n,
+                other => panic!("poll_write should return Ready(Ok(...)): {other:?}"),
+            };
+            assert_eq!(n, chunk.len());
+            let mut seen = 0usize;
+            while seen < chunk.len() {
+                let msg = rx.recv().await.unwrap();
+                if let StreamWriteData::Data(buf) = msg.data {
+                    seen += buf.len();
+                } else {
+                    panic!("expected Data, got {other:?}", other = msg.data);
+                }
+            }
+            seen
+        }
+
+        // Warm the staging pool and the fair-queue maps with one identical
+        // chunk (single dispatch; no split at this size).
+        assert_eq!(
+            stage_and_drain(&mut writer, &mut data_tx, &mut rx, &chunk, &mut cx).await,
+            chunk.len()
+        );
+
+        let before = crate::test_alloc::thread_alloc_count();
+        let seen = stage_and_drain(&mut writer, &mut data_tx, &mut rx, &chunk, &mut cx).await;
+        let allocated = crate::test_alloc::thread_alloc_count() - before;
+        assert_eq!(seen, chunk.len());
+        assert_eq!(
+            allocated,
+            0,
+            "staging a warm {}-byte chunk allocated {allocated} times; the staged \
+             buffer must be taken from the writer's pool (the fair-queue \
+             ready-count and cached-head maps reuse their nodes), not allocated \
+             per write",
+            chunk.len(),
+        );
+    }
 }

@@ -1,7 +1,14 @@
-use std::{io, num::NonZeroUsize, time::Duration};
+use std::{
+    future::Future,
+    io,
+    num::NonZeroUsize,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use primitive::arena::obj_pool::ArcObjPool;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 
 use crate::{
     control::DeadControl,
@@ -16,6 +23,86 @@ const OBJ_POOL_SHARDS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const CHANNEL_SIZE: usize = 1024;
 const READ_BUF_CAPACITY: usize = 64 * 1024;
 const RECEIVE_DEADLINE_INTERVALS: u32 = 4;
+/// Deadline used by [`LivenessRead`] before `recv_with_steady_deadline` arms
+/// it. Never in force for a real read, but finite so `Instant + deadline`
+/// cannot overflow.
+const UNARMED_DEADLINE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// Enforces a *sliding* receive deadline over an [`AsyncRead`]: the read fails
+/// with [`io::ErrorKind::TimedOut`] only when no bytes have arrived for
+/// `deadline`, measured from the **last byte that did arrive** rather than from
+/// the start of the read. A large frame whose bytes trickle in steadily is
+/// progress and must not be severed; an idle peer makes no progress and is.
+struct LivenessRead<R> {
+    inner: R,
+    deadline: Duration,
+    last_progress: tokio::time::Instant,
+    /// Armed only while the inner read is pending and re-created whenever a
+    /// byte resets `last_progress`.
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+impl<R> LivenessRead<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            deadline: UNARMED_DEADLINE,
+            last_progress: tokio::time::Instant::now(),
+            sleep: None,
+        }
+    }
+    /// Re-arm the deadline from *now*: the next frame gets a full deadline
+    /// window, and any in-flight sleep for the old window is discarded.
+    fn set_deadline(&mut self, deadline: Duration) {
+        self.deadline = deadline;
+        self.last_progress = tokio::time::Instant::now();
+        self.sleep = None;
+    }
+}
+impl<R: std::fmt::Debug> std::fmt::Debug for LivenessRead<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LivenessRead")
+            .field("inner", &self.inner)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+impl<R> AsyncRead for LivenessRead<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.last_progress = tokio::time::Instant::now();
+                    self.sleep = None;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                let (deadline, last_progress) = (self.deadline, self.last_progress);
+                let sleep = self.sleep.get_or_insert_with(|| {
+                    Box::pin(tokio::time::sleep_until(last_progress + deadline))
+                });
+                if sleep.as_mut().poll(cx).is_ready() {
+                    self.sleep = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "receive deadline - session timed out",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
 
 pub async fn run_central_io_reader<R>(
     mut io_reader: CentralIoReader<R>,
@@ -54,7 +141,7 @@ impl From<io::Error> for RunCentralIoReaderError {
 
 #[derive(Debug)]
 pub struct CentralIoReader<R> {
-    io_reader: BufReader<R>,
+    io_reader: BufReader<LivenessRead<R>>,
     buf_pool: ArcObjPool<Vec<u8>>,
     frame_reassembly: bool,
 }
@@ -64,7 +151,7 @@ where
 {
     pub fn new(io_reader: R, frame_reassembly: bool) -> Self {
         Self {
-            io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, io_reader),
+            io_reader: BufReader::with_capacity(READ_BUF_CAPACITY, LivenessRead::new(io_reader)),
             buf_pool: ArcObjPool::new(None, OBJ_POOL_SHARDS, Vec::new, |v| v.clear()),
             frame_reassembly,
         }
@@ -80,19 +167,14 @@ where
         steady_deadline: Duration,
         first_receive_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> io::Result<CentralIoReadMsg> {
+        self.io_reader.get_mut().set_deadline(deadline);
         loop {
-            let res = tokio::time::timeout(deadline, self.recv_pkt())
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "receive deadline - session timed out",
-                    )
-                })??;
+            let res = self.recv_pkt().await?;
             if let Some(tx) = first_receive_tx.take() {
                 let _ = tx.send(());
             }
             deadline = steady_deadline;
+            self.io_reader.get_mut().set_deadline(deadline);
             if let Some(res) = res {
                 return Ok(res);
             }
@@ -272,5 +354,131 @@ mod tests {
         while let Some(result) = reader_tasks.join_next().await {
             result.unwrap();
         }
+    }
+
+    /// The receive deadline is a *liveness* probe: it must fire only when the
+    /// peer has gone silent, not when a large frame's bytes arrive slowly but
+    /// steadily. A frame whose total transfer outlasts the deadline while each
+    /// inter-byte gap is well under it is progress and must not be severed.
+    #[tokio::test(start_paused = true)]
+    async fn a_slowly_but_steadily_arriving_frame_is_not_severed() {
+        use crate::protocol::{DataHeader, Header};
+
+        let deadline = Duration::from_millis(100);
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut reader = CentralIoReader::new(server, false);
+        let mut first_receive_tx = None;
+
+        let body_len: u16 = 4096;
+        let mut frame = Vec::new();
+        frame.push(Header::Data.encode()[0]);
+        frame.extend_from_slice(
+            &DataHeader {
+                stream_id: 7,
+                body_len,
+            }
+            .encode(),
+        );
+        frame.extend(std::iter::repeat_n(0xABu8, body_len as usize));
+
+        // Deliver one byte every 10 ms: every gap is far below the deadline,
+        // but the whole frame takes tens of deadlines to arrive. The writer is
+        // owned by the test's JoinSet so the panic/abort discipline holds.
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            for byte in frame {
+                tokio::io::AsyncWriteExt::write_all(&mut client, &[byte])
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let msg = reader
+            .recv_with_steady_deadline(deadline, deadline, &mut first_receive_tx)
+            .await
+            .expect("a steadily-arriving frame must not trip the receive deadline");
+        match msg {
+            CentralIoReadMsg::Data(stream, _offset, body) => {
+                assert_eq!(stream, 7);
+                assert_eq!(body.len(), body_len as usize);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    }
+
+    /// A Data frame's body buffer is taken from the reader's buffer pool and
+    /// reused across frames: after one warm frame, receiving another identical
+    /// frame must not allocate. Regression guard for the pooled reuse
+    /// (replacing `buf_pool.take_scoped()` with a fresh `Vec` allocates once
+    /// per body frame and must fail here). Runs on the current thread so the
+    /// per-thread allocation counter measures this test's reads only.
+    #[tokio::test]
+    async fn data_frames_reuse_the_pooled_body_buffer() {
+        use crate::protocol::{DataHeader, Header};
+
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut reader = CentralIoReader::new(server, false);
+
+        let body_len: u16 = 8192;
+        let mut frame = Vec::new();
+        frame.push(Header::Data.encode()[0]);
+        frame.extend_from_slice(
+            &DataHeader {
+                stream_id: 7,
+                body_len,
+            }
+            .encode(),
+        );
+        frame.extend(std::iter::repeat_n(0xABu8, body_len as usize));
+
+        // Warm the pool shards (four shards need one frame each before the
+        // take/drop rotation aligns) and the BufReader with identical frames.
+        // Each warm read pre-fills the BufReader so the measured region
+        // performs zero inner I/O polls: the read exercises only frame
+        // decoding and the pooled body-buffer acquisition. Without the
+        // pre-fill the inner duplex read may occasionally poll Pending and the
+        // LivenessRead deadline machinery allocates a Box<Sleep>, which would
+        // make an exact allocation count timing-dependent.
+        for _ in 0..6 {
+            client.write_all(&frame).await.unwrap();
+            let _ = reader.io_reader.fill_buf().await.unwrap();
+            let msg = reader
+                .recv_pkt()
+                .await
+                .expect("a complete frame must decode");
+            let body_len_seen = match msg {
+                Some(CentralIoReadMsg::Data(_stream, _offset, body)) => body.len(),
+                other => panic!("expected Data, got {other:?}"),
+            };
+            assert_eq!(body_len_seen, 8192);
+        }
+        let mut allocated_total = 0usize;
+        for _ in 0..4 {
+            client.write_all(&frame).await.unwrap();
+            let _ = reader.io_reader.fill_buf().await.unwrap();
+            let before = crate::test_alloc::thread_alloc_count();
+            let msg = reader
+                .recv_pkt()
+                .await
+                .expect("a complete frame must decode");
+            let allocated = crate::test_alloc::thread_alloc_count() - before;
+            allocated_total += allocated;
+            let body_len_seen = match msg {
+                Some(CentralIoReadMsg::Data(_stream, _offset, body)) => body.len(),
+                other => panic!("expected Data, got {other:?}"),
+            };
+            assert_eq!(body_len_seen, 8192);
+            assert_eq!(
+                allocated, 0,
+                "a warm 8192-byte Data frame allocated {allocated} times; the body \
+                 buffer must be reused from the reader's pool, not allocated per \
+                 frame",
+            );
+        }
+        assert_eq!(allocated_total, 0);
     }
 }

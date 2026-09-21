@@ -255,6 +255,13 @@ impl SenderState {
     }
 }
 
+/// Multiplexes per-token senders into one ready stream.
+///
+/// Owns admission/readiness only: token allocation, per-token bounded FIFO,
+/// and the ready set. `recv_queue_start` orders which ready token is surfaced
+/// next, not who transmits; a consumer that drains every ready token before
+/// choosing (the `mux` egress `WriteDataRx`) decides dispatch itself, so this
+/// scan order is not observable there.
 #[derive(Debug)]
 pub struct Receiver<T> {
     opener: mpsc::Receiver<OpenRequest<T>>,
@@ -330,7 +337,6 @@ impl<T> Receiver<T> {
                 Poll::Pending => break,
             }
         }
-        let mut saw_ready = false;
         let scan_start = self.recv_queue_start;
         let mut wrapped = false;
         loop {
@@ -359,7 +365,6 @@ impl<T> Receiver<T> {
             // FIFO is preserved because an excluded token is only ever one
             // that already has a cached head upstream.
             if excluded(token) {
-                saw_ready = true;
                 self.recv_queue_start = QueueToken(token.0.wrapping_add(1));
                 continue;
             }
@@ -409,7 +414,6 @@ impl<T> Receiver<T> {
                 }
             }
         }
-        let _ = saw_ready;
         let nothing_else_to_poll = self.opener.is_closed() && self.queues.is_empty();
         if nothing_else_to_poll {
             None.into()

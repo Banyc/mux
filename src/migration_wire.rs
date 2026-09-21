@@ -2342,4 +2342,50 @@ mod tests {
         let result = registry.dispatch(hdr(MAX_SPLICE_STREAMS as u64, 0, false), c_over);
         assert!(matches!(result, Err(MigrationError::TooManySpliceStreams)));
     }
+
+    /// A generation *at* the FINAL marker is refused once the marker itself
+    /// has been consumed (popped) by the splice driver. Re-dispatching the
+    /// same number as a non-FINAL is not caught by the duplicate check (the
+    /// entry is gone), so only the boundary in the `GenerationAfterFinal`
+    /// guard rejects it. Pins the `>=` in [`SpliceRegistry::dispatch`].
+    #[tokio::test]
+    async fn a_generation_at_the_final_marker_is_refused_after_it_is_consumed() {
+        let mut registry = SpliceRegistry::new();
+        let (c0, _s0) = duplex(1);
+        registry.dispatch(hdr(1, 0, false), c0).unwrap().unwrap();
+        let (c, _s) = duplex(1);
+        registry.dispatch(hdr(1, 5, true), c).unwrap();
+        assert!(
+            registry.pop_pending(1).is_some(),
+            "the FINAL generation must be poppable"
+        );
+        let (c2, _s2) = duplex(1);
+        assert!(
+            matches!(
+                registry.dispatch(hdr(1, 5, false), c2),
+                Err(MigrationError::GenerationAfterFinal)
+            ),
+            "a generation at the FINAL marker was re-admitted after the marker was consumed"
+        );
+    }
+
+    /// The orphan TTL is inclusive: an orphan whose deadline equals the
+    /// current instant is reaped. Pins the `<=` in
+    /// [`SpliceRegistry::reap_orphans`].
+    #[tokio::test(start_paused = true)]
+    async fn orphan_ttl_reaps_at_the_exact_deadline() {
+        let mut registry = SpliceRegistry::new();
+        for i in 0..(MAX_ORPHAN_STREAMS - 1) as u64 {
+            let (c, _s) = duplex(1);
+            assert!(registry.dispatch(hdr(200 + i, 1, false), c).is_ok());
+        }
+        tokio::time::advance(ORPHAN_TTL).await;
+        for i in 0..MAX_ORPHAN_STREAMS as u64 {
+            let (c, _s) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(300 + i, 1, false), c).is_ok(),
+                "after exactly ORPHAN_TTL orphan {i} should be reaped and accepted"
+            );
+        }
+    }
 }

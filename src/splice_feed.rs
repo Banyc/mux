@@ -288,4 +288,58 @@ mod tests {
             "a closed registration channel was silently ignored"
         );
     }
+
+    /// The unclaimed-gen0 ready queue is capped at exactly
+    /// `MAX_UNCLAIMED_GEN0`: one registration over the cap evicts the
+    /// oldest, so a peer cannot pin more than the cap per header it sends.
+    #[tokio::test]
+    async fn the_ready_queue_evicts_at_exactly_the_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (handle, mut driver) = spawn_splice_router();
+        let mut peer_halves = Vec::new();
+        for logical_id in 0..(MAX_UNCLAIMED_GEN0 as u64 + 1) {
+            let (theirs, ours) = tokio::io::duplex(64);
+            handle
+                .send_continuation(
+                    ResumeHeader {
+                        logical_id,
+                        generation: 0,
+                        is_final: false,
+                        is_response: true,
+                    },
+                    Box::pin(theirs) as GenerationReader,
+                )
+                .await
+                .unwrap();
+            peer_halves.push(ours);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            peer_halves[0].write_all(b"x").await.is_err(),
+            "the oldest unclaimed gen-0 was still pinned after MAX_UNCLAIMED_GEN0+1 registrations"
+        );
+        driver.abort_all();
+    }
+
+    /// The supervisor waits for BOTH the matcher and the driver: a driver
+    /// error must still be reported as `DriverFailed` even when the matcher
+    /// finished first. Stopping on the first child (`||`) would abort the
+    /// driver and mask its error as a clean stop.
+    #[tokio::test]
+    async fn the_supervisor_waits_for_both_children() {
+        let (state_tx, state_rx) = watch::channel(SpliceRouterState::Running);
+        let matcher: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> =
+            Box::pin(async { SpliceTaskExit::MatcherDone });
+        let driver: Pin<Box<dyn Future<Output = SpliceTaskExit> + Send>> = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            SpliceTaskExit::DriverDone(Err(MigrationError::CorruptHeader))
+        });
+        let mut supervision = spawn_splice_supervisor(vec![matcher, driver], state_tx);
+        supervision.join_next().await.unwrap().unwrap();
+        assert_eq!(
+            *state_rx.borrow(),
+            SpliceRouterState::DriverFailed,
+            "the supervisor stopped on the matcher and masked the driver's error"
+        );
+    }
 }

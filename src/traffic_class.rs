@@ -233,11 +233,9 @@ impl LatencyControl {
     pub(crate) fn open(&mut self, token: fair_queue::QueueToken, now: Instant) {
         let obs = SizeMix::new();
         self.open_count += 1;
-        if obs.is_bulk() {
-            self.bulk_count += 1;
-        } else {
-            self.next_bulk_transition = Some(now + LATENCY_IDLE);
-        }
+        // A freshly opened stream has no history yet, so it is never bulk; it
+        // starts the idle-to-bulk countdown instead.
+        self.next_bulk_transition = Some(now + LATENCY_IDLE);
         self.streams.insert(token, obs);
     }
     pub(crate) fn close(&mut self, token: fair_queue::QueueToken) {
@@ -494,5 +492,79 @@ mod tests {
         let forced = p.decision(LaneClass::Bulk, LaneMigrationReason::Forced, 0);
         assert_eq!(forced.reason.as_str(), "forced");
         assert_eq!(forced.small_writes, demote.small_writes);
+    }
+
+    #[test]
+    fn every_migration_reason_reports_its_documented_label() {
+        let documented = [
+            (LaneMigrationReason::LargeWrite, "large_write"),
+            (LaneMigrationReason::BulkRatio, "bulk_ratio"),
+            (LaneMigrationReason::SmallWriteStreak, "small_write_streak"),
+            (LaneMigrationReason::Forced, "forced"),
+            (LaneMigrationReason::Rebind, "rebind"),
+        ];
+        for (reason, label) in documented {
+            assert_eq!(
+                reason.as_str(),
+                label,
+                "{reason:?} reports {label:?} as its migration reason label",
+            );
+        }
+    }
+
+    /// The cooldown window is inclusive of its endpoint: a write landing
+    /// exactly `MIGRATION_COOLDOWN` after the last migration is already
+    /// cooled. Pins the `>=` in [`LanePolicy::cooled`].
+    #[test]
+    fn migration_cooldown_is_inclusive_at_its_endpoint() {
+        let mut p = LanePolicy::new();
+        let t0 = Instant::now();
+        p.note_migration(t0);
+        assert_eq!(
+            on_write(
+                &mut p,
+                PROMOTE_IMMEDIATE_THRESHOLD,
+                INT,
+                t0 + MIGRATION_COOLDOWN
+            ),
+            Some(LaneClass::Bulk),
+            "a write exactly MIGRATION_COOLDOWN later must be cooled"
+        );
+    }
+
+    /// The `LATENCY_IDLE` transition takes effect at its endpoint: a stream
+    /// that has been idle for exactly `LATENCY_IDLE` is no longer counted
+    /// latency-sensitive. Pins the `<` in
+    /// [`LatencyControl::any_latency_sensitive`].
+    #[tokio::test(start_paused = true)]
+    async fn latency_idle_transition_is_inclusive_at_its_endpoint() {
+        let mut lc = LatencyControl::new();
+        let t0 = Instant::now();
+        lc.open(fair_queue::QueueToken(0), t0);
+        tokio::time::advance(LATENCY_IDLE).await;
+        assert!(
+            !lc.any_latency_sensitive(),
+            "at exactly LATENCY_IDLE the bulk transition must already be in force"
+        );
+    }
+
+    /// The rolling history is halved *before* tallying the observation that
+    /// reaches [`HISTORY_MAX`], so the counter continues from
+    /// `HISTORY_MAX/2 + 1` rather than `HISTORY_MAX + 1`. Pins the `>=` in
+    /// [`SizeMix::record`] (a `>` would tally one extra observation before
+    /// halving, shifting the classification window).
+    #[test]
+    fn history_halves_before_tallying_the_observation_at_the_max() {
+        let mut c = SizeMix::new();
+        for _ in 0..HISTORY_MAX {
+            c.record(100);
+        }
+        assert_eq!(c.small_count, HISTORY_MAX as u32);
+        c.record(100);
+        assert_eq!(
+            c.small_count,
+            (HISTORY_MAX / 2 + 1) as u32,
+            "the counters must halve before the observation that reaches HISTORY_MAX"
+        );
     }
 }

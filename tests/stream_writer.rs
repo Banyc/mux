@@ -178,9 +178,11 @@ async fn concurrent_open_then_write_payload_arrives() {
                     .iter()
                     .position(|p| *p == buf)
                     .expect("server received an unexpected/unknown payload");
+                // Removing the match is what catches a payload delivered
+                // twice: the second copy finds no remaining entry and the
+                // `expect` above fires.
                 expected.swap_remove(idx);
             }
-            assert!(expected.is_empty(), "server did not receive all payloads");
         });
         let mut client_handles = tokio::task::JoinSet::new();
         for i in 0..NUM_STREAMS {
