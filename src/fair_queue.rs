@@ -594,4 +594,55 @@ mod tests {
         assert_eq!(close_token, token);
         assert!(matches!(res, ReceiverRecv::Close));
     }
+
+    /// The queue table admits exactly `MAX_QUEUE_COUNT` distinct queues: the
+    /// request that would be the next one is neither announced nor inserted.
+    /// The boundary is reached deterministically by feeding the opener channel
+    /// directly; every response is held open so its dedicated channel stays
+    /// live, because dropping a response would close the queue and mark its
+    /// token ready, contaminating the scan with a close instead of leaving the
+    /// admission cap as the only thing under test.
+    #[test]
+    fn queue_table_admits_exactly_max_queue_count() {
+        let (opener, mut receiver) = channel::<u32>();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut responses = Vec::with_capacity(MAX_QUEUE_COUNT);
+        for expected_len in 1..=MAX_QUEUE_COUNT {
+            let (resp, resp_rx) = oneshot::channel();
+            opener
+                .opener
+                .try_send(OpenRequest {
+                    opening_value: 0,
+                    resp,
+                })
+                .expect("the opener channel has room for one pending request");
+            responses.push(resp_rx);
+            match receiver.poll_recv(&mut cx) {
+                Poll::Ready(Some((_, ReceiverRecv::Open(0)))) => {}
+                other => panic!("open #{expected_len} was not announced: {other:?}"),
+            }
+        }
+        assert_eq!(receiver.queues.len(), MAX_QUEUE_COUNT);
+
+        // The next request is pending, but the table is already full: it must
+        // stay unannounced and out of the table.
+        let (resp, _resp_rx) = oneshot::channel();
+        opener
+            .opener
+            .try_send(OpenRequest {
+                opening_value: 0,
+                resp,
+            })
+            .unwrap();
+        assert!(
+            receiver.poll_recv(&mut cx).is_pending(),
+            "queue #{} was announced past the table cap",
+            MAX_QUEUE_COUNT + 1
+        );
+        assert_eq!(
+            receiver.queues.len(),
+            MAX_QUEUE_COUNT,
+            "the queue table grew past MAX_QUEUE_COUNT"
+        );
+    }
 }
