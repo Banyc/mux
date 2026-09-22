@@ -536,4 +536,30 @@ mod tests {
             "a second terminal leaked past the first"
         );
     }
+
+    /// A reader that has been dropped is a closed sink, not a full queue: the
+    /// dispatcher must keep absorbing data (and the terminal) rather than
+    /// reporting `StreamReadQueueFull`, which in production tears the stream
+    /// down and closes the peer's write side for a reader that simply went
+    /// away. The queue is left with exactly two free slots because the
+    /// admission guard refuses at one, so the first dispatch after the close
+    /// is the one that would consume the reserved slot and make the second
+    /// dispatch report full.
+    #[tokio::test]
+    async fn data_for_a_dropped_reader_is_absorbed_not_reported_full() {
+        let (dispatcher, rx) = stream_read_channel();
+        for _ in 0..(STREAM_READ_HARD_DATA_LIMIT - 1) {
+            dispatcher.send_data(buf(&[0xAA])).unwrap();
+        }
+        drop(rx);
+        assert!(
+            dispatcher.send_data(buf(&[0xBB])).is_ok(),
+            "the first dispatch after the reader dropped must be absorbed"
+        );
+        assert!(
+            dispatcher.send_data(buf(&[0xCC])).is_ok(),
+            "a closed reader must never look full: it has no consumer to drain"
+        );
+        dispatcher.finish();
+    }
 }

@@ -481,4 +481,146 @@ mod tests {
         }
         assert_eq!(allocated_total, 0);
     }
+
+    /// A Data frame whose declared body is cut short by EOF is a peer that
+    /// died mid-frame. That is `UnexpectedEof`, not `InvalidData`: the bytes
+    /// did not decode into an unexpected message, they never arrived.
+    #[tokio::test]
+    async fn eof_mid_body_is_unexpected_eof() {
+        use crate::protocol::{DataHeader, Header};
+
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut reader = CentralIoReader::new(server, false);
+        client.write_all(&[Header::Data.encode()[0]]).await.unwrap();
+        client
+            .write_all(
+                &DataHeader {
+                    stream_id: 7,
+                    body_len: 100,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        client.write_all(&[0xAB; 10]).await.unwrap();
+        drop(client);
+        let err = reader.recv_pkt().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The same truncation boundary in frame-reassembly mode, whose Data
+    /// header carries an offset: a short body is still a dead peer
+    /// (`UnexpectedEof`), never a decoded-but-unexpected `InvalidData`.
+    #[tokio::test]
+    async fn eof_mid_body_is_unexpected_eof_in_reassembly_mode() {
+        use crate::protocol::{DataHeaderExt, Header};
+
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut reader = CentralIoReader::new(server, true);
+        client.write_all(&[Header::Data.encode()[0]]).await.unwrap();
+        client
+            .write_all(
+                &DataHeaderExt {
+                    stream_id: 7,
+                    body_len: 100,
+                    offset: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        client.write_all(&[0xAB; 10]).await.unwrap();
+        drop(client);
+        let err = reader.recv_pkt().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The steady receive deadline is exactly
+    /// `heartbeat_interval * RECEIVE_DEADLINE_INTERVALS`: a silent peer must
+    /// trip it as the paused clock crosses the fourth interval and not before.
+    /// The multi-thread deadline test deliberately leaves the multiple free
+    /// (it asserts the error, not the timing), so this pins the constant on
+    /// the paused clock, polling the reader task once at each side of the
+    /// boundary.
+    #[tokio::test(start_paused = true)]
+    async fn the_steady_receive_deadline_is_four_heartbeat_intervals() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ProbeReader<R> {
+            inner: R,
+            polled: std::sync::Arc<AtomicBool>,
+        }
+        impl<R: AsyncRead + Unpin> AsyncRead for ProbeReader<R> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.polled.store(true, Ordering::SeqCst);
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        let heartbeat_interval = Duration::from_millis(100);
+        // The peer half stays alive so the read stays Pending; a dropped peer
+        // would surface as EOF, not as the liveness deadline.
+        let (_peer, server) = tokio::io::duplex(1 << 16);
+        let polled = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = ProbeReader {
+            inner: server,
+            polled: polled.clone(),
+        };
+        let (tx, _rx) = central_io_read_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            run_central_io_reader(
+                CentralIoReader::new(reader, false),
+                tx,
+                heartbeat_interval,
+                None,
+                None,
+            )
+            .await
+        });
+
+        // Let the reader reach its first (pending) read and arm the deadline
+        // without advancing the clock.
+        let mut spins = 0;
+        while !polled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+            spins += 1;
+            assert!(spins < 10_000, "the reader never polled its inner stream");
+        }
+
+        // One millisecond short of four intervals: still alive.
+        tokio::time::advance(heartbeat_interval * 4 - Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::ZERO, tasks.join_next())
+                .await
+                .is_err(),
+            "the receive deadline fired before four heartbeat intervals elapsed"
+        );
+
+        // Crossing the fourth interval: the deadline must fire, and the
+        // session must report the receive-deadline TimedOut.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let joined = tokio::time::timeout(Duration::ZERO, tasks.join_next())
+            .await
+            .expect("the receive deadline did not fire at four heartbeat intervals");
+        match joined
+            .expect("the reader task vanished")
+            .expect("the reader task panicked")
+        {
+            Err(RunCentralIoReaderError::IoReader(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::TimedOut, "wrong error kind: {e:?}");
+            }
+            other => panic!("expected Err(IoReader(TimedOut)), got {other:?}"),
+        }
+    }
 }

@@ -612,6 +612,35 @@ mod reassembly_tests {
         );
     }
 
+    /// A longer frame at an offset already buffered extends past the buffered
+    /// range: that is an overlap, not an idempotent duplicate. Treating it as
+    /// a duplicate silently discards the extension, so the stream can never
+    /// reach its final offset.
+    #[tokio::test]
+    async fn a_longer_frame_at_a_buffered_offset_is_an_overlap() {
+        let mut rb = ReorderBuffer::new();
+        rb.ingest(8, buf(&[1, 2])).unwrap();
+        let err = rb.ingest(8, buf(&[3, 4, 5, 6])).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::Overlap),
+            "an 8..12 frame overlaps the buffered 8..10 frame: {err:?}"
+        );
+    }
+
+    /// Overlap is about byte ranges, not lengths: a frame whose range intrudes
+    /// into a buffered predecessor is an error even when the two frames have
+    /// equal length. Accepting it as a duplicate silently drops the new bytes.
+    #[tokio::test]
+    async fn an_overlapping_equal_length_frame_is_not_a_duplicate() {
+        let mut rb = ReorderBuffer::new();
+        rb.ingest(0, buf(&[1, 2, 3, 4])).unwrap();
+        let err = rb.ingest(2, buf(&[5, 6, 7, 8])).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::Overlap),
+            "a 2..6 frame intrudes into the buffered 0..4 frame: {err:?}"
+        );
+    }
+
     /// A final offset far ahead of the cursor is accepted. The final
     /// offset is a marker that consumes no reassembly buffer, so capping
     /// it by `REASSEMBLY_MAX_RANGE_BYTES` is wrong: a valid far
