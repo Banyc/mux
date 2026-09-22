@@ -430,4 +430,26 @@ mod tests {
             chunk.len(),
         );
     }
+
+    /// A zero-length write is a no-op: it reports `Ok(0)` and enqueues no
+    /// fair-queue message. An empty Data message is byte-invisible end to end
+    /// (the read path drops empty frames), so the queued message itself is the
+    /// only observable difference. A zero-duration timeout under a paused
+    /// clock polls the queue exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn empty_write_enqueues_no_message() {
+        let (mut writer, mut data_tx, mut rx) = stream_writer_state(5).await;
+        let mut cx = Context::from_waker(Waker::noop());
+        let n = match writer.poll_write(&mut data_tx, &[], &mut cx) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("an empty poll_write must return Ready(Ok(0)): {other:?}"),
+        };
+        assert_eq!(n, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, rx.recv())
+                .await
+                .is_err(),
+            "a zero-length write queued a fair-queue message"
+        );
+    }
 }

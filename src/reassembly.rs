@@ -696,6 +696,32 @@ mod reassembly_tests {
         );
     }
 
+    /// The ambiguous-distance guard rejects exactly the 2^31 step in serial
+    /// space, not the largest unambiguous forward distance (`2^31 - 1`). A
+    /// final offset one byte short of the ambiguity is a normal far CloseWrite
+    /// and must be accepted; the exact 2^31 step is equally "ahead" and
+    /// "behind" and must be rejected.
+    #[test]
+    fn wire_offset_ambiguity_is_exactly_two_to_the_31() {
+        // 2^31 - 1 ahead: the largest unambiguous forward offset is accepted.
+        let mut rb = ReorderBuffer::new();
+        rb.set_final_offset(i32::MAX as u32).unwrap();
+        assert_eq!(rb.final_offset_abs, Some(i32::MAX as u64));
+        assert!(!rb.is_complete());
+
+        // Exactly 2^31 ahead maps to `i32::MIN` and is ambiguous.
+        let mut rb = ReorderBuffer::new();
+        let err = rb.set_final_offset(0x8000_0000).unwrap_err();
+        assert!(
+            matches!(err, ReassemblyError::AmbiguousOffset),
+            "the exact 2^31 forward distance must be rejected as ambiguous, got {err:?}"
+        );
+        assert!(
+            rb.final_offset_abs.is_none(),
+            "an ambiguous final offset must not be recorded"
+        );
+    }
+
     #[test]
     fn any_reordering_of_a_stream_reassembles_it_exactly() {
         struct Rng(u64);
