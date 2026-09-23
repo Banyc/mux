@@ -53,17 +53,27 @@ pub const DEFAULT_SUCCESSOR_DEADLINE: Duration = Duration::from_secs(30);
 /// rejecting with `InvalidData`.
 pub const MAX_PENDING_GENERATIONS: usize = 256;
 
-pub const MAX_ORPHANS_PER_STREAM: usize = 32;
+/// Maximum generations held for one logical stream before its generation 0
+/// arrives. This is the same bound as [`MAX_PENDING_GENERATIONS`]: the driver
+/// flushes held generations in strict order, so a tighter pre-gen-0 bound
+/// would refuse a generation the stream's own post-gen-0 bound admits — and a
+/// refused generation is a gap no later generation can fill.
+pub const MAX_ORPHANS_PER_STREAM: usize = MAX_PENDING_GENERATIONS;
 
-pub const MAX_ORPHAN_STREAMS: usize = 32;
+/// Maximum distinct logical stream ids with live splice state in the
+/// registry. When the cap is hit, a new splice is refused with
+/// [`MigrationError::TooManySpliceStreams`].
+pub const MAX_SPLICE_STREAMS: usize = 256;
+
+/// Maximum distinct logical stream ids whose generations are held before
+/// their generation 0 arrives. The same bound as [`MAX_SPLICE_STREAMS`]:
+/// generations held before gen-0 are the same state as generations held after
+/// it, so a tighter pre-gen-0 bound would refuse a generation the stream is
+/// otherwise able to hold.
+pub const MAX_ORPHAN_STREAMS: usize = MAX_SPLICE_STREAMS;
 
 /// Time-to-live for orphan entries in the registry.
 pub const ORPHAN_TTL: Duration = Duration::from_millis(1500);
-
-/// Maximum number of distinct logical stream ids with live splice state in
-/// the registry. When the cap is hit, a new splice is refused with
-/// [`MigrationError::TooManySpliceStreams`].
-pub const MAX_SPLICE_STREAMS: usize = 256;
 
 /// Capacity of the per-logical-stream successor queue feeding a
 /// [`SplicedReader`]. Bounded so a slow reader cannot accumulate
@@ -91,6 +101,11 @@ pub enum MigrationError {
     /// A new splice was refused because the cap on distinct logical stream
     /// ids with live splice state was reached.
     TooManySpliceStreams,
+    /// A held generation for this logical stream was discarded (a bound was
+    /// exceeded, or the orphan TTL expired), so its chain can never be
+    /// delivered whole. Refused rather than handed out as a reader that
+    /// would wait forever on the gap.
+    BrokenChain,
     BrokenPipe,
     TimedOut,
 }
@@ -114,6 +129,12 @@ impl fmt::Display for MigrationError {
             MigrationError::TooManyOrphans => write!(f, "too many orphan generations"),
             MigrationError::TooManySpliceStreams => {
                 write!(f, "too many distinct logical streams being spliced")
+            }
+            MigrationError::BrokenChain => {
+                write!(
+                    f,
+                    "generation chain incomplete: a held generation was discarded"
+                )
             }
             MigrationError::BrokenPipe => write!(f, "generation chain broken: no successor"),
             MigrationError::TimedOut => {
@@ -320,6 +341,16 @@ pub struct SpliceRegistry {
     // Orphan tracking: logical id -> list of (reader, deadline).
     orphans: HashMap<u64, VecDeque<OrphanEntry>>,
     orphan_count: usize,
+    /// Logical ids known to be un-deliverable: a held generation for the id
+    /// was discarded (a bound was exceeded, or [`ORPHAN_TTL`] expired), so
+    /// the chain can never be delivered whole. The driver flushes generations
+    /// in strict order, and a reader for such an id would wait out its whole
+    /// successor deadline on a gap nothing can fill, so gen-0 for the id is
+    /// refused with [`MigrationError::BrokenChain`] instead of producing one.
+    /// Bounded by [`MAX_SPLICE_STREAMS`] records and never expired: a gen-0
+    /// for a broken id can arrive arbitrarily late. The value is when the id
+    /// was remembered, for eviction order.
+    broken: HashMap<u64, Instant>,
 }
 
 impl fmt::Debug for SpliceRegistry {
@@ -328,6 +359,7 @@ impl fmt::Debug for SpliceRegistry {
             .field("streams", &self.streams.len())
             .field("successor_deadline", &self.successor_deadline)
             .field("orphan_count", &self.orphan_count)
+            .field("broken", &self.broken.len())
             .finish()
     }
 }
@@ -339,6 +371,7 @@ impl SpliceRegistry {
             successor_deadline: DEFAULT_SUCCESSOR_DEADLINE,
             orphans: HashMap::new(),
             orphan_count: 0,
+            broken: HashMap::new(),
         }
     }
 
@@ -361,6 +394,9 @@ impl SpliceRegistry {
         let reader: GenerationReader = Box::pin(continuation);
         let claimed = (header.generation == 0).then_some(header.logical_id);
         self.reap_orphans(claimed);
+        if self.broken.contains_key(&header.logical_id) {
+            return Err(MigrationError::BrokenChain);
+        }
         match self.streams.get_mut(&header.logical_id) {
             Some(entry) => {
                 if header.generation == 0 {
@@ -428,14 +464,19 @@ impl SpliceRegistry {
         reader: GenerationReader,
     ) -> Result<(), MigrationError> {
         self.reap_orphans(None);
-        let known = self.orphans.contains_key(&header.logical_id);
-        if !known && self.orphans.len() >= MAX_ORPHAN_STREAMS {
+        let logical_id = header.logical_id;
+        let known = self.orphans.contains_key(&logical_id);
+        let stream_full = self
+            .orphans
+            .get(&logical_id)
+            .is_some_and(|entries| entries.len() >= MAX_ORPHANS_PER_STREAM);
+        if (!known && self.orphans.len() >= MAX_ORPHAN_STREAMS) || stream_full {
+            // Refusing a generation makes the chain un-deliverable, so the id
+            // must not later produce a reader that waits on the gap.
+            self.remember_broken(logical_id);
             return Err(MigrationError::TooManyOrphans);
         }
-        let entries = self.orphans.entry(header.logical_id).or_default();
-        if entries.len() >= MAX_ORPHANS_PER_STREAM {
-            return Err(MigrationError::TooManyOrphans);
-        }
+        let entries = self.orphans.entry(logical_id).or_default();
         if entries
             .iter()
             .any(|e| e.header.generation == header.generation)
@@ -452,26 +493,67 @@ impl SpliceRegistry {
         Ok(())
     }
 
+    /// Remember that `logical_id`'s chain is incomplete, dropping any
+    /// generations still held for it: they can never be delivered, and
+    /// letting them reach a reader would only delay its failure. The id is
+    /// refused (with [`MigrationError::BrokenChain`]) from then on, so a
+    /// gen-0 that arrives after its successors were discarded is never
+    /// surfaced as a reader that would wait on the gap.
+    ///
+    /// The records are never expired: a gen-0 for a broken id can arrive
+    /// arbitrarily late, and forgetting the id would reopen the very hole
+    /// this closes. They are bounded by [`MAX_SPLICE_STREAMS`], evicting the
+    /// oldest only when a peer has broken more chains than the registry can
+    /// have live streams at once.
+    fn remember_broken(&mut self, logical_id: u64) {
+        if let Some(entries) = self.orphans.remove(&logical_id) {
+            self.orphan_count -= entries.len();
+        }
+        if self.broken.len() >= MAX_SPLICE_STREAMS && !self.broken.contains_key(&logical_id) {
+            let oldest = self
+                .broken
+                .iter()
+                .min_by_key(|(_, remembered)| **remembered)
+                .map(|(logical_id, _)| *logical_id);
+            if let Some(oldest) = oldest {
+                self.broken.remove(&oldest);
+            }
+        }
+        self.broken.insert(logical_id, Instant::now());
+    }
+
     /// Reap orphan entries whose TTL has expired. The stream whose
     /// generation-0 is arriving right now (`claimed`) is skipped, so
     /// orphans from that stream survive long enough to be merged into it
     /// — orphan expiry stays bound under ordinary traffic.
+    ///
+    /// Expiry discards held generations, so the affected logical ids are
+    /// remembered as broken: a later gen-0 for one of them must not produce
+    /// a reader for a chain that has a hole in it.
     fn reap_orphans(&mut self, claimed: Option<u64>) {
         let now = Instant::now();
+        let mut expired = Vec::new();
         for (logical_id, entries) in self.orphans.iter_mut() {
             if Some(*logical_id) == claimed {
                 continue;
             }
+            let before = entries.len();
             while let Some(front) = entries.front() {
                 if front.deadline <= now {
                     entries.pop_front();
-                    self.orphan_count -= 1;
                 } else {
                     break;
                 }
             }
+            if entries.len() != before {
+                self.orphan_count -= before - entries.len();
+                expired.push(*logical_id);
+            }
         }
-        self.orphans.retain(|_, v| !v.is_empty());
+        for logical_id in expired {
+            self.orphans.remove(&logical_id);
+            self.remember_broken(logical_id);
+        }
     }
 
     /// Pop the next pending generation for a logical stream, in
@@ -824,12 +906,32 @@ pub async fn spawn_splice_driver(
                 let is_final = header.is_final;
                 let spliced_opt = match registry.dispatch(header, reader) {
                     Ok(opt) => opt,
-                    Err(MigrationError::DuplicateGeneration
-                        | MigrationError::GenerationAfterFinal
-                        | MigrationError::TooManyOrphans
-                        | MigrationError::TooManySpliceStreams) => continue,
-                    Err(MigrationError::TooManyPendingGenerations) => {
-                        cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                    // Nothing new to hold: a duplicate of a generation already
+                    // pending, or one behind the FINAL marker already seen.
+                    Err(
+                        MigrationError::DuplicateGeneration | MigrationError::GenerationAfterFinal,
+                    ) => continue,
+                    // The generation (or the whole stream) was refused, so the
+                    // chain can never be delivered whole. Retire the stream
+                    // instead of leaving a reader to wait out its successor
+                    // deadline on a gap nothing can fill, and release a
+                    // gen-0 waiter so the accepter is not parked on it.
+                    Err(
+                        MigrationError::TooManyOrphans
+                        | MigrationError::TooManySpliceStreams
+                        | MigrationError::TooManyPendingGenerations
+                        | MigrationError::BrokenChain,
+                    ) => {
+                        cleanup_all(
+                            logical_id,
+                            &mut queues,
+                            &mut incarnations,
+                            &mut next_to_flush,
+                            &mut registry,
+                        );
+                        if is_gen0 {
+                            let _ = gen0_tx.send((logical_id, None)).await;
+                        }
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -1415,7 +1517,7 @@ mod tests {
         }
         let (c_over, _s_over) = duplex(1);
         let h_over = ResumeHeader {
-            logical_id: 200,
+            logical_id: 100 + MAX_ORPHAN_STREAMS as u64,
             generation: 1,
             is_final: false,
             is_response: false,
@@ -1441,7 +1543,7 @@ mod tests {
         for i in 0..MAX_ORPHAN_STREAMS as u64 {
             let (c, _s) = duplex(1);
             let h = ResumeHeader {
-                logical_id: 300 + i,
+                logical_id: 1000 + i,
                 generation: 1,
                 is_final: false,
                 is_response: false,
@@ -2191,6 +2293,73 @@ mod tests {
         );
     }
 
+    /// A burst of successor generations that arrives before generation 0 is
+    /// HELD, never dropped. The driver flushes generations in strict order,
+    /// so a generation the receiver discards before gen-0 leaves a gap the
+    /// cursor can never fill: the reader waits out its whole successor
+    /// deadline even though the peer delivered every generation.
+    ///
+    /// Successors reaching the registry before gen-0 is dispatched is a
+    /// legitimate race, not a protocol violation: the peer opens gen-0 first
+    /// but the receiver accepts and peeks lanes independently, so a run of
+    /// successors on the other lane can be dispatched first.
+    #[tokio::test]
+    async fn a_successor_burst_that_overtakes_gen0_is_not_dropped() {
+        // One more than the per-stream orphan bound that was tighter than the
+        // bound on generations held after gen-0.
+        const BURST: u32 = 33;
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(300));
+        let (cont_tx, mut gen0_rx, _driver) = driver(registry);
+        // Successors 1..=BURST are dispatched BEFORE gen-0; the last is FINAL,
+        // so the chain ends there.
+        for generation in 1..=BURST {
+            let is_final = generation == BURST;
+            let mut s = send_gen(&cont_tx, hdr(7, generation, is_final)).await;
+            if !is_final {
+                s.write_all(&[generation as u8]).await.unwrap();
+            }
+            s.shutdown().await.unwrap();
+        }
+        let mut gen0 = send_gen(&cont_tx, hdr(7, 0, false)).await;
+        gen0.write_all(b"g0").await.unwrap();
+        gen0.shutdown().await.unwrap();
+        let (id, mut reader) = expect_gen0_reader(gen0_rx.recv().await);
+        assert_eq!(id, 7);
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut got))
+            .await
+            .expect("a successor that overtook gen-0 stranded the reader")
+            .expect("reading the spliced chain failed");
+        let mut want = b"g0".to_vec();
+        want.extend((1..BURST).map(|g| g as u8));
+        assert_eq!(got, want, "successors that overtook gen-0 were dropped");
+    }
+
+    /// A chain that lost a generation must not be handed out as a reader at
+    /// all: the driver flushes in strict order, so the reader could only wait
+    /// out its successor deadline on the unfillable gap. The gen-0 is refused
+    /// and its waiter released, so the accepter keeps working.
+    #[tokio::test]
+    async fn an_overflowing_successor_burst_refuses_the_stream_instead_of_stranding_it() {
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(200));
+        let (cont_tx, mut gen0_rx, _driver) = driver(registry);
+        for generation in 1..=(MAX_ORPHANS_PER_STREAM as u32 + 1) {
+            let _s = send_gen(&cont_tx, hdr(7, generation, false)).await;
+        }
+        let mut gen0 = send_gen(&cont_tx, hdr(7, 0, false)).await;
+        gen0.write_all(b"g0").await.unwrap();
+        gen0.shutdown().await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(2), gen0_rx.recv())
+            .await
+            .expect("the gen-0 of an overflowed chain was never answered")
+            .expect("the driver answered the gen-0");
+        assert_eq!(answered.0, 7);
+        assert!(
+            answered.1.is_none(),
+            "a chain missing a refused generation was surfaced as a reader, which can only strand the reader on the gap"
+        );
+    }
+
     #[tokio::test]
     async fn one_streams_orphans_do_not_refuse_anothers() {
         let mut registry = SpliceRegistry::new();
@@ -2383,7 +2552,7 @@ mod tests {
         for i in 0..MAX_ORPHAN_STREAMS as u64 {
             let (c, _s) = duplex(1);
             assert!(
-                registry.dispatch(hdr(300 + i, 1, false), c).is_ok(),
+                registry.dispatch(hdr(2000 + i, 1, false), c).is_ok(),
                 "after exactly ORPHAN_TTL orphan {i} should be reaped and accepted"
             );
         }
