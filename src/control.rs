@@ -110,6 +110,11 @@ enum ClassifiedStreamId {
     Peer,
 }
 
+/// The one bit of a wire stream id that separates this side's id space from
+/// the peer's: set on a local id exactly when
+/// [`MuxControl::local_ids_set_first_bit`] says so.
+const FIRST_BIT: StreamId = 1 << (StreamId::BITS - 1);
+
 async fn handle_local_open(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -132,54 +137,11 @@ async fn handle_central_read(
 ) -> Result<(), HandleCentralReadError> {
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
-            if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
-                return Ok(());
-            }
-            if control.stream_table.contains_key(&stream_id) {
-                return Ok(());
-            }
-            let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
-                Ok(x) => x,
-                Err(e) => match e {
-                    ControlOpenError::TooManyOpenStreams(_) => {
-                        return Ok(());
-                    }
-                    ControlOpenError::DeadCentralIo(dead_central_io) => {
-                        return Err(HandleCentralReadError::DeadCentralIo(dead_central_io));
-                    }
-                },
-            };
-            if let Err(e) = stream_init_handle.stream_accept_tx.try_send(stream) {
-                control.retire_stream(stream_id);
-                return Err(HandleCentralReadError::DeadStreamInit(e));
-            }
+            accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
             if control.frame_reassembly && side == Side::Write {
-                if !control.stream_table.contains_key(&stream_id) {
-                    if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
-                        return Ok(());
-                    }
-                    let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
-                    match res {
-                        Ok((_, stream)) => {
-                            if stream_init_handle
-                                .stream_accept_tx
-                                .try_send(stream)
-                                .is_err()
-                            {
-                                control.retire_stream(stream_id);
-                                return Ok(());
-                            }
-                        }
-                        Err(ControlOpenError::TooManyOpenStreams(_)) => {
-                            return Ok(());
-                        }
-                        Err(ControlOpenError::DeadCentralIo(e)) => {
-                            return Err(HandleCentralReadError::DeadCentralIo(e));
-                        }
-                    }
-                }
+                accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
                 if control
                     .peer_close_write_with_offset(stream_id, final_offset)
                     .await
@@ -196,30 +158,7 @@ async fn handle_central_read(
         }
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
             if control.frame_reassembly {
-                if !control.stream_table.contains_key(&stream_id) {
-                    if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
-                        return Ok(());
-                    }
-                    let res = open_stream(control, stream_close_tx, Some(stream_id)).await;
-                    match res {
-                        Ok((_, stream)) => {
-                            if stream_init_handle
-                                .stream_accept_tx
-                                .try_send(stream)
-                                .is_err()
-                            {
-                                control.retire_stream(stream_id);
-                                return Ok(());
-                            }
-                        }
-                        Err(ControlOpenError::TooManyOpenStreams(_)) => {
-                            return Ok(());
-                        }
-                        Err(ControlOpenError::DeadCentralIo(e)) => {
-                            return Err(HandleCentralReadError::DeadCentralIo(e));
-                        }
-                    }
-                }
+                accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
                 if control
                     .ingest_reassembly(stream_id, offset, data_buf)
                     .await
@@ -247,6 +186,40 @@ enum HandleCentralReadError {
     DeadCentralIo(DeadCentralIo),
     DeadStreamInit(DeadStreamInit),
 }
+
+/// Sole copy of the peer-stream admission decision, asked before every wire
+/// frame that can introduce a stream. A stream id that arrived from the peer
+/// is materialised and handed to the accept channel unless this side already
+/// has it, or unless this side is the one that allocates it (a stray frame for
+/// a local id must never fabricate a stream). An accept the application cannot
+/// take retires the entry, so a peer cannot leak one table slot per stream it
+/// opens; a full table is tolerated the same way.
+async fn accept_peer_stream(
+    control: &mut MuxControl,
+    stream_close_tx: &StreamCloseTxPrototype,
+    stream_init_handle: &mut StreamInitChannels,
+    stream_id: StreamId,
+) -> Result<(), HandleCentralReadError> {
+    if control.stream_table.contains_key(&stream_id) {
+        return Ok(());
+    }
+    if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
+        return Ok(());
+    }
+    let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
+        Ok(x) => x,
+        Err(ControlOpenError::TooManyOpenStreams(_)) => return Ok(()),
+        Err(ControlOpenError::DeadCentralIo(e)) => {
+            return Err(HandleCentralReadError::DeadCentralIo(e));
+        }
+    };
+    if let Err(e) = stream_init_handle.stream_accept_tx.try_send(stream) {
+        control.retire_stream(stream_id);
+        return Err(HandleCentralReadError::DeadStreamInit(e));
+    }
+    Ok(())
+}
+
 async fn open_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -302,43 +275,30 @@ impl MuxControl {
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
         }
     }
-    fn classify_stream_id(&self, stream_id: StreamId) -> ClassifiedStreamId {
-        let is_first_bit_set = stream_id >> (StreamId::BITS - 1) == 1;
-        match self.initiation {
-            Initiation::Server => {
-                if is_first_bit_set {
-                    ClassifiedStreamId::Local
-                } else {
-                    ClassifiedStreamId::Peer
-                }
-            }
-            Initiation::Client => {
-                if is_first_bit_set {
-                    ClassifiedStreamId::Peer
-                } else {
-                    ClassifiedStreamId::Local
-                }
-            }
-        }
-    }
-    #[cfg(test)]
-    fn is_local_id_space(&self, stream_id: StreamId) -> bool {
-        let is_first_bit_set = stream_id >> (StreamId::BITS - 1) == 1;
-        match self.initiation {
-            Initiation::Server => is_first_bit_set,
-            Initiation::Client => !is_first_bit_set,
-        }
-    }
-    fn should_stream_id_set_first_bit(&self) -> bool {
+    /// Sole authority for which half of the wire id space this side owns: a
+    /// local stream id carries [`FIRST_BIT`] exactly when this is true.
+    /// [`Self::classify_stream_id`] (reading an id that arrived on the wire)
+    /// and [`Self::wire_stream_id`] (minting one that leaves on the wire) are
+    /// both derived from it, so the two directions cannot come to disagree
+    /// about which initiation owns which half.
+    fn local_ids_set_first_bit(&self) -> bool {
         match self.initiation {
             Initiation::Server => true,
             Initiation::Client => false,
         }
     }
+    fn classify_stream_id(&self, stream_id: StreamId) -> ClassifiedStreamId {
+        if (stream_id & FIRST_BIT != 0) == self.local_ids_set_first_bit() {
+            ClassifiedStreamId::Local
+        } else {
+            ClassifiedStreamId::Peer
+        }
+    }
     fn wire_stream_id(&self, local_stream_id: StreamId) -> StreamId {
-        match self.should_stream_id_set_first_bit() {
-            true => local_stream_id | (1 << (StreamId::BITS - 1)),
-            false => local_stream_id,
+        if self.local_ids_set_first_bit() {
+            local_stream_id | FIRST_BIT
+        } else {
+            local_stream_id
         }
     }
     fn next_stream_id(&mut self) -> Result<StreamId, TooManyOpenStreams> {
@@ -1682,7 +1642,7 @@ mod reassembly_tests {
                 let _peer = open_test_stream(&mut control, 0).await;
                 assert_eq!(
                     control.next_stream_id().unwrap(),
-                    1 << (StreamId::BITS - 1),
+                    FIRST_BIT,
                     "a stream in the peer's half of the id space blocked a free local id"
                 );
             })
@@ -1741,8 +1701,11 @@ mod reassembly_tests {
             scope.fold(std::mem::take(&mut rig.drain));
             scope
                 .run(async {
-                    let local_id: StreamId = 1 << (StreamId::BITS - 1);
-                    assert!(rig.control.is_local_id_space(local_id));
+                    let local_id: StreamId = FIRST_BIT;
+                    assert_eq!(
+                        rig.control.classify_stream_id(local_id),
+                        ClassifiedStreamId::Local
+                    );
                     for msg in [
                         CentralIoReadMsg::Open(local_id),
                         CentralIoReadMsg::Data(local_id, 0, buf(&[0xAA])),
@@ -1777,7 +1740,10 @@ mod reassembly_tests {
                     .open(dispatcher, PeerReadClosedFlag::new(), None)
                     .await
                     .unwrap();
-                assert!(rig.control.is_local_id_space(local_id));
+                assert_eq!(
+                    rig.control.classify_stream_id(local_id),
+                    ClassifiedStreamId::Local
+                );
                 rig.deliver(CentralIoReadMsg::Open(local_id)).await.unwrap();
                 assert!(
                     rig.accept_rx.try_recv().is_err(),
@@ -1805,7 +1771,10 @@ mod reassembly_tests {
             scope
                 .run(async {
                     let peer_id: StreamId = 7;
-                    assert!(!rig.control.is_local_id_space(peer_id));
+                    assert_eq!(
+                        rig.control.classify_stream_id(peer_id),
+                        ClassifiedStreamId::Peer
+                    );
                     let mut peer_rx = open_test_stream(&mut rig.control, peer_id).await;
                     rig.deliver(CentralIoReadMsg::Open(peer_id))
                         .await
