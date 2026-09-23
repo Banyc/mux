@@ -545,7 +545,7 @@ mod tests {
     /// admission guard refuses at one, so the first dispatch after the close
     /// is the one that would consume the reserved slot and make the second
     /// dispatch report full.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn data_for_a_dropped_reader_is_absorbed_not_reported_full() {
         let (dispatcher, rx) = stream_read_channel();
         for _ in 0..(STREAM_READ_HARD_DATA_LIMIT - 1) {
