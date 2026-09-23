@@ -31,8 +31,12 @@ pub const DEFAULT_MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024; // 16 MiB
 /// Maximum number of in-flight send operations before backpressure.
 pub const DEFAULT_MAX_INFLIGHT_MESSAGES: usize = 64;
 
-/// Maximum pending out-of-order messages in ordered mode before
-/// force-advancing past the gap.
+/// Maximum number of completed messages the ordered receiver holds while
+/// waiting for the sequence they follow. The cap bounds memory by pausing
+/// acceptance of new substreams (backpressure); it is never a reason to
+/// skip a sequence, because a full buffer does not mean the missing
+/// sequence is gone. A sequence is skipped only once no spawned read task
+/// can still deliver it.
 pub const DEFAULT_REORDER_CAP: usize = 256;
 
 // ---------------------------------------------------------------------------
@@ -44,11 +48,14 @@ pub enum DeliveryMode {
     /// Messages are yielded as soon as they arrive. No cross-message
     /// ordering guarantees.
     Unordered,
-    /// Messages are yielded in send order. Late arrivals are buffered
-    /// up to [`DEFAULT_REORDER_CAP`]; a permanent gap causes a
-    /// force-advance. Documented cost: ordered delivery re-couples
-    /// small messages behind lost bursts (measured ~+74% p99 vs
-    /// Unordered on a mixed-size flow).
+    /// Messages are yielded in send order. Late arrivals are buffered up
+    /// to [`DEFAULT_REORDER_CAP`] completed messages, and acceptance of new
+    /// substreams pauses at that cap so the buffer stays bounded. A
+    /// sequence is skipped only once no spawned read task can still deliver
+    /// it; a skipped sequence that arrives late is still delivered, so
+    /// ordering may degrade but a sent message is never dropped.
+    /// Documented cost: ordered delivery re-couples small messages behind
+    /// lost bursts (measured ~+74% p99 vs Unordered on a mixed-size flow).
     Ordered,
 }
 
@@ -289,6 +296,12 @@ pub struct DualMessageReceiver {
     // Ordered-mode state
     ordered: BTreeMap<u64, Message>,
     next_seq: u64,
+    /// Lowest sequence the cursor has skipped over. A message below
+    /// `next_seq` is accepted (and yielded late) only when it is at or above
+    /// this floor — those are the sequences a force-advance skipped, which
+    /// can still arrive. Below the floor the sequence was delivered before
+    /// the cursor moved, so it is a duplicate or a stale wrapping sequence.
+    skipped_from: Option<u64>,
     reorder_cap: usize,
     accepter_dead: bool,
 }
@@ -321,6 +334,7 @@ impl DualMessageReceiver {
             inflight: 0,
             ordered: BTreeMap::new(),
             next_seq: 0,
+            skipped_from: None,
             reorder_cap: DEFAULT_REORDER_CAP,
             accepter_dead: false,
         }
@@ -352,14 +366,14 @@ impl DualMessageReceiver {
                         if self.ordered.is_empty() {
                             break;
                         }
-                        self.next_seq = *self.ordered.first_key_value().unwrap().0;
+                        self.skip_to(*self.ordered.first_key_value().unwrap().0);
                     }
                 }
                 return Ok(None);
             }
 
             tokio::select! {
-                res = self.accepter.accept(), if !self.accepter_dead => {
+                res = self.accepter.accept(), if !self.accepter_dead && !self.acceptance_paused() => {
                     match res {
                         Ok((reader, _writer, _class)) => {
                             self.spawn_read_task(reader);
@@ -444,44 +458,62 @@ impl DualMessageReceiver {
 
     // Ordered-mode helpers
 
-    fn insert_ordered(&mut self, msg: Message) {
-        let seq = msg.seq.unwrap_or(0);
-        // Drop stale seqs already below the cursor (a stale message
-        // inserted behind the cursor can never match the normal pop
-        // path and is withheld indefinitely).
-        if seq < self.next_seq {
-            return;
-        }
-        self.ordered.insert(seq, msg);
-        // Force-advance past a permanent gap when the buffer exceeds the
-        // cap: jump next_seq to the lowest buffered seq so pop_ordered
-        // delivers it next. Do NOT discard the buffered message — that
-        // would silently drop data.
-        if self.ordered.len() > self.reorder_cap {
-            let (&first_seq, _) = self.ordered.first_key_value().unwrap();
-            self.next_seq = first_seq;
+    /// True while the receiver holds as many undelivered ordered messages
+    /// (buffered plus a read task each) as the cap allows: it stops pulling
+    /// new substreams in so the reorder state stays bounded. Joining
+    /// already-spawned reads continues, so the outstanding reads drain and a
+    /// gap becomes skippable (see [`Self::pop_ordered`]) instead of growing
+    /// the buffer without bound.
+    fn acceptance_paused(&self) -> bool {
+        matches!(self.mode, DeliveryMode::Ordered)
+            && self.ordered.len() + self.inflight >= self.reorder_cap
+    }
+
+    /// Move the cursor to `next`, recording the sequences skipped over.
+    fn skip_to(&mut self, next: u64) {
+        if next > self.next_seq {
+            self.skipped_from.get_or_insert(self.next_seq);
+            self.next_seq = next;
         }
     }
 
-    fn pop_ordered(&mut self) -> Option<Vec<u8>> {
-        loop {
-            let (&seq, _) = self.ordered.first_key_value()?;
-            if seq == self.next_seq {
-                let msg = self.ordered.remove(&seq).unwrap();
-                self.next_seq = advance_past(seq);
-                return Some(msg.payload);
-            }
-            if seq < self.next_seq {
-                self.ordered.remove(&seq);
-                continue;
-            }
-            if self.ordered.len() >= self.reorder_cap {
-                let msg = self.ordered.remove(&seq).unwrap();
-                self.next_seq = advance_past(seq);
-                return Some(msg.payload);
-            }
-            return None;
+    fn insert_ordered(&mut self, msg: Message) {
+        let seq = msg.seq.unwrap_or(0);
+        // Keep a sequence the cursor skipped over: it was never delivered,
+        // so dropping it would silently lose a message the sender saw as
+        // sent. `pop_ordered` yields it late. Below the skip floor the
+        // sequence was delivered before the cursor moved — a duplicate or a
+        // stale wrapping sequence — and is rejected. The cap is enforced by
+        // pausing acceptance, never by jumping the cursor here.
+        if seq < self.next_seq && !self.skipped_from.is_some_and(|floor| seq >= floor) {
+            return;
         }
+        self.ordered.insert(seq, msg);
+    }
+
+    fn pop_ordered(&mut self) -> Option<Vec<u8>> {
+        let (&seq, _) = self.ordered.first_key_value()?;
+        if seq == self.next_seq {
+            let msg = self.ordered.remove(&seq).unwrap();
+            self.next_seq = advance_past(seq);
+            return Some(msg.payload);
+        }
+        if seq < self.next_seq {
+            // A sequence an earlier force-advance skipped that is only now
+            // readable: yielding it late may reorder delivery, but it may
+            // never lose a message.
+            return Some(self.ordered.remove(&seq).unwrap().payload);
+        }
+        // `seq > next_seq`: a gap. Skip it only once every spawned read has
+        // resolved. Until then an outstanding read task can still deliver
+        // the missing sequence, and a full buffer only proves the cap was
+        // reached, not that the message is gone.
+        if self.ordered.len() >= self.reorder_cap && self.inflight == 0 {
+            let msg = self.ordered.remove(&seq).unwrap();
+            self.skip_to(advance_past(seq));
+            return Some(msg.payload);
+        }
+        None
     }
 }
 
@@ -1201,6 +1233,92 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(msg, vec![0xAAu8; 8]);
+            })
+            .await;
+    }
+
+    /// A full reorder buffer is not proof that the missing sequence is a
+    /// permanent gap. The receiver spawns one read task per substream, and
+    /// join order follows task scheduling, so the message sent first can be
+    /// the last whose read task is joined: the cap is reached while the
+    /// lowest sequence is still in flight. Force-advancing there would
+    /// advance the cursor past a message that is about to arrive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_gap_is_not_skipped_while_the_missing_message_is_in_flight() {
+        let (_opener, accepter, scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                rx.reorder_cap = 4;
+
+                // Arrival state produced by the read-task race: seq 1..=4
+                // have been joined and buffered, seq 0's read task is still
+                // outstanding, so seq 0 is still coming.
+                rx.inflight = 1;
+                for seq in 1..=4u64 {
+                    rx.insert_ordered(Message {
+                        seq: Some(seq),
+                        payload: vec![seq as u8],
+                    });
+                }
+                assert_eq!(
+                    rx.pop_ordered(),
+                    None,
+                    "a full buffer does not make an in-flight sequence a permanent gap"
+                );
+
+                // seq 0's read finally joins: it must be delivered first and
+                // nothing may be skipped.
+                rx.inflight = 0;
+                rx.insert_ordered(Message {
+                    seq: Some(0),
+                    payload: b"seq0".to_vec(),
+                });
+                assert_eq!(rx.pop_ordered(), Some(b"seq0".to_vec()));
+                for seq in 1..=4u64 {
+                    assert_eq!(rx.pop_ordered(), Some(vec![seq as u8]));
+                }
+                assert_eq!(rx.pop_ordered(), None);
+            })
+            .await;
+    }
+
+    /// Sequence numbers are unique, so a buffered sequence below the cursor
+    /// was skipped by a force-advance and was never delivered. Discarding it
+    /// on arrival loses a message the sender observed as sent; it must be
+    /// delivered instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_force_advance_never_discards_a_late_message() {
+        let (_opener, accepter, scope) = paired_sessions().await;
+        scope
+            .run(async {
+                let mut rx = DualMessageReceiver::new(accepter, DeliveryMode::Ordered);
+                rx.reorder_cap = 4;
+
+                // A permanent gap at 0 forces the cursor past it.
+                for seq in 1..=4u64 {
+                    rx.insert_ordered(Message {
+                        seq: Some(seq),
+                        payload: vec![seq as u8],
+                    });
+                }
+                let mut delivered = vec![rx.pop_ordered().expect("the gap is skipped")];
+
+                // seq 0 was not permanent after all: it arrives late.
+                rx.insert_ordered(Message {
+                    seq: Some(0),
+                    payload: b"seq0".to_vec(),
+                });
+
+                while let Some(payload) = rx.pop_ordered() {
+                    delivered.push(payload);
+                }
+                delivered.sort();
+                assert_eq!(
+                    delivered,
+                    vec![vec![1], vec![2], vec![3], vec![4], b"seq0".to_vec()],
+                    "every inserted message must be delivered exactly once"
+                );
             })
             .await;
     }
