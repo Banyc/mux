@@ -20,15 +20,17 @@
 //!   after the successor deadline expires, never clean EOF.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt, io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll, ready},
     time::Duration,
 };
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::Notify,
     time::{Instant, Sleep},
 };
 
@@ -608,6 +610,10 @@ pub struct SplicedReader {
     incarnation: u64,
     is_closed: bool,
     finished: bool,
+    /// Signalled on every generation taken out of the queue. The queue is the
+    /// only buffer a deferred generation waits in, so this is what tells the
+    /// driver that a flush deferred on a full queue can be re-attempted.
+    drain_notify: Option<Arc<Notify>>,
 }
 
 impl fmt::Debug for SplicedReader {
@@ -641,6 +647,7 @@ impl SplicedReader {
             incarnation: 0,
             is_closed,
             finished: false,
+            drain_notify: None,
         }
     }
 
@@ -661,6 +668,14 @@ impl SplicedReader {
     ) -> Self {
         self.cleanup_tx = Some(tx);
         self.incarnation = incarnation;
+        self
+    }
+
+    /// Arm the drain signal: the driver is woken whenever this reader takes a
+    /// generation out of its queue, and re-attempts any flush it deferred on
+    /// the queue being full.
+    pub fn with_drain_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.drain_notify = Some(notify);
         self
     }
 
@@ -763,6 +778,12 @@ impl AsyncRead for SplicedReader {
                                 self.current_is_final = is_final;
                                 self.is_closed = is_final;
                                 self.successor_timer = None;
+                                if let Some(notify) = &self.drain_notify {
+                                    // A queue slot just came free: a flush the
+                                    // driver deferred on a full queue can run
+                                    // now.
+                                    notify.notify_one();
+                                }
                                 continue;
                             }
                             Poll::Ready(None) => {
@@ -846,58 +867,122 @@ pub async fn spawn_splice_driver(
         HashMap::new();
     let mut next_to_flush: HashMap<u64, u32> = HashMap::new();
     let mut incarnations: HashMap<u64, u64> = HashMap::new();
+    // Streams whose contiguous flush stopped on a full queue. The generation
+    // stayed in the registry, so the flush MUST be attempted again once the
+    // reader has made room; the reader signals that through `drained`.
+    let mut blocked_by_capacity: HashSet<u64> = HashSet::new();
+    // Woken by every queue dequeue. The reader is the only thing that frees a
+    // queue slot, so without this signal a flush deferred on a full queue had
+    // no re-trigger at all: the next continuation is the only other event that
+    // re-ran it, and the FINAL generation has no next continuation.
+    let drained = Arc::new(Notify::new());
     let (cleanup_tx, mut cleanup_rx) =
         tokio::sync::mpsc::channel::<(u64, u64)>(SPLICE_CLEANUP_CAPACITY);
     let mut next_incarnation: u64 = 1;
+    /// How a contiguous flush ended.
+    #[derive(Clone, Copy, Default)]
+    struct FlushOutcome {
+        /// The FINAL marker was queued (or the queue is gone): the stream is
+        /// complete and its driver-side state can be retired.
+        reached_final: bool,
+        /// The flush stopped because the queue was full. Unlike a gap (which
+        /// only a missing generation can close), this is repaired by the
+        /// reader draining, so it must be re-attempted.
+        queue_full: bool,
+    }
     fn flush_contiguous(
         registry: &mut SpliceRegistry,
         logical_id: u64,
         queue_tx: &tokio::sync::mpsc::Sender<(bool, GenerationReader)>,
         next_to_flush: &mut HashMap<u64, u32>,
-    ) -> bool {
+    ) -> FlushOutcome {
+        let mut outcome = FlushOutcome::default();
         let mut next = next_to_flush.get(&logical_id).copied().unwrap_or(1);
         while let Some((genn, is_final, reader)) = registry.pop_pending(logical_id) {
             if genn < next {
                 drop(reader);
                 continue;
             }
-            if genn == next {
-                match queue_tx.try_send((is_final, reader)) {
-                    Ok(()) => {
-                        next = next.checked_add(1).expect("generation overflow");
-                        if is_final {
-                            return true;
-                        }
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full((is_final, reader))) => {
-                        registry.reinsert_pending(logical_id, genn, is_final, reader);
-                        break;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        return true;
-                    }
-                }
-            } else {
+            if genn != next {
                 registry.reinsert_pending(logical_id, genn, is_final, reader);
                 break;
             }
+            match queue_tx.try_send((is_final, reader)) {
+                Ok(()) => {
+                    next = next.checked_add(1).expect("generation overflow");
+                    if is_final {
+                        outcome.reached_final = true;
+                        break;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full((is_final, reader))) => {
+                    registry.reinsert_pending(logical_id, genn, is_final, reader);
+                    outcome.queue_full = true;
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    outcome.reached_final = true;
+                    break;
+                }
+            }
         }
         next_to_flush.insert(logical_id, next);
-        false
+        outcome
     }
     fn cleanup_all(
         logical_id: u64,
         queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
         incarnations: &mut HashMap<u64, u64>,
         next_to_flush: &mut HashMap<u64, u32>,
+        blocked_by_capacity: &mut HashSet<u64>,
         registry: &mut SpliceRegistry,
     ) {
         queues.remove(&logical_id);
         incarnations.remove(&logical_id);
         next_to_flush.remove(&logical_id);
+        blocked_by_capacity.remove(&logical_id);
         registry.remove_stream(logical_id);
     }
+    /// Re-attempt every flush that stopped on a full queue. Called for every
+    /// driver iteration and whenever `drained` wakes the driver, so a reader
+    /// making room never depends on one signal being observed.
+    fn retry_blocked_flushes(
+        blocked_by_capacity: &mut HashSet<u64>,
+        queues: &mut HashMap<u64, tokio::sync::mpsc::Sender<(bool, GenerationReader)>>,
+        registry: &mut SpliceRegistry,
+        next_to_flush: &mut HashMap<u64, u32>,
+        incarnations: &mut HashMap<u64, u64>,
+    ) {
+        let blocked: Vec<u64> = blocked_by_capacity.iter().copied().collect();
+        for logical_id in blocked {
+            let Some(queue_tx) = queues.get(&logical_id).cloned() else {
+                blocked_by_capacity.remove(&logical_id);
+                continue;
+            };
+            let outcome = flush_contiguous(registry, logical_id, &queue_tx, next_to_flush);
+            if !outcome.queue_full {
+                blocked_by_capacity.remove(&logical_id);
+            }
+            if outcome.reached_final {
+                cleanup_all(
+                    logical_id,
+                    queues,
+                    incarnations,
+                    next_to_flush,
+                    blocked_by_capacity,
+                    registry,
+                );
+            }
+        }
+    }
     loop {
+        retry_blocked_flushes(
+            &mut blocked_by_capacity,
+            &mut queues,
+            &mut registry,
+            &mut next_to_flush,
+            &mut incarnations,
+        );
         tokio::select! {
             cont = cont_rx.recv() => {
                 let Some((header, reader)) = cont else { break; };
@@ -927,6 +1012,7 @@ pub async fn spawn_splice_driver(
                             &mut queues,
                             &mut incarnations,
                             &mut next_to_flush,
+                            &mut blocked_by_capacity,
                             &mut registry,
                         );
                         if is_gen0 {
@@ -948,20 +1034,25 @@ pub async fn spawn_splice_driver(
                                 let successor_deadline = registry.successor_deadline;
                                 let token = next_incarnation;
                                 next_incarnation = next_incarnation.checked_add(1).expect("incarnation overflow");
-                                let spliced = spliced.with_queue_and_cleanup(
-                                    queue_rx,
-                                    successor_deadline,
-                                    cleanup_tx.clone(),
-                                    token,
-                                );
+                                let spliced = spliced
+                                    .with_queue_and_cleanup(
+                                        queue_rx,
+                                        successor_deadline,
+                                        cleanup_tx.clone(),
+                                        token,
+                                    )
+                                    .with_drain_notify(Arc::clone(&drained));
                                 queues.insert(logical_id, queue_tx.clone());
                                 incarnations.insert(logical_id, token);
                                 next_to_flush.insert(logical_id, 1);
-                                let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
+                                let outcome = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
+                                if outcome.queue_full {
+                                    blocked_by_capacity.insert(logical_id);
+                                }
                                 if gen0_tx.send((logical_id, Some(spliced))).await.is_err()
-                                    || reached_final
+                                    || outcome.reached_final
                                 {
-                                    cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                                    cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut blocked_by_capacity, &mut registry);
                                 }
                             }
                         }
@@ -971,9 +1062,12 @@ pub async fn spawn_splice_driver(
                             let _ = gen0_tx.send((logical_id, None)).await;
                         }
                         if let Some(queue_tx) = queues.get(&logical_id).cloned() {
-                            let reached_final = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
-                            if reached_final {
-                                cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                            let outcome = flush_contiguous(&mut registry, logical_id, &queue_tx, &mut next_to_flush);
+                            if outcome.queue_full {
+                                blocked_by_capacity.insert(logical_id);
+                            }
+                            if outcome.reached_final {
+                                cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut blocked_by_capacity, &mut registry);
                             }
                         }
                     }
@@ -983,9 +1077,10 @@ pub async fn spawn_splice_driver(
                 if let Some((logical_id, token)) = cleanup
                     && let Some(&current_token) = incarnations.get(&logical_id)
                         && current_token == token {
-                            cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut registry);
+                            cleanup_all(logical_id, &mut queues, &mut incarnations, &mut next_to_flush, &mut blocked_by_capacity, &mut registry);
                         }
             }
+            () = drained.notified(), if !blocked_by_capacity.is_empty() => {}
         }
     }
     Ok(())
@@ -2333,6 +2428,61 @@ mod tests {
         let mut want = b"g0".to_vec();
         want.extend((1..BURST).map(|g| g as u8));
         assert_eq!(got, want, "successors that overtook gen-0 were dropped");
+    }
+
+    /// A generation the driver deferred on a full queue must be re-flushed
+    /// once the reader makes room. The queue is drained only by the reader,
+    /// and the flush was re-run only on the *next* continuation, so a FINAL
+    /// that could not be queued had nothing left to re-trigger it: the
+    /// reader drained the queue and then waited out its successor deadline
+    /// on the one generation that would have closed the chain.
+    #[tokio::test]
+    async fn a_final_deferred_by_a_full_queue_is_redelivered_when_the_reader_drains() {
+        let registry = SpliceRegistry::new().with_successor_deadline(Duration::from_millis(200));
+        let (cont_tx, mut gen0_rx, _driver) = driver(registry);
+
+        // Gen-0 opens the chain and carries no bytes yet, so the reader
+        // cannot reach the queue until gen-0 is closed below.
+        let gen0 = send_gen(&cont_tx, hdr(3, 0, false)).await;
+        let (id, mut spliced) = expect_gen0_reader(gen0_rx.recv().await);
+        assert_eq!(id, 3);
+
+        // Fill the per-stream queue to exactly capacity with non-final
+        // generations, each carrying one byte. Nothing is read yet, so no
+        // generation can leave the queue for the reader's active slot.
+        for generation in 1..=SPLICE_QUEUE_CAPACITY as u32 {
+            let mut s = send_gen(&cont_tx, hdr(3, generation, false)).await;
+            s.write_all(&[generation as u8]).await.unwrap();
+            s.shutdown().await.unwrap();
+        }
+
+        // The FINAL arrives with the queue already full: it can only be
+        // deferred, and no later continuation for this stream exists to
+        // re-trigger the flush.
+        let mut fin = send_gen(&cont_tx, hdr(3, SPLICE_QUEUE_CAPACITY as u32 + 1, true)).await;
+        fin.shutdown().await.unwrap();
+
+        // Ordering barrier, not a sleep: the driver consumes one FIFO channel
+        // in one task, so a gen-0 for another stream is answered only after
+        // the FINAL above has been dispatched and deferred.
+        let _barrier = send_gen(&cont_tx, hdr(99, 0, true)).await;
+        let (barrier_id, _) = expect_gen0_reader(gen0_rx.recv().await);
+        assert_eq!(barrier_id, 99);
+
+        // Close gen-0 so the reader moves on to the queued generations.
+        drop(gen0);
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), spliced.read_to_end(&mut got))
+            .await
+            .expect("the reader never finished")
+            .expect("a FINAL deferred on a full queue stranded the reader");
+        assert_eq!(
+            got,
+            (1..=SPLICE_QUEUE_CAPACITY as u32)
+                .map(|generation| generation as u8)
+                .collect::<Vec<u8>>(),
+            "a deferred FINAL must still close the chain, in generation order"
+        );
     }
 
     /// A chain that lost a generation must not be handed out as a reader at

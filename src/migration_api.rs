@@ -2,7 +2,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -503,6 +506,56 @@ pub struct MigratingCapableAccepter {
     feed: SpliceRouterHandle,
     own_feed_driver: Option<JoinSet<()>>,
     peeks: FuturesUnordered<Pin<Box<dyn Future<Output = PeekedStream> + Send>>>,
+    /// Active header reads, i.e. the peeks still inside their deadline. A peek
+    /// whose deadline expired continues off this budget, so a slow substream
+    /// stops competing with the substreams still being accepted while its
+    /// header is still delivered instead of dropped.
+    counting_peeks: Arc<AtomicUsize>,
+}
+
+/// One unit of an accepter's bounded peek concurrency, held by an active
+/// header read. Released when the read finishes, and — when its deadline
+/// expires — before the read continues off-budget.
+struct PeekBudget {
+    counting: Arc<AtomicUsize>,
+    held: bool,
+}
+
+impl PeekBudget {
+    fn new(counting: Arc<AtomicUsize>) -> Self {
+        counting.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counting,
+            held: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            self.counting.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PeekBudget {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// How a resume-header read ended.
+pub(crate) enum Peeked {
+    /// The read finished: a resume header, or a substream that carries none
+    /// (plain, truncated, or closed).
+    Complete {
+        is_migrating: bool,
+        header: Option<ResumeHeader>,
+        reader: StreamReader,
+    },
+    /// The read hit its deadline with no header yet, handing the reader back
+    /// so the caller can continue the read off its own budget.
+    Deadline(StreamReader),
 }
 
 const MAX_CONCURRENT_PEEKS: usize = 256;
@@ -564,6 +617,7 @@ impl MigratingCapableAccepter {
             feed,
             own_feed_driver: Some(own_feed_driver),
             peeks: FuturesUnordered::new(),
+            counting_peeks: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -575,6 +629,7 @@ impl MigratingCapableAccepter {
             feed,
             own_feed_driver: None,
             peeks: FuturesUnordered::new(),
+            counting_peeks: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -606,7 +661,7 @@ impl MigratingCapableAccepter {
 
     pub async fn accept(&mut self) -> Result<AcceptedStream, MigratingStreamError> {
         loop {
-            let can_accept = self.peeks.len() < MAX_CONCURRENT_PEEKS;
+            let can_accept = self.counting_peeks.load(Ordering::Relaxed) < MAX_CONCURRENT_PEEKS;
             let has_peeks = !self.peeks.is_empty();
             let has_own_feed = self.own_feed_driver.is_some();
             let step = tokio::select! {
@@ -621,9 +676,11 @@ impl MigratingCapableAccepter {
                     let (reader, writer, lane) =
                         accepted.map_err(|_| MigratingStreamError::LaneDead)?;
                     let feed = self.feed.clone();
+                    let counting = Arc::clone(&self.counting_peeks);
                     self.peeks.push(Box::pin(async move {
+                        let mut budget = PeekBudget::new(counting);
                         PeekedStream {
-                            outcome: Self::peek_and_dispatch(reader, feed).await,
+                            outcome: Self::peek_and_dispatch(reader, feed, &mut budget).await,
                             writer,
                             lane,
                         }
@@ -669,10 +726,16 @@ impl MigratingCapableAccepter {
     async fn peek_and_dispatch(
         reader: StreamReader,
         feed: SpliceRouterHandle,
+        budget: &mut PeekBudget,
     ) -> Result<PeekOutcome, MigratingStreamError> {
-        let Some((is_migrating, header_opt, reader)) = Self::peek_resume_header(reader).await?
+        let peeked = Self::peek_resume_header_off_budget(reader, budget).await?;
+        let Peeked::Complete {
+            is_migrating,
+            header: header_opt,
+            reader,
+        } = peeked
         else {
-            return Ok(PeekOutcome::Consumed);
+            unreachable!("the off-budget continuation read has no deadline")
         };
         let (Some(header), true) = (header_opt, is_migrating) else {
             return Ok(PeekOutcome::Plain { reader });
@@ -705,35 +768,101 @@ impl MigratingCapableAccepter {
         }
     }
 
+    /// Read a resume header inside [`RESUME_HEADER_DEADLINE`], and — if that
+    /// deadline expires — to completion *off* the accepter's bounded peek
+    /// budget.
+    ///
+    /// A substream that has not produced its header by the deadline is NOT
+    /// known to be silent: the control-plane `Open` overtakes the substream's
+    /// own data under congestion, and a migrating generation writes its header
+    /// before it writes anything else. Discarding such a substream drops a
+    /// generation of a chain that may already have a live reader, and that
+    /// reader can then only wait out its whole successor deadline on a gap
+    /// nothing can fill. The deadline still does its job — it stops a silent
+    /// substream from holding the concurrency budget that keeps other
+    /// substreams acceptable — without turning a late header into a lost
+    /// generation.
+    async fn peek_resume_header_off_budget(
+        reader: StreamReader,
+        budget: &mut PeekBudget,
+    ) -> Result<Peeked, MigratingStreamError> {
+        match Self::peek_resume_header(reader).await? {
+            Peeked::Deadline(reader) => {
+                budget.release();
+                Self::finish_resume_header(reader).await
+            }
+            complete => Ok(complete),
+        }
+    }
+
+    /// Read a header, giving up at [`RESUME_HEADER_DEADLINE`]. A
+    /// [`Peeked::Deadline`] hands the reader back so the caller can continue
+    /// the read off its own budget instead of discarding the substream.
     pub(crate) async fn peek_resume_header(
+        reader: StreamReader,
+    ) -> Result<Peeked, MigratingStreamError> {
+        Self::read_resume_header(reader, Some(RESUME_HEADER_DEADLINE)).await
+    }
+
+    /// Continue a header read the deadline cut short. No deadline: the
+    /// substream is released when its header arrives or the peer closes it.
+    async fn finish_resume_header(reader: StreamReader) -> Result<Peeked, MigratingStreamError> {
+        Self::read_resume_header(reader, None).await
+    }
+
+    async fn read_resume_header(
         mut reader: StreamReader,
-    ) -> Result<Option<(bool, Option<ResumeHeader>, StreamReader)>, MigratingStreamError> {
+        deadline: Option<Duration>,
+    ) -> Result<Peeked, MigratingStreamError> {
         use crate::migration_wire::{RESUME_HEADER_LEN, ResumeHeader};
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; RESUME_HEADER_LEN];
         let mut filled = 0;
-        let deadline = tokio::time::Instant::now() + RESUME_HEADER_DEADLINE;
+        let deadline = deadline.map(|duration| tokio::time::Instant::now() + duration);
         while filled < buf.len() {
-            let read = tokio::time::timeout_at(deadline, reader.read(&mut buf[filled..])).await;
-            match read {
-                Err(_) => return Ok(None),
-                Ok(result) => match result {
-                    Ok(0) | Err(_) => {
-                        if filled > 0 {
-                            reader.prepend(&buf[..filled]);
+            let read = match deadline {
+                Some(at) => {
+                    match tokio::time::timeout_at(at, reader.read(&mut buf[filled..])).await {
+                        Ok(read) => read,
+                        Err(_) => {
+                            if filled > 0 {
+                                reader.prepend(&buf[..filled]);
+                            }
+                            return Ok(Peeked::Deadline(reader));
                         }
-                        return Ok(Some((false, None, reader)));
                     }
-                    Ok(n) => filled += n,
-                },
+                }
+                None => reader.read(&mut buf[filled..]).await,
+            };
+            match read {
+                Ok(0) | Err(_) => {
+                    if filled > 0 {
+                        reader.prepend(&buf[..filled]);
+                    }
+                    return Ok(Peeked::Complete {
+                        is_migrating: false,
+                        header: None,
+                        reader,
+                    });
+                }
+                Ok(n) => filled += n,
             }
         }
-        if let Some(header) = ResumeHeader::parse(&buf) {
-            Ok(Some((true, Some(header), reader)))
-        } else {
-            reader.prepend(&buf);
-            Ok(Some((false, None, reader)))
-        }
+        Ok(match ResumeHeader::parse(&buf) {
+            Some(header) => Peeked::Complete {
+                is_migrating: true,
+                header: Some(header),
+                reader,
+            },
+            None => {
+                reader.prepend(&buf);
+                Peeked::Complete {
+                    is_migrating: false,
+                    header: None,
+                    reader,
+                }
+            }
+        })
     }
 }
 
@@ -913,8 +1042,10 @@ impl ResponseRouter {
         driver.spawn(async move {
             let mut peeks: JoinSet<Option<(ResumeHeader, StreamReader)>> = JoinSet::new();
             let mut accepting = true;
+            let counting_peeks = Arc::new(AtomicUsize::new(0));
             loop {
-                let can_accept = accepting && peeks.len() < MAX_CONCURRENT_PEEKS;
+                let can_accept =
+                    accepting && counting_peeks.load(Ordering::Relaxed) < MAX_CONCURRENT_PEEKS;
                 let has_peeks = !peeks.is_empty();
                 if !can_accept && !has_peeks {
                     break;
@@ -922,11 +1053,20 @@ impl ResponseRouter {
                 tokio::select! {
                     accepted = accepter.accept(), if can_accept => match accepted {
                         Ok((reader, _writer, _lane)) => {
+                            let counting = Arc::clone(&counting_peeks);
                             peeks.spawn(async move {
-                                match MigratingCapableAccepter::peek_resume_header(reader).await {
-                                    Ok(Some((true, Some(header), reader))) if header.is_response => {
-                                        Some((header, reader))
-                                    }
+                                let mut budget = PeekBudget::new(counting);
+                                match MigratingCapableAccepter::peek_resume_header_off_budget(
+                                    reader,
+                                    &mut budget,
+                                )
+                                .await
+                                {
+                                    Ok(Peeked::Complete {
+                                        is_migrating: true,
+                                        header: Some(header),
+                                        reader,
+                                    }) if header.is_response => Some((header, reader)),
                                     _ => None,
                                 }
                             });
@@ -2294,6 +2434,55 @@ mod tests {
         accept.abort_all();
     }
 
+    /// A substream whose resume header arrives after
+    /// [`RESUME_HEADER_DEADLINE`] is not known to be silent: the control-plane
+    /// `Open` can overtake the substream's own data. Discarding it drops a
+    /// generation of a chain that may already have a live reader, and that
+    /// reader can then only wait out its whole successor deadline on the gap.
+    /// The read must continue instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_later_than_the_peek_deadline_is_not_discarded() {
+        use tokio::io::AsyncWriteExt;
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
+
+        // The accepter must be running while the substream is empty, or it
+        // would only peek a header that has already arrived.
+        let mut accept = JoinSet::new();
+        accept.spawn(async move { mac.accept().await });
+
+        // The substream is opened with nothing behind it, so the receiver's
+        // peek deadline expires while it is still empty.
+        let (_, mut writer) = opener.open(LaneClass::Interactive).await.unwrap();
+        tokio::time::sleep(RESUME_HEADER_DEADLINE * 3).await;
+
+        // Only now does the header arrive: the generation was live all along.
+        ResumeHeader {
+            logical_id: 5,
+            generation: 0,
+            is_final: false,
+            is_response: false,
+        }
+        .write(&mut writer)
+        .await
+        .unwrap();
+        writer.write_all(b"late-header").await.unwrap();
+
+        let accepted = tokio::time::timeout(Duration::from_secs(5), accept.join_next())
+            .await
+            .expect("the late header was discarded, so the chain it opens has a hole")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (mut reader, _) = migrating(accepted);
+        let mut got = [0u8; 11];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"late-header");
+        let _ = writer.shutdown();
+    }
+
     /// A dead splice feed must surface as `LaneDead` rather than being
     /// skipped: swallowing `FeedDead` leaves the accepter waiting forever
     /// while every stream the peer opens is dropped on the floor.
@@ -2314,6 +2503,53 @@ mod tests {
             "a dead splice feed produced {result:?}"
         );
         let _ = writer.finalize().await;
+    }
+
+    /// The response router peeks response successors with the same deadline,
+    /// and used to discard a late one the same way, leaving the answer's
+    /// reader waiting on a hole nothing could fill.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_header_later_than_the_peek_deadline_is_not_discarded() {
+        let (x_op, x_acc, y_op, mut y_acc, _tasks) = make_duplex_session().await;
+        let (router, _driver) = spawn_response_router(x_acc);
+
+        // The response chain's generation 0: a substream whose peer side is
+        // closed straight away, so the EOF barrier lets generation 1 through.
+        let (gen0_reader, _gen0_writer) = x_op.open(LaneClass::Interactive).await.unwrap();
+        let (_, peer_writer, _) = y_acc.accept().await.unwrap();
+        drop(peer_writer);
+        let mut resp_reader = router
+            .handle()
+            .inject_response_gene(7, gen0_reader)
+            .await
+            .expect("splice feed alive")
+            .await
+            .unwrap();
+
+        // A response successor with nothing behind it: the router's peek
+        // deadline expires first.
+        let (_, mut successor) = y_op.open(LaneClass::Interactive).await.unwrap();
+        tokio::time::sleep(RESUME_HEADER_DEADLINE * 3).await;
+        ResumeHeader {
+            logical_id: 7,
+            generation: 1,
+            is_final: true,
+            is_response: true,
+        }
+        .write(&mut successor)
+        .await
+        .unwrap();
+        successor.shutdown().unwrap();
+
+        let mut got = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut resp_reader, &mut got),
+        )
+        .await
+        .expect("the late response header was discarded, so the answer has a hole")
+        .unwrap();
+        assert_eq!(read, 0, "the response FINAL never closed the answer");
     }
 
     fn migrating(accepted: AcceptedStream) -> (SplicedReader, StreamWriter) {
