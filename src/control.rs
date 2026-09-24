@@ -1867,7 +1867,19 @@ mod reassembly_tests {
                 assert_eq!(control.local_opened_streams, 1, "local slot not counted");
                 control.peer_close(id, Side::Read);
                 control.peer_close(id, Side::Write);
+                assert!(
+                    control.stream_table.contains_key(&id),
+                    "the stream was retired while a local side was still open"
+                );
+                assert_eq!(
+                    control.local_opened_streams, 1,
+                    "a partially closed stream released its local-id slot"
+                );
                 control.local_close(id, Side::Read);
+                assert!(
+                    control.stream_table.contains_key(&id),
+                    "the stream was retired after a single local side closed"
+                );
                 control.local_close(id, Side::Write);
                 assert!(
                     !control.stream_table.contains_key(&id),
@@ -1877,6 +1889,48 @@ mod reassembly_tests {
                     control.local_opened_streams, 0,
                     "the local-id slot of a fully-closed stream was not released"
                 );
+            })
+            .await;
+    }
+
+    /// A peer-originated stream takes no local-id slot: only ids this side
+    /// mints are bounded by [`MuxControl::local_opened_streams`], so a peer's
+    /// opens must never advance it. The asymmetry is what lets
+    /// [`MuxControl::retire_stream`] release the slot unguarded for local ids
+    /// while peer streams retire without touching it.
+    #[tokio::test]
+    async fn a_peer_stream_takes_no_local_id_slot() {
+        let (mut control, _close_tx, drain) = make_control(false);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                // Server initiation: ids without the first bit are the peer's.
+                let (dispatcher, _rx) = stream_read_channel();
+                let bp = PeerReadClosedFlag::new();
+                let (peer_id, _tx) = control.open(dispatcher, bp, Some(7)).await.unwrap();
+                assert_eq!(
+                    control.local_opened_streams, 0,
+                    "a peer-originated stream consumed a local-id slot"
+                );
+                let (dispatcher, _rx2) = stream_read_channel();
+                let (local_id, _tx2) = control
+                    .open(dispatcher, PeerReadClosedFlag::new(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    control.local_opened_streams, 1,
+                    "a locally-originated stream did not take a local-id slot"
+                );
+                control.peer_close(peer_id, Side::Read);
+                control.peer_close(peer_id, Side::Write);
+                control.local_close(peer_id, Side::Read);
+                control.local_close(peer_id, Side::Write);
+                assert_eq!(
+                    control.local_opened_streams, 1,
+                    "retiring a peer-originated stream released the local-id slot of another stream"
+                );
+                assert!(control.stream_table.contains_key(&local_id));
             })
             .await;
     }

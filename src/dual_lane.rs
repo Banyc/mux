@@ -1339,10 +1339,55 @@ mod tests {
         }
     }
 
+    /// Lane liveness is revoked *before* the supervisor awaits the teardown
+    /// reap, so a task aborted by the epilog already observes the lane dead.
+    ///
+    /// Revoking it afterwards leaves a window — the whole abort/reap of both
+    /// lane scopes — in which `is_alive()` still answers `true`, so
+    /// `DualStreamOpener::open` keeps minting streams on a lane the supervisor
+    /// has already determined is gone. The oracle is the aborted task's own
+    /// drop guard: it samples `is_alive()` at exactly the moment the epilog
+    /// tears it down.
+    #[tokio::test]
+    async fn lane_liveness_is_revoked_before_the_teardown_reap() {
+        use std::sync::{Arc, Mutex};
+
+        struct ObserveLivenessOnDrop(Liveness, Arc<Mutex<Option<bool>>>);
+        impl Drop for ObserveLivenessOnDrop {
+            fn drop(&mut self) {
+                *self.1.lock().unwrap() = Some(self.0.is_alive());
+            }
+        }
+
+        let liveness = Liveness::new();
+        let probe = liveness.clone();
+        let observed: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let observed_in_task = Arc::clone(&observed);
+
+        let mut int_s: JoinSet<MuxError> = JoinSet::new();
+        int_s.spawn(async {
+            MuxError::TaskStopped {
+                task: "interactive_finished",
+            }
+        });
+        let mut bulk_s: JoinSet<MuxError> = JoinSet::new();
+        bulk_s.spawn(async move {
+            let _guard = ObserveLivenessOnDrop(probe, observed_in_task);
+            std::future::pending::<MuxError>().await
+        });
+
+        let _ = liveness.watch_dual_lanes(int_s, bulk_s).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(false),
+            "a lane task torn down by the epilog still saw a live lane: liveness must be revoked \
+             before the reap awaits, not after it"
+        );
+    }
+
     // -------------------------------------------------------------------
     // open_auto vectored write (AsyncWrite::write_vectored classification)
     // -------------------------------------------------------------------
-
     #[tokio::test(flavor = "multi_thread")]
     async fn open_auto_vectored_small_total_interactive() {
         let (srv_int, mut cli_int) =

@@ -555,9 +555,14 @@ mod tests {
         assert!(saw_a_small, "A small eventually emitted after A large");
     }
 
-    /// Equal-size messages rotate by round-robin order, not lowest-token-first.
+    /// Equal-size messages leave the receiver in token order: the cached heads
+    /// are consumed one per `recv`, so the lowest remaining token goes first.
+    /// This pins head consumption order, NOT the round-robin cursor — it passes
+    /// unchanged under a lowest-token-first picker, because no two equal-size
+    /// heads with credit coexist at a pick. The cursor's own advance is pinned
+    /// by [`dispatch_advances_the_round_robin_cursor_past_the_chosen_token`].
     #[tokio::test]
-    async fn equal_size_messages_rotate_round_robin() {
+    async fn equal_size_messages_are_consumed_in_token_order() {
         let (tx, mut rx) = write_data_channel();
         let stream_a = open_stream(&tx, &mut rx, 1).await;
         let stream_b = open_stream(&tx, &mut rx, 2).await;
@@ -567,28 +572,68 @@ mod tests {
         send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; 10]).await;
         send_data_owned(stream_c.tx.clone(), stream_c.stream_id, vec![2u8; 10]).await;
 
-        // All equal size. First pick is round-robin from head_pick_start=0, so
-        // lowest token wins the first round; afterwards the cursor advances
-        // past it, so subsequent picks rotate.
+        // All three heads are cached by the first `recv`, which dispatches the
+        // lowest token's whole head (10 bytes is under every cap), so the next
+        // `recv` is left with the remaining two in token order.
         let first = rx.recv().await.unwrap();
-        assert_eq!(first.stream_id, 1);
+        assert_eq!(first.stream_id, 1, "the lowest cached token goes first");
         let second = rx.recv().await.unwrap();
-        assert_eq!(second.stream_id, 2, "round-robin advances to B");
+        assert_eq!(second.stream_id, 2, "the next cached token follows");
         let third = rx.recv().await.unwrap();
-        assert_eq!(third.stream_id, 3, "round-robin advances to C");
+        assert_eq!(third.stream_id, 3, "the last cached token follows");
 
-        // Refill in the same order and confirm rotation continues: cursor is
-        // now past C, wraps around to A.
+        // Refill in the same order: the same consumption order repeats.
         send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![3u8; 10]).await;
         send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![4u8; 10]).await;
         send_data_owned(stream_c.tx.clone(), stream_c.stream_id, vec![5u8; 10]).await;
 
         let fourth = rx.recv().await.unwrap();
-        assert_eq!(fourth.stream_id, 1, "round-robin wraps to A");
+        assert_eq!(fourth.stream_id, 1);
         let fifth = rx.recv().await.unwrap();
         assert_eq!(fifth.stream_id, 2);
         let sixth = rx.recv().await.unwrap();
         assert_eq!(sixth.stream_id, 3);
+    }
+
+    /// Dispatching a head advances the round-robin cursor past its token, so a
+    /// peer whose head ties on remaining length wins the next pick instead of
+    /// the stream that just went.
+    ///
+    /// The tie-break is invisible to byte-total fairness assertions: the
+    /// per-token deficit credit alone keeps every stream's served bytes even,
+    /// so a picker that never moves its cursor still looks fair. Here B's head
+    /// is left cached across A's dispatch, both are then equal in remaining
+    /// length and both hold credit, so only the cursor separates them.
+    #[tokio::test]
+    async fn dispatch_advances_the_round_robin_cursor_past_the_chosen_token() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+        // Pin the cursor so the first pick is unambiguous: it starts past A's
+        // token, so A wins the first pick on head size.
+        rx.head_pick_start = fair_queue::QueueToken(0);
+
+        // A: one byte, dispatched whole, so A keeps nearly all of its quantum
+        // of credit for the next pick.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; 1]).await;
+        // B: larger than one cap, so its head stays cached across A's dispatch.
+        let tied_len = DATA_CONTENDED_CAP * 2;
+        send_data_owned(stream_b.tx.clone(), stream_b.stream_id, vec![1u8; tied_len]).await;
+
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1, "the smaller head is dispatched first");
+        assert_eq!(data_len(&first.data), 1);
+
+        // A is ready again with exactly B's remaining length. Both hold credit,
+        // so the pick is decided by the cursor, which the first dispatch moved
+        // past A: B is now first in round-robin order.
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![2u8; tied_len]).await;
+        let second = rx.recv().await.unwrap();
+        assert_eq!(
+            second.stream_id, 2,
+            "an equal-size peer holding credit must be dispatched next, not the stream that just \
+             went - the round-robin cursor did not advance past the chosen token"
+        );
     }
 
     /// Deficit round robin is byte-fair: beside full-quantum bulk peers, a
@@ -936,6 +981,48 @@ mod tests {
             data_len(&first.data),
             DATA_BULK_CAP,
             "after closing the only sensitive stream, bulk cap should apply"
+        );
+    }
+
+    /// Closing the last non-bulk stream releases its latency vote immediately:
+    /// with only ratio-bulk streams left, a dispatch must use `DATA_BULK_CAP`
+    /// without waiting out `LATENCY_IDLE`. The sibling
+    /// `closing_sensitive_stream_lets_bulk_drain_at_bulk_cap` advances the
+    /// paused clock past the idle window before closing, so the time-driven
+    /// path there reaches the bulk cap whether or not the close actually
+    /// released the token's `LatencyControl` entry — the accounting leak stays
+    /// invisible. Here the clock never advances, so only the close's release
+    /// can make the surviving stream the sole open one.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_last_sensitive_stream_releases_its_latency_vote() {
+        let (tx, mut rx) = write_data_channel();
+        let stream_a = open_stream(&tx, &mut rx, 1).await;
+        let stream_b = open_stream(&tx, &mut rx, 2).await;
+
+        // A -> ratio-bulk: one head of exactly DATA_BULK_CAP records a bulk
+        // observation per dispatch, so three dispatches reach HISTORY_MIN.
+        send_and_drain_message(&stream_a, &mut rx, DATA_BULK_CAP).await;
+
+        // Close B (the only non-bulk stream) and drive the receiver until the
+        // close transition has run. The clock is never advanced, so B's
+        // `open()` deadline is still in the future when A is dispatched.
+        drop(stream_b);
+        loop {
+            let msg = rx.recv().await.unwrap();
+            if msg.stream_id == 2 && matches!(msg.data, StreamWriteData::Fin) {
+                break;
+            }
+        }
+
+        let big_len = DATA_BULK_CAP * 2;
+        send_data_owned(stream_a.tx.clone(), stream_a.stream_id, vec![0u8; big_len]).await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(
+            data_len(&first.data),
+            DATA_BULK_CAP,
+            "the closed stream still held a latency vote: every open stream is bulk, \
+             so the dispatch must not be held at the contended cap"
         );
     }
 

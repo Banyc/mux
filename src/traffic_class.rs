@@ -197,27 +197,26 @@ pub(crate) const LATENCY_HISTORY_MAX: usize = crate::traffic_class::HISTORY_MAX;
 ///   bulk does a dispatch use the bulk cap for throughput.
 ///
 /// The class is computed on demand from per-stream send observations (recent
-/// send sizes and last-sent time); it is not stored as a field. Global
-/// sensitivity is cheap to query in the common case: `bulk_count` and
-/// `next_bulk_transition` are maintained incrementally, and
-/// `any_latency_sensitive` is O(1) except when a time-driven transition is due
-/// (then it recomputes aggregates, O(open_count), and resets the timer).
+/// send sizes); it is not stored as a field. Global sensitivity is cheap to
+/// query in the common case: `bulk_count` is maintained incrementally, and
+/// `any_latency_sensitive` is O(1).
 #[derive(Debug)]
 pub(crate) struct LatencyControl {
     /// Send history per open stream token. `Small`/`Bulk` are tallied
-    /// incrementally so the bulk ratio is a cheap division, and
-    /// `last_sent` lets a bulk stream revert to latency-sensitive if it
-    /// resumes after the idle window.
+    /// incrementally so the bulk ratio is a cheap division; [`Self::close`]
+    /// drops the token's entry when the stream goes away.
     streams: HashMap<fair_queue::QueueToken, SizeMix>,
     /// Number of currently-open streams (`Open` seen, no `Close`/`Fin` yet).
     open_count: usize,
     /// Number of open streams currently classified bulk.
     bulk_count: usize,
-    /// Earliest time at which some non-bulk stream may transition to bulk
-    /// (its `last_sent + LATENCY_IDLE`). `None` when no non-bulk stream could
-    /// ever transition (e.g. no history yet). `any_latency_sensitive` is O(1)
-    /// while `now < next_bulk_transition`; once `now` crosses it, aggregates
-    /// are recomputed and this is reset.
+    /// Time at which every currently open non-bulk stream has been idle long
+    /// enough to be classified bulk by idleness: the *latest* `send + LATENCY_IDLE`
+    /// among them. `None` when nothing has been observed yet, or when the last
+    /// observation was itself bulk. `any_latency_sensitive` is O(1): it answers
+    /// `false` as soon as every open stream is bulk by ratio
+    /// (`open_count == bulk_count`), and otherwise compares `now` against this
+    /// deadline.
     next_bulk_transition: Option<Instant>,
 }
 
