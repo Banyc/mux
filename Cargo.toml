@@ -20,8 +20,8 @@ tracing = "0.1"
 # place that sees both layers together. Imports only ever go downward
 # (mux kit → harness kit); the harness stays a leaf, so no cycle contains a
 # normal edge.
-# netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"], optional = true }
-netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"], optional = true }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
 # rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.90", features = ["testing"], optional = true }
 # rtp = { path = "../rtp", features = ["testing"], optional = true }
 
@@ -37,8 +37,8 @@ file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.
 # every consumer that does not request the feature itself, still compiles
 # without `testing`, so mux's lean dependency graph stays lean.
 mux = { path = ".", features = ["testing"] }
-# netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"] }
-netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"] }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
 # rtp = { git = "https://github.com/Banyc/rtp.git", tag = "v0.0.90", features = ["testing"] }
 # rtp = { path = "../rtp", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
