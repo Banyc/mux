@@ -1586,8 +1586,12 @@ mod tests {
     /// Promotion is eager: each write at the immediate-promotion threshold is
     /// classified before it is written, and a writer already on the bulk lane
     /// is not migrated again (no redundant generation).
+    ///
+    /// Eager is not uncooled: `LanePolicy::on_write` applies
+    /// `crate::traffic_class::MIGRATION_COOLDOWN` to the promote branch too,
+    /// which `traffic_class::tests::promote_respects_cooldown` pins.
     #[tokio::test(flavor = "multi_thread")]
-    async fn promote_is_eager_not_cooled() {
+    async fn promote_opens_one_generation_and_does_not_re_migrate() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
 
         let mut writer = opener.open_migrating(1, LaneClass::Interactive);
