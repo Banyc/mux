@@ -1428,20 +1428,52 @@ mod tests {
         }
     }
 
+    /// The lane a writer is currently writing on. Every caller below has
+    /// already written at least once, so the writer is `Active`; any other
+    /// state means the write path did not finish what it started.
+    fn active_lane(writer: &MigratingStreamWriter) -> LaneClass {
+        match &writer.state {
+            WriterState::Active { lane, .. } => *lane,
+            WriterState::PendingOpen { .. } => panic!("writer is still PendingOpen"),
+            WriterState::Migrating { .. } => panic!("writer is mid-migration"),
+            WriterState::Closed => panic!("writer is closed"),
+        }
+    }
+
     // -------------------------------------------------------------------
     // Promote-before-write
     // -------------------------------------------------------------------
 
+    /// The classification runs *before* the bytes are written: a write at the
+    /// immediate-promotion threshold opens its first generation on the bulk
+    /// lane instead of opening on the interactive lane and then migrating
+    /// away from it. A writer that classified late would have started two
+    /// generations (the abandoned gen 0 plus the bulk successor).
     #[tokio::test(flavor = "multi_thread")]
     async fn promote_before_write() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
 
         let mut writer = opener.open_migrating(1, LaneClass::Interactive);
 
-        // A single large write should promote to bulk BEFORE writing
-        writer.write_all(&[0u8; 3000]).await.unwrap();
-
-        // The write was sent on the bulk lane. Just verify it didn't error.
+        let before = writer.chain.generations_started();
+        writer
+            .write_all(&vec![
+                0u8;
+                crate::traffic_class::PROMOTE_IMMEDIATE_THRESHOLD
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "a write at PROMOTE_IMMEDIATE_THRESHOLD did not promote the writer to the bulk lane"
+        );
+        assert_eq!(
+            writer.chain.generations_started(),
+            before + 1,
+            "the write was sent on a generation the writer then migrated away from - \
+             the promotion must happen before the write"
+        );
         writer.finalize().await.unwrap();
     }
 
@@ -1449,18 +1481,32 @@ mod tests {
     // Demote streak
     // -------------------------------------------------------------------
 
+    /// A bulk writer demotes to the interactive lane on the write that
+    /// completes the small-write streak - not earlier, and not never. The
+    /// first assertion is what makes the second attributable to the streak
+    /// (`DEMOTE_STREAK` is the policy's own constant).
     #[tokio::test(flavor = "multi_thread")]
     async fn demote_streak() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
 
         let mut writer = opener.open_migrating(1, LaneClass::Bulk);
 
-        // Write 4 consecutive small writes — should trigger demotion
-        for _ in 0..4 {
+        for _ in 0..crate::traffic_class::DEMOTE_STREAK - 1 {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "the writer demoted before the small-write streak reached DEMOTE_STREAK"
+        );
 
-        // After demotion, the writer should be on interactive lane.
+        writer.write_all(&[0u8; 100]).await.unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Interactive,
+            "the write that completed the streak left the writer on the bulk lane - \
+             the demotion decision never reached the migration"
+        );
         writer.finalize().await.unwrap();
     }
 
@@ -1487,29 +1533,102 @@ mod tests {
     // Close during migration
     // -------------------------------------------------------------------
 
+    /// Closing while the writer is still in the unresolved `Migrating` state
+    /// must give the peer a clean EOF carrying exactly what was written
+    /// before the close, and must not leave the abandoned target lane open.
     #[tokio::test(flavor = "multi_thread")]
     async fn close_during_migration() {
-        let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let (opener, accepter, _s, _sb, _c, _cb) = make_dual_session().await;
+        let mut mac = accepter.into_migrating_capable();
 
-        let mut writer = opener.open_migrating(1, LaneClass::Interactive);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let mut writer = opener.open_migrating_manual(1, LaneClass::Interactive);
+            writer.write_all(b"before the migration").await.unwrap();
+            // Migrate without a following write, so the writer is still in
+            // `Migrating` when `finalize` runs.
+            writer.force_migrate(LaneClass::Bulk).await.unwrap();
+            assert!(
+                matches!(
+                    &writer.state,
+                    WriterState::Migrating {
+                        target_lane: LaneClass::Bulk
+                    }
+                ),
+                "force_migrate did not leave the writer mid-migration, so this test \
+                 would not exercise a close during migration"
+            );
+            writer.finalize().await.unwrap();
+        });
 
-        writer.write_all(&[0u8; 3000]).await.unwrap(); // triggers promote to bulk
-        writer.finalize().await.unwrap();
+        let accepted = mac.accept().await.unwrap();
+        let (mut reader, _) = migrating(accepted);
+        let mut drains = JoinSet::new();
+        drains.spawn(async move { while mac.accept().await.is_ok() {} });
+
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data)
+            .await
+            .unwrap();
+        assert_eq!(
+            data, b"before the migration",
+            "a close during migration did not deliver the payload written before it"
+        );
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     // -------------------------------------------------------------------
     // Policy: promote is eager
     // -------------------------------------------------------------------
 
+    /// Promotion is eager: each write at the immediate-promotion threshold is
+    /// classified before it is written, and a writer already on the bulk lane
+    /// is not migrated again (no redundant generation).
     #[tokio::test(flavor = "multi_thread")]
     async fn promote_is_eager_not_cooled() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
 
         let mut writer = opener.open_migrating(1, LaneClass::Interactive);
 
-        // Two large writes back-to-back — both should promote immediately
-        writer.write_all(&[0u8; 3000]).await.unwrap();
-        writer.write_all(&[0u8; 4000]).await.unwrap();
+        let before = writer.chain.generations_started();
+        writer
+            .write_all(&vec![
+                0u8;
+                crate::traffic_class::PROMOTE_IMMEDIATE_THRESHOLD
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "the first immediate-promotion write did not promote the writer"
+        );
+        let after_first = writer.chain.generations_started();
+        assert_eq!(
+            after_first,
+            before + 1,
+            "the promotion must open exactly one generation"
+        );
+
+        writer
+            .write_all(&vec![
+                0u8;
+                crate::traffic_class::PROMOTE_IMMEDIATE_THRESHOLD
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "the second immediate-promotion write left the bulk lane"
+        );
+        assert_eq!(
+            writer.chain.generations_started(),
+            after_first,
+            "a writer already on the bulk lane opened another generation"
+        );
         writer.finalize().await.unwrap();
     }
 
@@ -1958,20 +2077,48 @@ mod tests {
     // Policy: demotion respects cooldown
     // -------------------------------------------------------------------
 
+    /// The cooldown gates the *second* demotion: the first streak demotes the
+    /// writer (no prior migration), the promote that follows the expired
+    /// cooldown restarts the window, and a second streak inside that window
+    /// must leave the writer on the bulk lane.
     #[tokio::test(flavor = "multi_thread")]
     async fn demotion_respects_cooldown() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut writer = opener.open_migrating(1, LaneClass::Bulk);
-        for _ in 0..20 {
+        for _ in 0..crate::traffic_class::DEMOTE_STREAK {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.write_all(&[0u8; 3000]).await.unwrap();
-        for _ in 0..20 {
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Interactive,
+            "the first small-write streak must demote the writer: nothing has migrated yet, \
+             so no cooldown can apply"
+        );
+
+        tokio::time::sleep(crate::traffic_class::MIGRATION_COOLDOWN + Duration::from_millis(50))
+            .await;
+        writer
+            .write_all(&vec![
+                0u8;
+                crate::traffic_class::PROMOTE_IMMEDIATE_THRESHOLD
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "a write at PROMOTE_IMMEDIATE_THRESHOLD after the cooldown did not promote the writer"
+        );
+
+        // The promote restarted the cooldown; this streak lands inside it.
+        for _ in 0..crate::traffic_class::DEMOTE_STREAK {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        for _ in 0..4 {
-            writer.write_all(&[0u8; 100]).await.unwrap();
-        }
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "a small-write streak inside MIGRATION_COOLDOWN demoted the writer"
+        );
         writer.finalize().await.unwrap();
     }
 
@@ -1979,18 +2126,46 @@ mod tests {
     // Policy: demotion after cooldown expires
     // -------------------------------------------------------------------
 
+    /// The mirror of [`demotion_respects_cooldown`]: once the promote's
+    /// cooldown has elapsed, the same streak must demote the writer again.
     #[tokio::test(flavor = "multi_thread")]
     async fn demotion_after_cooldown_expires() {
         let (opener, _accepter, _s, _sb, _c, _cb) = make_dual_session().await;
         let mut writer = opener.open_migrating(1, LaneClass::Bulk);
-        for _ in 0..20 {
+        for _ in 0..crate::traffic_class::DEMOTE_STREAK {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
-        writer.write_all(&[0u8; 3000]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        for _ in 0..20 {
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Interactive,
+            "the first small-write streak must demote the writer"
+        );
+
+        tokio::time::sleep(crate::traffic_class::MIGRATION_COOLDOWN + Duration::from_millis(50))
+            .await;
+        writer
+            .write_all(&vec![
+                0u8;
+                crate::traffic_class::PROMOTE_IMMEDIATE_THRESHOLD
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Bulk,
+            "a write at PROMOTE_IMMEDIATE_THRESHOLD after the cooldown did not promote the writer"
+        );
+
+        tokio::time::sleep(crate::traffic_class::MIGRATION_COOLDOWN + Duration::from_millis(50))
+            .await;
+        for _ in 0..crate::traffic_class::DEMOTE_STREAK {
             writer.write_all(&[0u8; 100]).await.unwrap();
         }
+        assert_eq!(
+            active_lane(&writer),
+            LaneClass::Interactive,
+            "the first small-write streak after MIGRATION_COOLDOWN elapsed did not demote the writer"
+        );
         writer.finalize().await.unwrap();
     }
 
