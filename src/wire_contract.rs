@@ -34,6 +34,7 @@ use crate::{
         reader::{CentralIoReadMsg, CentralIoReader},
         scheduler::{StreamWriteData, WriteControlMsg, WriteDataMsg},
     },
+    control::FIRST_BIT,
     lane_hello::{
         GROUP_TOKEN_LEN, GroupToken, HELLO_LEN, PAIRING_NONCE_LEN, PairingNonce, read_lane_hello,
         write_lane_hello,
@@ -156,6 +157,17 @@ fn stream_id_msg_is_a_big_endian_u32() {
     .encode();
     assert_eq!(encoded, [0x01, 0x02, 0x03, 0x04]);
     assert_eq!(StreamIdMsg::decode(encoded).stream_id, 0x0102_0304);
+}
+
+/// Which half of the 32-bit stream-id space each side allocates is a wire
+/// convention: a peer at another revision that split it on a different bit
+/// would mint ids the other side reads as its own. `FIRST_BIT` is the sole
+/// authority for the split, so a change to it stays self-consistent across
+/// every in-crate test that compares against the same constant. The literal
+/// below is the byte-level statement of the convention.
+#[test]
+fn the_stream_id_space_split_bit_is_literal() {
+    assert_eq!(FIRST_BIT, 0x8000_0000);
 }
 
 #[test]

@@ -113,7 +113,7 @@ enum ClassifiedStreamId {
 /// The one bit of a wire stream id that separates this side's id space from
 /// the peer's: set on a local id exactly when
 /// [`MuxControl::local_ids_set_first_bit`] says so.
-const FIRST_BIT: StreamId = 1 << (StreamId::BITS - 1);
+pub(crate) const FIRST_BIT: StreamId = 1 << (StreamId::BITS - 1);
 
 async fn handle_local_open(
     control: &mut MuxControl,
