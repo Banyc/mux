@@ -35,9 +35,6 @@ impl<T> QueueRegistrar<T> {
     fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
         Self { opener }
     }
-    pub fn is_closed(&self) -> bool {
-        self.opener.is_closed()
-    }
     pub async fn open(&self, opening_value: T) -> Option<Sender<T>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let req = OpenRequest {
@@ -54,59 +51,7 @@ impl<T> QueueRegistrar<T> {
         };
         Some(Sender::new(resp))
     }
-    pub fn lazy_open(&self, opening_value: T) -> LazySender<T> {
-        LazySender::new(self.clone(), opening_value)
-    }
 }
-#[derive(Debug)]
-pub struct LazySender<T> {
-    opener: QueueRegistrar<T>,
-    opening_value: Option<T>,
-    sender: Option<NotClone<Sender<T>>>,
-}
-impl<T> LazySender<T> {
-    fn new(opener: QueueRegistrar<T>, opening_value: T) -> Self {
-        Self {
-            opener,
-            opening_value: Some(opening_value),
-            sender: None,
-        }
-    }
-    async fn ensure_sender(&mut self) -> Option<&Sender<T>> {
-        if self.sender.is_none() {
-            let opening_value = self.opening_value.take()?;
-            let sender = self.opener.open(opening_value).await?;
-            self.sender.get_or_insert(NotClone(sender));
-        }
-        Some(&self.sender.as_ref().unwrap().0)
-    }
-    pub fn try_send(&mut self, value: T) -> Result<(), (LazySenderError, T)> {
-        let Some(NotClone(sender)) = &self.sender else {
-            return Err((LazySenderError::NotOpened, value));
-        };
-        match sender.try_send(value) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(value)) => Err((LazySenderError::Full, value)),
-            Err(mpsc::error::TrySendError::Closed(value)) => Err((LazySenderError::Closed, value)),
-        }
-    }
-    pub async fn send(&mut self, value: T) -> Result<(), (LazySenderError, T)> {
-        let Some(sender) = self.ensure_sender().await else {
-            return Err((LazySenderError::Closed, value));
-        };
-        match sender.send(value).await {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::SendError(value)) => Err((LazySenderError::Closed, value)),
-        }
-    }
-}
-#[derive(Debug, Clone)]
-pub enum LazySenderError {
-    Closed,
-    Full,
-    NotOpened,
-}
-
 #[derive(Debug, Clone)]
 struct SenderWithState<Sender> {
     pub state: SenderState,
@@ -136,13 +81,6 @@ impl<T: Send> PollSender<T> {
     pub fn send_item(&mut self, value: T) -> Result<(), T> {
         self.queue.state.send_item(&mut self.queue.sender, value)
     }
-    pub fn poll_send(&mut self, value: T, cx: &mut Context<'_>) -> Poll<Result<(), T>> {
-        match ready!(self.poll_reserve(cx)) {
-            Ok(()) => (),
-            Err(()) => return Err(value).into(),
-        }
-        self.send_item(value).into()
-    }
 }
 #[derive(Debug)]
 pub struct Sender<T> {
@@ -165,12 +103,6 @@ impl<T> Sender<T> {
             sender: resp.dedicated_chan,
         };
         Self { queue }
-    }
-    pub fn is_closed(&self) -> bool {
-        self.queue.sender.is_closed()
-    }
-    pub fn try_send(&self, value: T) -> Result<(), mpsc::error::TrySendError<T>> {
-        self.queue.state.try_send(&self.queue.sender, value)
     }
     pub async fn send(&self, value: T) -> Result<(), mpsc::error::SendError<T>> {
         self.queue.state.send(&self.queue.sender, value).await
@@ -202,16 +134,6 @@ impl SenderState {
         Self {
             shared: Arc::new(SenderStateShared { ready, token }),
         }
-    }
-    pub fn try_send<T>(
-        &self,
-        queue: &mpsc::Sender<T>,
-        value: T,
-    ) -> Result<(), mpsc::error::TrySendError<T>> {
-        let mut undo = ready_incr(&self.shared.ready, self.shared.token);
-        queue.try_send(value)?;
-        undo.commit();
-        Ok(())
     }
     /// # Cancel safety
     ///
@@ -524,8 +446,6 @@ impl<F: FnMut()> UndoGuard<F> {
     }
 }
 
-#[derive(Debug)]
-struct NotClone<T>(pub T);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueueToken(pub usize);
 
