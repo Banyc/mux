@@ -1454,4 +1454,60 @@ mod tests {
             })
             .await;
     }
+
+    /// The lane-message frame on a substream is
+    /// `[payload_len u32 LE][seq u64 LE, Ordered only][payload]`.
+    ///
+    /// Both sides must agree byte for byte: a mode mismatch is not detected on
+    /// the wire, so an `Unordered` reader handed an `Ordered` frame (or a
+    /// revision that swapped a field's endianness) silently feeds the sequence
+    /// bytes into the payload. The expectations below are hand-written
+    /// literals, not `to_le_bytes` round-trips through the production encoder,
+    /// so a self-consistent two-sided change to either field fails here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_frame_bytes_are_little_endian_and_ordered_only_carries_a_sequence() {
+        use tokio::io::AsyncReadExt;
+
+        let (opener, mut accepter, scope) = paired_sessions().await;
+        scope
+            .run(async {
+                // Unordered: no sequence field. A 3-byte payload is
+                // 0x03000000 little-endian and 0x00000003 big-endian.
+                let tx = DualMessageSender::new(opener.clone(), DeliveryMode::Unordered);
+                let mut sends = JoinSet::new();
+                sends.spawn(async move { tx.send(b"abc").await.unwrap() });
+                let (mut reader, _writer, _class) = accepter.accept().await.unwrap();
+                let mut header = [0u8; 4];
+                reader.read_exact(&mut header).await.unwrap();
+                assert_eq!(
+                    header,
+                    [0x03, 0x00, 0x00, 0x00],
+                    "the payload length must be a little-endian u32"
+                );
+                let mut payload = [0u8; 3];
+                reader.read_exact(&mut payload).await.unwrap();
+                assert_eq!(&payload[..], b"abc");
+                sends.join_next().await.unwrap().unwrap();
+
+                // Ordered: the same length prefix followed by an 8-byte
+                // little-endian sequence, which starts at 0 on a fresh sender.
+                let tx = DualMessageSender::new(opener.clone(), DeliveryMode::Ordered);
+                let mut sends = JoinSet::new();
+                sends.spawn(async move { tx.send(b"xyz").await.unwrap() });
+                let (mut reader, _writer, _class) = accepter.accept().await.unwrap();
+                let mut header = [0u8; 12];
+                reader.read_exact(&mut header).await.unwrap();
+                assert_eq!(&header[..4], [0x03, 0x00, 0x00, 0x00]);
+                assert_eq!(
+                    &header[4..],
+                    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    "the sequence must be a little-endian u64 immediately after the length"
+                );
+                let mut payload = [0u8; 3];
+                reader.read_exact(&mut payload).await.unwrap();
+                assert_eq!(&payload[..], b"xyz");
+                sends.join_next().await.unwrap().unwrap();
+            })
+            .await;
+    }
 }

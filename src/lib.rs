@@ -26,6 +26,8 @@ mod task_scope;
 mod test_alloc;
 mod traffic_class;
 mod udp_mux;
+#[cfg(test)]
+mod wire_contract;
 
 // The mux layer-testing kit (`mux::testkit`, behind `testing`): re-exported
 // for the cooperation crate's scenario targets. The feature stays OFF for
