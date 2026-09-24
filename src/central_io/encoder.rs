@@ -236,21 +236,10 @@ where
                 }
             }
         } else {
-            if fixed_header.is_empty() || body.is_empty() {
-                // Keep the existing single-write behaviour when either part is
-                // empty; only coalesce when both are non-empty.
-                if !fixed_header.is_empty() {
-                    self.io_writer.write_all(fixed_header).await?;
-                }
-                if !body.is_empty() {
-                    self.io_writer.write_all(body).await?;
-                }
-            } else {
-                self.frame_buf.clear();
-                self.frame_buf.extend_from_slice(fixed_header);
-                self.frame_buf.extend_from_slice(body);
-                self.io_writer.write_all(&self.frame_buf).await?;
-            }
+            self.frame_buf.clear();
+            self.frame_buf.extend_from_slice(fixed_header);
+            self.frame_buf.extend_from_slice(body);
+            self.io_writer.write_all(&self.frame_buf).await?;
             Ok(())
         }
     }
