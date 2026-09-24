@@ -40,7 +40,7 @@ const RESUME_HEADER_DEADLINE: Duration = Duration::from_secs(30);
 const RESUME_HEADER_DEADLINE: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
-// Mirrored classifier
+// Stream name
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -1637,33 +1637,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Mirrored classifier records history
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn mirrored_classifier_tracks_bulk_ratio() {
-        let mut c = crate::traffic_class::SizeMix::new();
-
-        // Small writes → interactive
-        for _ in 0..10 {
-            c.record(100);
-        }
-        assert!(!c.is_bulk(), "all small writes => not bulk");
-
-        // Large writes → bulk
-        for _ in 0..10 {
-            c.record(3000);
-        }
-        assert!(c.is_bulk(), "many large writes => bulk");
-
-        // Halving on overflow
-        for _ in 0..20 {
-            c.record(100);
-        }
-        assert!(!c.is_bulk(), "halving should let small wins dominate");
-    }
-
-    // -------------------------------------------------------------------
     // DualStreamAccepter::into_migrating_capable
     // -------------------------------------------------------------------
 
@@ -2536,7 +2509,7 @@ mod tests {
     }
 
     /// The auto-classification gate is selected by the OPEN call site, not
-    /// only by the mirrored classifier: `open_migrating` classifies each
+    /// only by `SizeMix`: `open_migrating` classifies each
     /// write and promotes before sending a bulk write, while
     /// `open_migrating_manual` must never auto-migrate. Observing the
     /// writer's lane proves the gate itself, not just `SizeMix` in
