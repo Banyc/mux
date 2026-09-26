@@ -94,6 +94,26 @@ assert that a mux stream's write/close ordering and EOF semantics hold. There
 is no `#[ignore]`d scenario left in this crate, so the `gate-default-required`
 block is empty.
 
+### Stream-read ordering integrity under out-of-order frame delivery (structural, default tier)
+
+A transport that hands complete frames up in arrival order rather than sent
+order — the receiver-side fast-forward the deployment's interactive lane runs —
+is only sound while the consumer above it restores per-stream order. This crate
+is that consumer, so the restoration is gated in the tier that always runs.
+
+The lib unit test
+`control::reassembly_tests::out_of_order_frame_delivery_reaches_the_reader_in_sent_order`
+drives the real delivery decision (`handle_central_read`, the same function
+`run_control` calls) with one stream's frames scrambled across arrival, reads
+the bytes back through the real `StreamReader` the control loop hands the
+application, and asserts they are exactly the bytes the sender wrote, in the
+sent order. It guards the mux end of the mux↔transport frame fast-forward
+coupling (in the deployment, mux over `rtp`). Vacuity: with `frame_reassembly`
+off the same frames route through `MuxControl::dispatch_data`, which forwards
+each body in arrival order, and the assertion fails naming the property
+(arrival order `[3, 0, 7, 1, 6, 2, 5, 4]` reads back as `D, A, H, B, G, C, F,
+E`). The test is a lib unit test, so the opt-in manifest above is unaffected.
+
 ```gate-default-required
 ```
 

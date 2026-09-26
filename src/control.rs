@@ -1123,6 +1123,87 @@ mod reassembly_tests {
         drop(drain);
     }
 
+    /// **Stream-read ordering integrity under out-of-order frame delivery.**
+    ///
+    /// The deployment's interactive lane runs the transport's receiver-side
+    /// frame fast-forward, so complete Data frames reach the mux in *arrival*
+    /// order: a frame at a later offset can be handed up before an earlier
+    /// one. The mux is the component that restores the sender's order —
+    /// `handle_central_read` routes every Data frame through
+    /// `MuxControl::ingest_reassembly`, and the per-stream `ReorderBuffer`
+    /// releases bytes strictly in offset order. That restoration is the whole
+    /// reason the fast-forward opt-in is legal above this crate.
+    ///
+    /// This drives the real delivery path (`handle_central_read`, the very
+    /// function `run_control` calls) with the frames scrambled, then reads the
+    /// bytes back through the real `StreamReader` the control loop hands the
+    /// application. The reader must see exactly the bytes the sender wrote, in
+    /// the order the sender wrote them.
+    ///
+    /// Vacuity: flipping the rig below to `central_read_rig(false)` makes the
+    /// same frames go through `MuxControl::dispatch_data`, which forwards each
+    /// body in arrival order; the assertion then fails on the first mismatched
+    /// byte and names the property.
+    #[tokio::test]
+    async fn out_of_order_frame_delivery_reaches_the_reader_in_sent_order() {
+        const FRAME_LEN: usize = 4;
+        // One distinct payload per frame, so any reordering is observable in
+        // the bytes the reader returns.
+        let frames: Vec<Vec<u8>> = (0..8u8).map(|k| vec![b'A' + k; FRAME_LEN]).collect();
+        let sent: Vec<u8> = frames.iter().flatten().copied().collect();
+        // The order the transport hands the frames to the mux: not the send
+        // order, and with gaps that only close on a later arrival.
+        const ARRIVAL: [usize; 8] = [3, 0, 7, 1, 6, 2, 5, 4];
+        assert!(
+            !ARRIVAL.is_sorted(),
+            "an in-order ARRIVAL list would make this ordering test vacuous"
+        );
+
+        let mut rig = central_read_rig(true);
+        let mut scope = ControlScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                // The peer opens the stream, then sends Data frames whose
+                // offsets are non-monotonic across arrival.
+                rig.deliver(CentralIoReadMsg::Open(7)).await.unwrap();
+                let reader = rig.accept_rx.recv().await.unwrap().reader;
+                for &index in &ARRIVAL {
+                    rig.deliver(CentralIoReadMsg::Data(
+                        7,
+                        (index * FRAME_LEN) as Offset,
+                        buf(&frames[index]),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                rig.deliver(CentralIoReadMsg::Close(
+                    7,
+                    Side::Write,
+                    sent.len() as Offset,
+                ))
+                .await
+                .unwrap();
+
+                let mut got = Vec::new();
+                let mut reader = std::pin::pin!(reader);
+                tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut got)
+                    .await
+                    .expect("the reader must reach the end of the stream");
+                let read_order: Vec<char> = got
+                    .chunks(FRAME_LEN)
+                    .map(|frame| char::from(frame[0]))
+                    .collect();
+                assert_eq!(
+                    got, sent,
+                    "stream-read ordering integrity violated: the reader handed the \
+                     application bytes in a different order than the sender wrote them \
+                     (frames arrived as {ARRIVAL:?}, the reader returned them as {read_order:?})"
+                );
+            })
+            .await;
+    }
+
     /// Reassembly error teardown is idempotent: after the first error
     /// closes the stream's read side, subsequent calls must not enqueue
     /// additional Error messages. A burst of late/bad frames after the
