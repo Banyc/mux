@@ -565,4 +565,61 @@ mod tests {
             "the queue table grew past MAX_QUEUE_COUNT"
         );
     }
+
+    /// A ready mark whose queue is momentarily empty (the window a sender
+    /// opens between incrementing the ready count and its mpsc send/close
+    /// becoming visible) must not stop the scan before a later-ready token.
+    ///
+    /// The scan visits token A first, finds its channel empty, and the
+    /// spurious ready mark says A is still to be delivered (so it must not be
+    /// un-readied); the one `poll_recv` pass must then continue to token B and
+    /// deliver B's message. Returning `Poll::Pending` there instead would
+    /// leave B's already-enqueued message undelivered with no waker registered
+    /// on B's queue — B's push consumed the waker from its previous poll — so
+    /// no later wakeup can arrive and the consumer sleeps forever holding a
+    /// deliverable message.
+    #[test]
+    fn a_spurious_ready_mark_does_not_strand_a_later_ready_token() {
+        let (_opener, mut receiver) = channel::<u32>();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let token_a = QueueToken(0);
+        let token_b = QueueToken(1);
+        let (tx_a, rx_a) = mpsc::channel::<u32>(DATA_QUEUE_SIZE);
+        let (tx_b, rx_b) = mpsc::channel::<u32>(DATA_QUEUE_SIZE);
+        receiver.queues.insert(token_a, rx_a);
+        receiver.queues.insert(token_b, rx_b);
+        receiver.recv_queue_start = QueueToken(0);
+
+        // Token A: a ready mark backed by nothing in its channel, so its
+        // `poll_recv` returns Pending while `try_mark_unready` reports the
+        // mark spurious (a delivery for it is still outstanding).
+        receiver.ready.lock().unwrap().add(token_a);
+
+        // Token B: a real message with its ready mark, exactly as a completed
+        // `send_item` leaves it.
+        let state_b = SenderState::new(Arc::clone(&receiver.ready), token_b);
+        let mut sender_b = tokio_util::sync::PollSender::new(tx_b);
+        assert!(matches!(
+            sender_b.poll_reserve(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        state_b
+            .send_item(&mut sender_b, 42)
+            .expect("token B accepts the reserved slot");
+
+        match receiver.poll_recv(&mut cx) {
+            Poll::Ready(Some((token, ReceiverRecv::Value(42)))) => {
+                assert_eq!(
+                    token, token_b,
+                    "the later-ready token was not the one served"
+                )
+            }
+            other => {
+                panic!("a spurious ready mark on token A stranded token B's message: {other:?}")
+            }
+        }
+        drop(sender_b);
+        drop(tx_a);
+    }
 }
