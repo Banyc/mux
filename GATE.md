@@ -158,7 +158,9 @@ rotation under a full queue; teardown (`Fin`/close/drop) racing pending data;
 and stream open/close churn. Cells deliberately **not** covered: network
 impairment (delay/loss/reordering live in the harness scenarios and
 `rtp_mux/GATE.md`, not in this transport-free crate); `frame_reassembly = true`
-(the soak uses the stock wire); the real transport (mux does not depend on it).
+(the soak uses the stock wire — the reassembly dimension is covered by the
+opt-in `reassembly_gap_family` below); the real transport (mux does not depend
+on it).
 
 ### Liveness in the schedule families the soak holds fixed (standard tier)
 
@@ -193,27 +195,82 @@ dropped while the peer is still staging (CloseRead against data), and a writer
 dropped on its own staged tail (the `Fin` against pending data, verified
 byte-for-byte with a clean EOF). Measured cost: **4.1 s per 20 000 cycles**
 (0.21 ms/cycle).
+- `reassembly_gap_family` — the reassembly dimension, which no other family
+reaches: both sessions run `frame_reassembly` on over a transport whose two
+directions deliver frames out of sent order, so the reorder buffer's
+gap-filling wakeup is observed at all. Shapes: interactive ping-pong
+interleaved with a multi-frame bulk message on one session; a message whose
+frames arrive out of order and across multi-frame gaps (up to three frames
+overtaking one held frame); a `Fin` racing an in-flight message (the extended
+`CloseWrite` final offset arriving while the last data frame is still
+buffered); and a reader dropped mid-reassembly. Each cycle counts the
+out-of-order deliveries it produced (`reorders`, `max_gap`, `close_overtakes`)
+and the run fails if it produced none, so a green run cannot be vacuous.
+Stream setup is inside the cycle bound as well, so an `open`/`accept` that
+never completes is reported as a stall instead of hanging the runner.
+Measured cost: **0.25 ms per cycle** (400 cycles in 0.10 s; 4 000 in
+0.81-1.07 s); the default `MUX_FAMILY_CYCLES=400` is ~0.1 s.
+`MUX_FAMILY_STRAND=n` is a red-proof mode, never a normal one: the n-th data
+frame in each direction is never released.
 
-All three are `#[ignore]`d under `standard`; `MUX_FAMILY_CYCLES` and
+All four are `#[ignore]`d under `standard`; `MUX_FAMILY_CYCLES` and
 `MUX_FAMILY_SEED` widen the run. Detection limit, stated rather than implied:
 a zero-hit run of N cycles excludes a per-cycle defect rate above ~3/N at
 95 % — 0.05 % at this file's default 400 cycles per family, 0.0075 % at a
-20 000-cycle family run — and, as for the soak, the cycles share one build,
-one host and one in-memory transport and are seeded replications, so the
-exclusion is order-of-magnitude, not a rate.
+20 000-cycle family run, and 0.009 % for `reassembly_gap_family`'s 32 000 green
+cycles — and, as for the soak, the cycles share one build, one host and one
+in-memory transport and are seeded replications, so the exclusion is
+order-of-magnitude, not a rate.
+
+#### `reassembly_gap_family`: current status is red at >=13 000 cycles
+
+At its default 400 cycles the family is green: 32 000 cycles across eight seeds
+(four shapes, ~118 000 job completions), with no liveness stall other than the
+one below. Every run of 14 000 cycles — ten of ten, across seeds, over both the
+reordering transport and a plain duplex — wedges the session between cycle
+11 390 and 12 528: the client's `open` succeeds but the peer's `accept` never
+completes, the post-stall probe hangs, and the server's stream table has grown
+to `MAX_CONCURRENT_STREAMS` (8 192 entries, all peer-materialised,
+`local_opened == 0`), after which `accept_peer_stream` silently tolerates
+`TooManyOpenStreams` and every later stream is refused for the life of the
+session. The same shapes over the same transport with `frame_reassembly =
+false` keep the table flat (it never reaches 64 entries) over 14 000 cycles, so
+the leak is mode-on-specific rather than a property of the shapes.
+Reproduction:
+
+```sh
+MUX_FAMILY_CYCLES=14000 MUX_FAMILY_SEED=555 cargo test --release -p mux \
+  --test interactive_liveness_families -- --ignored --nocapture --exact \
+  reassembly_gap_family
+```
+
+A green 400-cycle run therefore clears the covered shapes at that length, not
+the reassembly path. The leak is not fixed in this change: what the mode-on
+admission path should do with a close for a stream it has not materialised,
+and with a stray frame for one it has already retired, is a separate decision.
+
+Red proof of the family's detector power: `MUX_FAMILY_STRAND=1` (an injected
+hold that never releases a data frame) turns the family red inside the first
+cycle, with the stalled jobs named by their staged/received byte counts
+(`interleaved ping staged=16 received=0`). With the landed
+`ReadyCounts::add` wake suppressed, the family stays **green** — 8 runs,
+17 600 cycles, four seeds — so it is not a detector of that defect, and its
+green runs do not certify the egress ready-mark wake.
 
 Coverage cells provided: publish-after-park timing at message boundaries
 (`Fin` and CloseRead included); one-token-at-a-time egress with no cross-token
-wake substitution; several independent sessions with one idle; and control
-frames racing in-flight data. Cells deliberately **not** covered, with the
+wake substitution; several independent sessions with one idle; control frames
+racing in-flight data; and the reassembly dimension — out-of-order arrival,
+multi-frame gaps in the reorder buffer, the extended `CloseWrite` final offset
+racing an in-flight message, a reader dropped mid-reassembly, and stream setup
+liveness inside the cycle bound. Cells deliberately **not** covered, with the
 reason for each empty cell: network impairment (mux is transport-free here;
 delay/loss/reordering belong to the harness scenarios and `rtp_mux/GATE.md`,
-and a duplex cannot produce them); `frame_reassembly = true` (the families run
-the stock wire — the reassembly cursor is covered by the default-tier lib test
+and a duplex cannot produce them); and byte-for-byte wire shape (a liveness
+family asserts delivery, not framing). The reassembly cursor's *framing* stays
+covered by the default-tier lib test
 `control::reassembly_tests::out_of_order_frame_delivery_reaches_the_reader_in_sent_order`,
-which injects the out-of-order arrival directly, because no in-crate transport
-can deliver a frame out of order to drive it here); and byte-for-byte wire
-shape (a liveness family asserts delivery, not framing).
+which injects the out-of-order arrival directly.
 
 ### The egress ready mark carries its wake (structural, default tier)
 
@@ -265,6 +322,7 @@ interactive_liveness_soak::interactive_path_liveness_soak = standard
 interactive_liveness_families::quiet_egress_tail_family = standard
 interactive_liveness_families::concurrent_sessions_family = standard
 interactive_liveness_families::control_race_family = standard
+interactive_liveness_families::reassembly_gap_family = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -275,6 +333,7 @@ interactive_liveness_soak::interactive_path_liveness_soak
 interactive_liveness_families::quiet_egress_tail_family
 interactive_liveness_families::concurrent_sessions_family
 interactive_liveness_families::control_race_family
+interactive_liveness_families::reassembly_gap_family
 ```
 
 ## Perf-tier reach into asserting helpers
