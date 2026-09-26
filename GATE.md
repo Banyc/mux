@@ -117,20 +117,74 @@ E`). The test is a lib unit test, so the opt-in manifest above is unaffected.
 ```gate-default-required
 ```
 
+### Interactive-path liveness under sustained concurrency (standard tier)
+
+The audits here close *decision* defects (threshold inclusivity, equivalence,
+boundary exactness); mutation sweeps cannot reach a *liveness* defect — a lost
+wakeup, a staged reply cancelled by a teardown guard, a cursor blocked on
+something a refusal path silently discarded. Those turn into the multi-second
+interactive stall the product's M1 mandate is about, so the interactive path
+has its own opt-in soak:
+`interactive_liveness_soak::interactive_path_liveness_soak` drives real mux
+sessions over an in-memory transport pair, many concurrent streams per cycle,
+with small request/response messages interleaved with bulk transfers, writers
+parked on the fair-queue reserve path, a reader or writer dropped mid-flight,
+`Fin` racing pending data, and thousands of open/close cycles. It asserts byte
+conservation (per-stream deterministic payload check), per-stream completion
+(no stream starved) and a 2 s per-cycle bound; a cycle that never completes is
+reported as a **hang** distinctly from a cycle that completes late or one that
+moved but left a stream stuck. A stall verdict prints the in-flight jobs with
+their staged/received byte counts, a post-stall session probe (stream-local
+versus session-wide), and a 10 ms runtime heartbeat (a genuine park versus host
+starvation).
+
+Tier: **standard** (`#[ignore]`d, asserting). Measured cost on the release gate
+build: **~4 s** for the default 1500 cycles (~180 MiB, ~9 000 streams opened).
+`MUX_SOAK_CYCLES` and `MUX_SOAK_SEED` widen the run; `MUX_SOAK_REPLAY_TO` and
+`MUX_SOAK_REPEAT` replay one cycle's schedule for reproduction.
+
+Detection limit, stated rather than implied: a zero-hit run of N cycles
+excludes a per-cycle defect rate above ~3/N at 95 % — 0.2 % per cycle at the
+default 1500 cycles — for **this schedule family only**. Cycles share one
+build, one host and one in-memory transport and are seeded replications of the
+same schedule, not independent draws, so zero hits support an order-of-
+magnitude exclusion, not a rate. Host-capacity failures are not catches: this
+soak binds no sockets (no port exhaustion), and the heartbeat separates a
+starved runtime from a parked task.
+
+Coverage cells provided: liveness under sustained interactive+bulk concurrency;
+the `fair_queue` scan/ready discipline and the reserve/`Pending` path; egress
+rotation under a full queue; teardown (`Fin`/close/drop) racing pending data;
+and stream open/close churn. Cells deliberately **not** covered: network
+impairment (delay/loss/reordering live in the harness scenarios and
+`rtp_mux/GATE.md`, not in this transport-free crate); `frame_reassembly = true`
+(the soak uses the stock wire); the real transport (mux does not depend on it).
+
+Two default-tier lib tests pin the same components at unit scale:
+`central_io::scheduler::tests::concurrent_streams_stage_and_close_without_losing_a_byte`
+(48 concurrent streams stage on the production reserve path and close while
+one consumer drains; byte conservation, every `Fin`, bounded run) and
+`fair_queue::tests::a_spurious_ready_mark_does_not_strand_a_later_ready_token`
+(a deterministic pin of the scan-continuation: reverting the `continue` on a
+spurious ready mark to `return Poll::Pending` strands the later token's message
+and fails the test). Neither needs a manifest entry (lib tests are outside the
+scenario targets).
+
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of
 non-`support` tests reported by `cargo test -p mux --test <target> -- --list
---ignored`. mux has no opt-in scenario target, so this block is empty.
+--ignored`.
 
 ```gate-manifest
+interactive_liveness_soak::interactive_path_liveness_soak = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
-`standard`/`full` scenario plus every default-tier assertion. With no opt-in
-scenario the block is empty.
+`standard`/`full` scenario plus every default-tier assertion.
 
 ```gate-asserting
+interactive_liveness_soak::interactive_path_liveness_soak
 ```
 
 ## Perf-tier reach into asserting helpers
