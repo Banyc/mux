@@ -160,6 +160,61 @@ impairment (delay/loss/reordering live in the harness scenarios and
 `rtp_mux/GATE.md`, not in this transport-free crate); `frame_reassembly = true`
 (the soak uses the stock wire); the real transport (mux does not depend on it).
 
+### Liveness in the schedule families the soak holds fixed (standard tier)
+
+The soak's *injection schedule* is fixed by the cycle index (`cycle % 7` for
+the `Fin` race, `% 11` for the dropped reader, `% 13` for the flood), so the
+timing of every injection relative to a message boundary, the number of
+concurrent sessions, and the control-frame races are identical across its
+seeds; it varies stream counts, sizes and volume only. A green soak therefore
+excludes liveness defects in one schedule family. `tests/
+interactive_liveness_families.rs` adds the families it holds fixed, one
+opt-in test each, asserting the same three properties (byte conservation,
+per-job completion, a 2 s cycle bound with the stall reported separately from
+a late cycle) and reporting a stall with the in-flight jobs and their
+staged/received byte counts:
+
+- `quiet_egress_tail_family` — one stream at a time with a cooperative quiet
+gap (yields plus a 200 us sleep) between every message, so each publish is
+made against a scheduler that has been given the chance to park; the same gap
+precedes the tail message-plus-`shutdown` and a dropped reader. This is the
+*timing* axis: no publication in the soak is phase-locked to a quiet message
+boundary, and only one token is live, so no other token's push can substitute
+for a lost wake. Measured cost: **5.0 s per 3 000 cycles** (1.7 ms/cycle,
+dominated by the deliberate gaps); default `MUX_FAMILY_CYCLES=400` is ~0.7 s.
+- `concurrent_sessions_family` — three independent mux pairs over three
+duplexes in one process, so three central-I/O writers each park and must be
+woken on their own; the third pair is idle on odd cycles, so a wake lost in an
+idle session cannot be covered by another session's activity. Measured cost:
+**2.4 s per 20 000 cycles** (0.12 ms/cycle).
+- `control_race_family` — `Open`/`CloseRead`/`CloseWrite` churn racing
+in-flight data: open-then-immediately-abandon (no data at all), a reader
+dropped while the peer is still staging (CloseRead against data), and a writer
+dropped on its own staged tail (the `Fin` against pending data, verified
+byte-for-byte with a clean EOF). Measured cost: **4.1 s per 20 000 cycles**
+(0.21 ms/cycle).
+
+All three are `#[ignore]`d under `standard`; `MUX_FAMILY_CYCLES` and
+`MUX_FAMILY_SEED` widen the run. Detection limit, stated rather than implied:
+a zero-hit run of N cycles excludes a per-cycle defect rate above ~3/N at
+95 % — 0.05 % at this file's default 400 cycles per family, 0.0075 % at a
+20 000-cycle family run — and, as for the soak, the cycles share one build,
+one host and one in-memory transport and are seeded replications, so the
+exclusion is order-of-magnitude, not a rate.
+
+Coverage cells provided: publish-after-park timing at message boundaries
+(`Fin` and CloseRead included); one-token-at-a-time egress with no cross-token
+wake substitution; several independent sessions with one idle; and control
+frames racing in-flight data. Cells deliberately **not** covered, with the
+reason for each empty cell: network impairment (mux is transport-free here;
+delay/loss/reordering belong to the harness scenarios and `rtp_mux/GATE.md`,
+and a duplex cannot produce them); `frame_reassembly = true` (the families run
+the stock wire — the reassembly cursor is covered by the default-tier lib test
+`control::reassembly_tests::out_of_order_frame_delivery_reaches_the_reader_in_sent_order`,
+which injects the out-of-order arrival directly, because no in-crate transport
+can deliver a frame out of order to drive it here); and byte-for-byte wire
+shape (a liveness family asserts delivery, not framing).
+
 ### The egress ready mark carries its wake (structural, default tier)
 
 A bounded channel's receiver waker is consumed by each delivery, so a
@@ -207,6 +262,9 @@ non-`support` tests reported by `cargo test -p mux --test <target> -- --list
 
 ```gate-manifest
 interactive_liveness_soak::interactive_path_liveness_soak = standard
+interactive_liveness_families::quiet_egress_tail_family = standard
+interactive_liveness_families::concurrent_sessions_family = standard
+interactive_liveness_families::control_race_family = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -214,6 +272,9 @@ The `gate-asserting` block records the report-only/asserting split: every
 
 ```gate-asserting
 interactive_liveness_soak::interactive_path_liveness_soak
+interactive_liveness_families::quiet_egress_tail_family
+interactive_liveness_families::concurrent_sessions_family
+interactive_liveness_families::control_race_family
 ```
 
 ## Perf-tier reach into asserting helpers
