@@ -334,8 +334,13 @@ interactive-path soak prints at a stall verdict (fair-queue park census,
 frames emitted and decoded, frames handled, bytes pushed into and dequeued
 from a receiving stream's read queue) plus a per-stream, per-end byte ledger
 (`mux::live_probe::stream_trace_report`, enabled by the soak and off by
-default). It asserts nothing, gates nothing and is not a scenario: it exists
-so that a stall names the stage it parked in. The soak's own assertions,
+default). It also publishes, per session role, the stream-table admission
+ledger — table length, the count of streams this session opened itself (the
+rest were materialised from the peer's frames), the insert/retire totals, and
+a census sampled at the instant admission refuses, which separates entries
+that are already fully closed from entries waiting on the peer's read close.
+It asserts nothing, gates nothing and is not a scenario: it exists so that a
+stall names the stage it parked in. The soak's own assertions,
 bound and verdict kinds are unchanged; the counters are inside its existing
 failure report, next to the heartbeat. Cost of the added instrumentation on
 the measured soak: 1500 cycles still run in **4.1 s** (two runs measured,
@@ -350,6 +355,49 @@ one consumer drains; byte conservation, every `Fin`, bounded run) and
 spurious ready mark to `return Poll::Pending` strands the later token's message
 and fails the test). Neither needs a manifest entry (lib tests are outside the
 scenario targets).
+
+### Stream-table admission (structural, default tier)
+
+The stream table is mux's per-session admission resource: it holds one entry
+per open stream, in both wire modes, and `MuxControl::open` refuses a new
+stream once it holds `max_concurrent_streams` entries. The refusal is bound to
+the table, not to either id space's own count, because a peer under
+`frame_reassembly` materialises entries the local side never opened — the
+table can be full while `local_opened_streams == 0` (measured at the wedge:
+8 192 entries, `local_opened == 0`).
+
+Two properties are gated in the tier that always runs:
+
+- `control::reassembly_tests::a_table_full_of_peer_streams_refuses_further_opens`
+  fills the table with peer-materialised streams and asserts the next local
+  open *and* the next peer open are both refused while the local-id space
+  guard is nowhere near firing. A change that guarded only the local count
+  would admit the local open and let the table and its memory grow without
+  bound.
+- `control::reassembly_tests::a_fully_closed_stream_releases_its_table_entry_and_slot`
+  and `control::reassembly_tests::a_peer_stream_takes_no_local_id_slot` pin
+  the two halves of the counter's authority: the slot is released with the
+  entry, and a peer-materialised stream never takes one. `retire_stream`
+  releases the slot only for an entry the table actually held and classified
+  as local, so a double retire or a retire for an unknown id cannot move the
+  count that the id-space guard in `next_stream_id` uses to prove its ring
+  search terminates.
+
+A refused peer admission has no caller to return an error to: the caller is
+the peer's frame, so the stream cannot be materialised, its data is dropped,
+and `accept_peer_stream` used to return `Ok(())` indistinguishable from an
+accepted stream. The refusal is now counted in the admission ledger at the
+point it is decided (`MuxControl::open` records it as a peer refusal, next to
+the census of what was retained) and the first one per session is logged with
+the stream id and the occupancy, so the symptom a peer sees as a stall leaves
+a line naming the resource. The frame is still dropped rather than answered
+with a synthetic close: the local application never asked for that stream, and
+a close the peer did not open would be indistinguishable from a duplicate of
+its own.
+
+The release side of the same resource — a stream whose last outstanding frame
+is the peer's `CloseWrite` — is described in the `reassembly_gap_family`
+section below.
 
 ## Opt-in manifest
 

@@ -202,10 +202,16 @@ enum HandleCentralReadError {
 /// Sole copy of the peer-stream admission decision, asked before every wire
 /// frame that can introduce a stream. A stream id that arrived from the peer
 /// is materialised and handed to the accept channel unless this side already
-/// has it, or unless this side is the one that allocates it (a stray frame for
+/// has it, unless this side is the one that allocates it (a stray frame for
 /// a local id must never fabricate a stream). An accept the application cannot
 /// take retires the entry, so a peer cannot leak one table slot per stream it
-/// opens; a full table is tolerated the same way.
+/// opens.
+///
+/// A full table is the one refusal this function cannot answer: the peer's
+/// stream cannot be materialised, so its data is dropped. That refusal is
+/// counted and logged where it is decided (see `MuxControl::open`), because a
+/// resource exhaustion that returns `Ok(())` to its caller is otherwise
+/// indistinguishable from a stream that was accepted.
 async fn accept_peer_stream(
     control: &mut MuxControl,
     stream_close_tx: &StreamCloseTxPrototype,
@@ -220,7 +226,10 @@ async fn accept_peer_stream(
     }
     let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
         Ok(x) => x,
-        Err(ControlOpenError::TooManyOpenStreams(_)) => return Ok(()),
+        Err(ControlOpenError::TooManyOpenStreams(_)) => {
+            control.log_admission_refusal(stream_id);
+            return Ok(());
+        }
         Err(ControlOpenError::DeadCentralIo(e)) => {
             return Err(HandleCentralReadError::DeadCentralIo(e));
         }
@@ -275,6 +284,10 @@ pub struct MuxControl {
     write_data_tx: WriteDataTxFactory,
     frame_reassembly: bool,
     max_concurrent_streams: usize,
+    /// One log line per session for a full-table refusal, so a wedge that
+    /// refuses every later stream does not become a log flood; the counter in
+    /// the admission ledger keeps counting every refusal.
+    admission_refusal_logged: bool,
 }
 impl MuxControl {
     pub fn new(
@@ -290,6 +303,7 @@ impl MuxControl {
             write_data_tx,
             frame_reassembly,
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
+            admission_refusal_logged: false,
         }
     }
     /// Sole authority for which half of the wire id space this side owns: a
@@ -346,6 +360,15 @@ impl MuxControl {
         }
     }
     fn next_stream_id(&mut self) -> Result<StreamId, TooManyOpenStreams> {
+        // The local id space is a ring of `max_local_stream_id` values and the
+        // search below walks it until it finds a free one, so it only
+        // terminates while some local id is free. `local_opened_streams` is
+        // exactly the number of local ids this session holds (the stream table
+        // is its only authority: it is incremented on insert and decremented on
+        // removal), so this comparison proves termination. It is not the
+        // capacity bound: a table full of peer-materialised entries is refused
+        // by `Self::open`, which checks the table itself before any id is
+        // minted, and this guard must not be mistaken for that check.
         let max_local_stream_id = StreamId::MAX >> 1;
         if usize::try_from(max_local_stream_id).unwrap() <= self.local_opened_streams {
             return Err(TooManyOpenStreams {});
@@ -394,14 +417,48 @@ impl MuxControl {
     }
     fn retire_stream(&mut self, stream_id: StreamId) {
         let role = self.session_role();
-        if self.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
+        // The table is the authority for both the entry and the local-id slot
+        // count, so the slot is released only for an entry the table actually
+        // held and classified as local: a double retire, or a retire for an id
+        // that was never local, must not move the count the id-space guard in
+        // `next_stream_id` reasons about.
+        if self.stream_table.remove(&stream_id).is_some()
+            && self.classify_stream_id(stream_id) == ClassifiedStreamId::Local
+        {
             self.local_opened_streams -= 1;
         }
-        self.stream_table.remove(&stream_id);
+        debug_assert_eq!(
+            self.local_opened_streams,
+            self.stream_table
+                .keys()
+                .filter(|id| self.classify_stream_id(**id) == ClassifiedStreamId::Local)
+                .count(),
+            "the local-id slot count drifted from the table's local entries"
+        );
         crate::live_probe::note_stream_retired(
             role,
             self.stream_table.len(),
             self.local_opened_streams,
+        );
+    }
+    /// Surface a refused peer admission. The refusal itself is counted where it
+    /// is decided (`Self::open`); this is the one place it is not fatal and not
+    /// returned to any caller, so it also logs the first one per session: a
+    /// session that has run out of table cannot admit the peer's stream, its
+    /// frames are dropped, and without a line naming the stream and the
+    /// occupancy the only symptom is a peer that stalls.
+    fn log_admission_refusal(&mut self, stream_id: StreamId) {
+        if self.admission_refusal_logged {
+            return;
+        }
+        self.admission_refusal_logged = true;
+        tracing::warn!(
+            stream_id,
+            stream_table_len = self.stream_table.len(),
+            max_concurrent_streams = self.max_concurrent_streams,
+            local_opened_streams = self.local_opened_streams,
+            "mux stream table full: the peer's stream cannot be materialised and its \
+             frames are dropped until table entries are released"
         );
     }
     /// Release an entry whose every side has closed. [`Self::local_close`] and
@@ -840,6 +897,56 @@ mod reassembly_tests {
                     "a peer open above the limit was admitted"
                 );
                 drop((pair3, pair4));
+            })
+            .await;
+    }
+
+    /// Admission bounds the stream table, not either id space's own count. A
+    /// table filled entirely by peer-materialised streams holds no local-id
+    /// slot, so the id-space guard in `next_stream_id` cannot be what refuses
+    /// the next open — the table check in `open` has to be. This is the wedge's
+    /// own ledger shape (`local_opened == 0` with a full table), and it is what
+    /// a "guard the local count instead" change would miss.
+    #[tokio::test]
+    async fn a_table_full_of_peer_streams_refuses_further_opens() {
+        let (mut control, _close_tx, drain) = make_control(true);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                control.set_max_concurrent_streams_for_test(2);
+                let (_, peer1) = open_stream(&mut control, &_close_tx, Some(7))
+                    .await
+                    .unwrap();
+                let (_, peer2) = open_stream(&mut control, &_close_tx, Some(9))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    control.local_opened_streams, 0,
+                    "peer-materialised streams must not consume local-id slots"
+                );
+                assert_eq!(control.stream_table.len(), 2);
+                assert!(
+                    usize::try_from(StreamId::MAX >> 1).unwrap() > control.local_opened_streams,
+                    "the local-id space guard is nowhere near firing for this table"
+                );
+
+                let local = control
+                    .open(stream_read_channel().0, PeerReadClosedFlag::new(), None)
+                    .await;
+                assert!(
+                    matches!(local, Err(ControlOpenError::TooManyOpenStreams(_))),
+                    "a local open was admitted with the table full of peer streams"
+                );
+                let peer = control
+                    .open(stream_read_channel().0, PeerReadClosedFlag::new(), Some(11))
+                    .await;
+                assert!(
+                    matches!(peer, Err(ControlOpenError::TooManyOpenStreams(_))),
+                    "a peer open was admitted with the table full of peer streams"
+                );
+                assert_eq!(control.local_opened_streams, 0);
+                drop((peer1, peer2));
             })
             .await;
     }
