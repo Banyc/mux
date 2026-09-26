@@ -157,6 +157,12 @@ async fn handle_central_read(
                         .send(WriteControlMsg::CloseRead(stream_id))
                         .await;
                 }
+                // A `CloseWrite` is the stream's last frame. Two paths above
+                // deliberately do not release the entry (the final offset can
+                // conflict with what was buffered, and a teardown can be the
+                // frame that closes the peer's write half); this is the one
+                // place both have run, so the release check runs here too.
+                control.retire_if_closed(stream_id);
             } else {
                 control.peer_close(stream_id, side);
             }
@@ -398,6 +404,24 @@ impl MuxControl {
             self.local_opened_streams,
         );
     }
+    /// Release an entry whose every side has closed. [`Self::local_close`] and
+    /// [`Self::peer_close`] run this check as part of applying their own
+    /// transition; the reassembly paths below set `is_peer_write_closed`
+    /// themselves (the peer's write half is closed when its final offset has
+    /// been reassembled, not when a `peer_close` is applied), and for a
+    /// stream whose last outstanding frame was that `CloseWrite` neither of
+    /// those two runs afterwards — so they have to run the same check or the
+    /// entry is retained forever and the table fills with streams that are
+    /// already finished.
+    fn retire_if_closed(&mut self, stream_id: StreamId) {
+        if self
+            .stream_table
+            .get(&stream_id)
+            .is_some_and(StreamState::is_closed)
+        {
+            self.retire_stream(stream_id);
+        }
+    }
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamDispatcher> {
         self.stream_table.get(&stream_id)?.open_read_sink()
     }
@@ -491,9 +515,13 @@ impl MuxControl {
             dispatcher.send_data(chunk).map_err(|_| ())?;
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
+            // The peer's last data frame can be the one that completes the
+            // reassembly when its `CloseWrite` overtook it, so this too is a
+            // path that closes the peer's write half.
             stream.is_peer_write_closed = true;
             stream.read_dispatcher.finish();
         }
+        self.retire_if_closed(stream_id);
         Ok(())
     }
 
@@ -505,24 +533,34 @@ impl MuxControl {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
             return Ok(());
         };
-        if stream.is_peer_write_closed {
-            return Ok(());
+        match stream.reassembly.as_mut() {
+            None => {
+                // The read side has already been torn down (its reader is gone
+                // or its reorder buffer hit a protocol error), so no later
+                // frame can be delivered to it. The `CloseWrite` still declares
+                // the peer's write half closed, and recording that is exactly
+                // what lets an entry already closed on every other side be
+                // released by the check below.
+                stream.is_peer_write_closed = true;
+            }
+            Some(reassembly) => {
+                if !stream.is_peer_write_closed {
+                    reassembly.set_final_offset(final_offset).map_err(|e| {
+                        tracing_reassembly_error(stream_id, final_offset, &e);
+                    })?;
+                    let to_release = reassembly.drain_contiguous();
+                    let dispatcher = &stream.read_dispatcher;
+                    for chunk in to_release {
+                        dispatcher.send_data(chunk).map_err(|_| ())?;
+                    }
+                    if reassembly.is_complete() {
+                        stream.is_peer_write_closed = true;
+                        stream.read_dispatcher.finish();
+                    }
+                }
+            }
         }
-        let Some(reassembly) = stream.reassembly.as_mut() else {
-            return Err(());
-        };
-        reassembly.set_final_offset(final_offset).map_err(|e| {
-            tracing_reassembly_error(stream_id, final_offset, &e);
-        })?;
-        let to_release = reassembly.drain_contiguous();
-        let dispatcher = &stream.read_dispatcher;
-        for chunk in to_release {
-            dispatcher.send_data(chunk).map_err(|_| ())?;
-        }
-        if reassembly.is_complete() {
-            stream.is_peer_write_closed = true;
-            stream.read_dispatcher.finish();
-        }
+        self.retire_if_closed(stream_id);
         Ok(())
     }
 
@@ -1506,6 +1544,83 @@ mod reassembly_tests {
                 assert!(
                     !control.stream_table.contains_key(&13),
                     "stream-table entry must be removed after is_closed() becomes true"
+                );
+            })
+            .await;
+    }
+
+    // -----------------------------------------------------------------
+    // Release of a stream whose last outstanding frame is the peer's
+    // `CloseWrite`. Mode-on sets `is_peer_write_closed` from the reassembly
+    // cursor (the peer's final offset), not from `peer_close`, so a stream
+    // that is closed on every other side when the `CloseWrite` lands had no
+    // later `local_close`/`peer_close` to run the `is_closed` check: the entry
+    // was retained for the life of the session and the receiver's table filled
+    // with finished streams.
+    // -----------------------------------------------------------------
+
+    /// The order the release defect needs: both local halves and the peer's
+    /// read close are applied first, so the peer's `CloseWrite` (whose final
+    /// offset completes the reassembly) is the stream's only remaining frame.
+    #[tokio::test]
+    async fn peer_close_write_arriving_last_releases_the_finished_entry() {
+        let (mut control, _close_tx, drain) = make_control(true);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                let _rx = open_test_stream(&mut control, 23).await;
+                control
+                    .ingest_reassembly(23, 0, buf(&[0xAA; 4]))
+                    .await
+                    .unwrap();
+                control.local_close(23, Side::Read);
+                control.local_close(23, Side::Write);
+                control.peer_close(23, Side::Read);
+                assert!(
+                    control.stream_table.contains_key(&23),
+                    "the stream is still waiting on the peer's write half"
+                );
+
+                control.peer_close_write_with_offset(23, 4).await.unwrap();
+
+                assert!(
+                    !control.stream_table.contains_key(&23),
+                    "the frame that closes the peer's write half must release an entry \
+                     that is closed on every other side, or the entry is retained forever"
+                );
+            })
+            .await;
+    }
+
+    /// The converse: the same `CloseWrite` must not release a stream that
+    /// still has a side open. The release condition stays `is_closed`, not
+    /// "a `CloseWrite` was seen", so an entry whose local write half is still
+    /// open survives until that side closes.
+    #[tokio::test]
+    async fn peer_close_write_does_not_release_a_stream_with_an_open_side() {
+        let (mut control, _close_tx, drain) = make_control(true);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                let _rx = open_test_stream(&mut control, 29).await;
+                control
+                    .ingest_reassembly(29, 0, buf(&[0xBB; 4]))
+                    .await
+                    .unwrap();
+                control.local_close(29, Side::Read);
+                control.peer_close(29, Side::Read);
+                control.peer_close_write_with_offset(29, 4).await.unwrap();
+                assert!(
+                    control.stream_table.contains_key(&29),
+                    "the peer's write close released a stream whose local write half is open"
+                );
+
+                control.local_close(29, Side::Write);
+                assert!(
+                    !control.stream_table.contains_key(&29),
+                    "the final local close must release the stream"
                 );
             })
             .await;

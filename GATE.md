@@ -89,10 +89,12 @@ measured) for the mux session table and its per-stream channels.
 ## The gate that always runs
 
 `cargo test -p mux` runs the crate's lib unit tests (including the memory
-floor above) and the mux-only non-scenario target `stream_writer`, whose tests
-assert that a mux stream's write/close ordering and EOF semantics hold. There
-is no `#[ignore]`d scenario left in this crate, so the `gate-default-required`
-block is empty.
+floor above) and the mux-only non-scenario targets `stream_writer` (a mux
+stream's write/close ordering and EOF semantics) and
+`reassembly_stream_release` (a finished stream's table entry is released in
+both wire modes; see the `reassembly_gap_family` section below). There is no
+`#[ignore]`d scenario left in this crate, so the `gate-default-required` block
+names the non-scenario target that must keep running in the default tier.
 
 ### Stream-read ordering integrity under out-of-order frame delivery (structural, default tier)
 
@@ -115,6 +117,7 @@ each body in arrival order, and the assertion fails naming the property
 E`). The test is a lib unit test, so the opt-in manifest above is unaffected.
 
 ```gate-default-required
+reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 ```
 
 ### Interactive-path liveness under sustained concurrency (standard tier)
@@ -222,21 +225,60 @@ cycles — and, as for the soak, the cycles share one build, one host and one
 in-memory transport and are seeded replications, so the exclusion is
 order-of-magnitude, not a rate.
 
-#### `reassembly_gap_family`: current status is red at >=13 000 cycles
+#### `reassembly_gap_family`: stream-table release under `frame_reassembly`
 
 At its default 400 cycles the family is green: 32 000 cycles across eight seeds
-(four shapes, ~118 000 job completions), with no liveness stall other than the
-one below. Every run of 14 000 cycles — ten of ten, across seeds, over both the
-reordering transport and a plain duplex — wedges the session between cycle
-11 390 and 12 528: the client's `open` succeeds but the peer's `accept` never
-completes, the post-stall probe hangs, and the server's stream table has grown
-to `MAX_CONCURRENT_STREAMS` (8 192 entries, all peer-materialised,
-`local_opened == 0`), after which `accept_peer_stream` silently tolerates
-`TooManyOpenStreams` and every later stream is refused for the life of the
-session. The same shapes over the same transport with `frame_reassembly =
-false` keep the table flat (it never reaches 64 entries) over 14 000 cycles, so
-the leak is mode-on-specific rather than a property of the shapes.
-Reproduction:
+(four shapes, ~118 000 job completions). Every run of 14 000 cycles — ten of
+ten, across seeds, over both the reordering transport and a plain duplex — used
+to wedge the session between cycle 11 390 and 12 528: the client's `open`
+succeeds but the peer's `accept` never completes, the post-stall probe hangs,
+and the server's stream table has grown to `MAX_CONCURRENT_STREAMS` (8 192
+entries, all peer-materialised, `local_opened == 0`), after which
+`accept_peer_stream` tolerates `TooManyOpenStreams` and every later stream is
+refused for the life of the session. The same shapes over the same transport
+with `frame_reassembly = false` keep the table flat (it never reaches 64
+entries) over 14 000 cycles, so the retention was mode-on-specific rather than a
+property of the shapes.
+
+What was retained, and why mode-on: `is_peer_write_closed` is set by the
+*reassembly* paths (`MuxControl::ingest_reassembly` and
+`peer_close_write_with_offset`, from the peer's final offset), not by
+`MuxControl::peer_close`, and `MuxControl::local_close` / `peer_close` were the
+only transitions that ran the `is_closed()` → `retire_stream()` check. A stream
+whose last outstanding frame was its `CloseWrite` had no later call through
+either of them, so its entry was retained for the life of the session. The
+admission census the ledger samples at a refusal shows the shape of it: at the
+wedge, 8 190 of the receiver's 8 192 entries were already `is_closed()`. Both
+sides retained entries (the client's own table reached 3 455 entries, all
+`local_opened`), so the defect is "the frame that closes the peer's write half
+does not release the entry", not a property of either id space.
+
+The release: `MuxControl::retire_if_closed` is now the one release check, and
+the reassembly paths that complete the close state run it — including the
+`CloseWrite` that arrives when the read side is already torn down, where no
+later `local_close` can run either. The `CloseWrite` is the stream's last
+frame, so this releases exactly the entries that are finished; an entry with a
+live side is untouched. The cap was not changed: a table that reaches it is the
+symptom of a missing release, not a capacity setting.
+
+Measured rate: the receiver retained 0.677 peer-materialised entries per cycle
+(8 192 retained at cycle 12 105, read from the admission ledger's insert/retire
+gap) and 0.285 per cycle on its own opens; after the fix the same command is
+green at **14 000** cycles and at **60 000** cycles (seed 1; 3 582 573 frames,
+560 000 job completions), same four shapes, same transport. Regression tests,
+both failing before the fix and passing after: the lib test
+`control::reassembly_tests::peer_close_write_arriving_last_releases_the_finished_entry`
+drives the order the defect needs through the real close paths and asserts the
+entry is released, with
+`control::reassembly_tests::peer_close_write_does_not_release_a_stream_with_an_open_side`
+holding the converse; `tests/reassembly_stream_release.rs` drives the same
+order through two real sessions and asserts both admission ledgers drain to
+their baseline, with the stock wire as the in-test control. Vacuity: with
+`retire_if_closed` reduced to a no-op the lib test fails naming the retained
+entry and the scenario fails at iteration 0 with
+`server[table=1 local_opened=0 … inserted=1 retired=0]`.
+
+The reproduction command above is unchanged, and is now the regression run:
 
 ```sh
 MUX_FAMILY_CYCLES=14000 MUX_FAMILY_SEED=555 cargo test --release -p mux \
@@ -244,10 +286,8 @@ MUX_FAMILY_CYCLES=14000 MUX_FAMILY_SEED=555 cargo test --release -p mux \
   reassembly_gap_family
 ```
 
-A green 400-cycle run therefore clears the covered shapes at that length, not
-the reassembly path. The leak is not fixed in this change: what the mode-on
-admission path should do with a close for a stream it has not materialised,
-and with a stray frame for one it has already retired, is a separate decision.
+A green 400-cycle run still clears the covered shapes at that length, not the
+reassembly path, so the long run remains the end-to-end proof.
 
 Red proof of the family's detector power: `MUX_FAMILY_STRAND=1` (an injected
 hold that never releases a data frame) turns the family red inside the first
@@ -334,6 +374,7 @@ interactive_liveness_families::quiet_egress_tail_family
 interactive_liveness_families::concurrent_sessions_family
 interactive_liveness_families::control_race_family
 interactive_liveness_families::reassembly_gap_family
+reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 ```
 
 ## Perf-tier reach into asserting helpers
@@ -350,8 +391,8 @@ perf tier reaches. mux has no `perf` scenario, so this block is empty.
 
 `check-gate.py` covers only the mux scenario targets; mux has none, so the
 checker only confirms the blocks above stay consistent with the compiled test
-binaries. `tests/stream_writer.rs` is a non-scenario target (its tests run in
-the default tier and are not gated as scenarios). The `nightly` bench (`mux`
+binaries. `tests/reassembly_stream_release.rs` and `tests/stream_writer.rs` are non-scenario
+targets (their tests run in the default tier and are not gated as scenarios). The `nightly` bench (`mux`
 with `--features nightly`, `bench::profile_mux_send`) is an infinite profiling
 loop and is never run to completion by any gate. The harness crate has its own
 gate (`netem_test/tests/GATE.md`) and the cooperation crate's gate is
