@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     sync::{
         Arc,
@@ -203,9 +203,12 @@ enum HandleCentralReadError {
 /// frame that can introduce a stream. A stream id that arrived from the peer
 /// is materialised and handed to the accept channel unless this side already
 /// has it, unless this side is the one that allocates it (a stray frame for
-/// a local id must never fabricate a stream). An accept the application cannot
-/// take retires the entry, so a peer cannot leak one table slot per stream it
-/// opens.
+/// a local id must never fabricate a stream), or unless the id was already
+/// released as a finished peer stream (a transport may re-deliver a frame
+/// whose acknowledgement was lost, and a duplicate of a stream the peer has
+/// already ended must not resurrect it as a phantom accepted stream). An
+/// accept the application cannot take retires the entry, so a peer cannot
+/// leak one table slot per stream it opens.
 ///
 /// A full table is the one refusal this function cannot answer: the peer's
 /// stream cannot be materialised, so its data is dropped. That refusal is
@@ -222,6 +225,9 @@ async fn accept_peer_stream(
         return Ok(());
     }
     if control.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
+        return Ok(());
+    }
+    if control.is_retired_finished_peer_stream(stream_id) {
         return Ok(());
     }
     let (_, stream) = match open_stream(control, stream_close_tx, Some(stream_id)).await {
@@ -275,6 +281,19 @@ async fn open_stream(
 
 pub const MAX_CONCURRENT_STREAMS: usize = 8192;
 
+/// How many finished peer stream ids are remembered so that a later frame for
+/// one of them is dropped instead of materialising a phantom accepted stream.
+/// A transport can re-deliver a frame whose acknowledgement was lost, and the
+/// reassembly path materialises a stream from any peer frame it does not
+/// already hold, so a duplicate arriving after the stream was released would
+/// otherwise appear to the application as a second, never-opened stream on the
+/// same id. This is a duplicate-suppression window, not an admission bound:
+/// exceeding it only means a duplicate arriving more than this many finished
+/// streams later can still materialise, and a peer mints ids monotonically
+/// over a 2^31 ring, so an id in the window cannot be a new stream until the
+/// peer has minted on the order of 2^31 streams after its retirement.
+pub const RETIRED_FINISHED_PEER_STREAM_WINDOW: usize = 1024;
+
 #[derive(Debug)]
 pub struct MuxControl {
     stream_table: HashMap<StreamId, StreamState>,
@@ -288,6 +307,11 @@ pub struct MuxControl {
     /// refuses every later stream does not become a log flood; the counter in
     /// the admission ledger keeps counting every refusal.
     admission_refusal_logged: bool,
+    /// Peer stream ids released while their peer write half was already closed,
+    /// oldest first. Populated by [`MuxControl::retire_stream`], consulted by
+    /// the peer-stream admission decision; see
+    /// [`RETIRED_FINISHED_PEER_STREAM_WINDOW`].
+    retired_finished_peer_streams: VecDeque<StreamId>,
 }
 impl MuxControl {
     pub fn new(
@@ -304,6 +328,7 @@ impl MuxControl {
             frame_reassembly,
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
             admission_refusal_logged: false,
+            retired_finished_peer_streams: VecDeque::new(),
         }
     }
     /// Sole authority for which half of the wire id space this side owns: a
@@ -417,15 +442,29 @@ impl MuxControl {
     }
     fn retire_stream(&mut self, stream_id: StreamId) {
         let role = self.session_role();
+        let peer_stream = self.classify_stream_id(stream_id) == ClassifiedStreamId::Peer;
+        // A peer-classified entry whose peer write half is already closed is a
+        // *finished* stream: the peer said it sends no more, so any later frame
+        // on this id is a duplicate of data already delivered and must not
+        // materialise a stream again.
+        let finished_peer = peer_stream
+            && self
+                .stream_table
+                .get(&stream_id)
+                .is_some_and(|stream| stream.is_peer_write_closed);
         // The table is the authority for both the entry and the local-id slot
         // count, so the slot is released only for an entry the table actually
         // held and classified as local: a double retire, or a retire for an id
         // that was never local, must not move the count the id-space guard in
         // `next_stream_id` reasons about.
-        if self.stream_table.remove(&stream_id).is_some()
-            && self.classify_stream_id(stream_id) == ClassifiedStreamId::Local
-        {
+        if self.stream_table.remove(&stream_id).is_some() && !peer_stream {
             self.local_opened_streams -= 1;
+        }
+        if finished_peer {
+            self.retired_finished_peer_streams.push_back(stream_id);
+            if self.retired_finished_peer_streams.len() > RETIRED_FINISHED_PEER_STREAM_WINDOW {
+                self.retired_finished_peer_streams.pop_front();
+            }
         }
         debug_assert_eq!(
             self.local_opened_streams,
@@ -440,6 +479,12 @@ impl MuxControl {
             self.stream_table.len(),
             self.local_opened_streams,
         );
+    }
+    /// Whether `stream_id` names a peer stream that was already released as
+    /// finished, so a frame for it is a duplicate rather than a stream to
+    /// materialise. See [`RETIRED_FINISHED_PEER_STREAM_WINDOW`].
+    fn is_retired_finished_peer_stream(&self, stream_id: StreamId) -> bool {
+        self.retired_finished_peer_streams.contains(&stream_id)
     }
     /// Surface a refused peer admission. The refusal itself is counted where it
     /// is decided (`Self::open`); this is the one place it is not fatal and not
@@ -1728,6 +1773,98 @@ mod reassembly_tests {
                 assert!(
                     !control.stream_table.contains_key(&29),
                     "the final local close must release the stream"
+                );
+            })
+            .await;
+    }
+
+    /// A transport may re-deliver a frame. Once a peer stream has been
+    /// released as finished, a duplicate frame for it must be dropped: the
+    /// reassembly admission path materialises a stream from any peer frame it
+    /// does not hold, so without the released-id window the application would
+    /// be handed a second, never-opened stream on that id.
+    #[tokio::test]
+    async fn a_duplicate_frame_after_a_finished_peer_stream_is_not_materialised() {
+        let mut rig = central_read_rig(true);
+        let mut scope = ControlScope::new();
+        scope.fold(std::mem::take(&mut rig.drain));
+        scope
+            .run(async {
+                rig.deliver(CentralIoReadMsg::Open(7)).await.unwrap();
+                let pair = rig.accept_rx.recv().await.unwrap();
+                rig.control.local_close(7, Side::Read);
+                rig.control.local_close(7, Side::Write);
+                rig.deliver(CentralIoReadMsg::Data(7, 0, buf(&[0xAA; 4])))
+                    .await
+                    .unwrap();
+                rig.deliver(CentralIoReadMsg::Close(7, Side::Read, 0))
+                    .await
+                    .unwrap();
+                rig.deliver(CentralIoReadMsg::Close(7, Side::Write, 4))
+                    .await
+                    .unwrap();
+                assert!(
+                    !rig.control.stream_table.contains_key(&7),
+                    "the finished stream was not released, so this test is not about a released id"
+                );
+
+                for duplicate in [
+                    CentralIoReadMsg::Data(7, 0, buf(&[0xAA; 4])),
+                    CentralIoReadMsg::Close(7, Side::Write, 4),
+                    CentralIoReadMsg::Open(7),
+                ] {
+                    let described = format!("{duplicate:?}");
+                    rig.deliver(duplicate).await.unwrap();
+                    assert!(
+                        !rig.control.stream_table.contains_key(&7),
+                        "{described} re-materialised a released finished peer stream"
+                    );
+                    assert!(
+                        rig.accept_rx.try_recv().is_err(),
+                        "{described} handed the application a phantom accepted stream on a released id"
+                    );
+                }
+                drop(pair);
+            })
+            .await;
+    }
+
+    /// The released-id window is bounded and evicts oldest-first, so it is a
+    /// duplicate-suppression window rather than an unbounded set of every id
+    /// the peer ever finished.
+    #[tokio::test]
+    async fn the_released_finished_peer_stream_window_is_bounded() {
+        let (mut control, _close_tx, drain) = make_control(true);
+        let mut scope = ControlScope::new();
+        scope.fold(drain);
+        scope
+            .run(async {
+                let ids = 1..=(RETIRED_FINISHED_PEER_STREAM_WINDOW as StreamId + 1);
+                for id in ids {
+                    let _rx = open_test_stream(&mut control, id).await;
+                    control.local_close(id, Side::Read);
+                    control.local_close(id, Side::Write);
+                    control.peer_close(id, Side::Read);
+                    control.peer_close_write_with_offset(id, 0).await.unwrap();
+                    assert!(
+                        !control.stream_table.contains_key(&id),
+                        "stream {id} was not released"
+                    );
+                }
+                assert_eq!(
+                    control.retired_finished_peer_streams.len(),
+                    RETIRED_FINISHED_PEER_STREAM_WINDOW,
+                    "the released-id window grew past its bound"
+                );
+                assert!(
+                    !control.is_retired_finished_peer_stream(1),
+                    "the oldest released id was not evicted"
+                );
+                assert!(
+                    control.is_retired_finished_peer_stream(
+                        RETIRED_FINISHED_PEER_STREAM_WINDOW as StreamId + 1
+                    ),
+                    "the newest released id was not remembered"
                 );
             })
             .await;

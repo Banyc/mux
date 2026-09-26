@@ -306,8 +306,11 @@ racing an in-flight message, a reader dropped mid-reassembly, and stream setup
 liveness inside the cycle bound. Cells deliberately **not** covered, with the
 reason for each empty cell: network impairment (mux is transport-free here;
 delay/loss/reordering belong to the harness scenarios and `rtp_mux/GATE.md`,
-and a duplex cannot produce them); and byte-for-byte wire shape (a liveness
-family asserts delivery, not framing). The reassembly cursor's *framing* stays
+and a duplex cannot produce them); byte-for-byte wire shape (a liveness
+family asserts delivery, not framing); and a duplicated frame (the reorderer
+reorders, it never delivers a frame twice, so the released-id window is pinned
+by the default-tier lib tests in the admission section above instead). The
+reassembly cursor's *framing* stays
 covered by the default-tier lib test
 `control::reassembly_tests::out_of_order_frame_delivery_reaches_the_reader_in_sent_order`,
 which injects the out-of-order arrival directly.
@@ -382,6 +385,24 @@ Two properties are gated in the tier that always runs:
   as local, so a double retire or a retire for an unknown id cannot move the
   count that the id-space guard in `next_stream_id` uses to prove its ring
   search terminates.
+
+- `control::reassembly_tests::a_duplicate_frame_after_a_finished_peer_stream_is_not_materialised`
+  releases a peer stream (`Open`, data, both local closes, `CloseRead`,
+  `CloseWrite`) and then re-delivers a data frame, a `CloseWrite`, and an
+  `Open` for it, asserting none of them re-materialises the stream or hands
+  the application a phantom accepted stream. The reassembly admission path
+  materialises from any peer frame it does not hold — that is what lets a
+  frame reordered ahead of its `Open` still arrive — so a released id needs a
+  duplicate-suppression window. The window is bounded
+  (`RETIRED_FINISHED_PEER_STREAM_WINDOW`, oldest-first eviction), and
+  `control::reassembly_tests::the_released_finished_peer_stream_window_is_bounded`
+  pins the bound and the eviction order. It is not an admission bound: a peer
+  mints ids monotonically over a 2^31 ring, so a remembered id cannot be a new
+  stream until the peer has minted on the order of 2^31 streams after that
+  retirement, and exceeding the window only means a duplicate arriving more
+  than this many finished streams later can still materialise. Vacuity:
+  dropping the released-id check makes the duplicate test fail naming the
+  re-materialised frame.
 
 A refused peer admission has no caller to return an error to: the caller is
 the peer's frame, so the stream cannot be materialised, its data is dropped,
