@@ -211,8 +211,12 @@ out-of-order deliveries it produced (`reorders`, `max_gap`, `close_overtakes`)
 and the run fails if it produced none, so a green run cannot be vacuous.
 Stream setup is inside the cycle bound as well, so an `open`/`accept` that
 never completes is reported as a stall instead of hanging the runner.
-Measured cost: **0.25 ms per cycle** (400 cycles in 0.10 s; 4 000 in
-0.81-1.07 s); the default `MUX_FAMILY_CYCLES=400` is ~0.1 s.
+Measured cost: **0.25 ms per cycle** on an idle host (400 cycles in 0.10 s;
+4 000 in 0.81-1.07 s); the default `MUX_FAMILY_CYCLES=400` is ~0.1 s. On the
+loaded host the release fix was verified on (load average ~40) the same family
+measures ~2.0 ms per cycle (14 000 cycles in 28-30 s, 60 000 in ~123 s); the
+admission ledger's two relaxed stores per open and retire are part of that, and
+the two figures are not a controlled A/B.
 `MUX_FAMILY_STRAND=n` is a red-proof mode, never a normal one: the n-th data
 frame in each direction is never released.
 
@@ -220,10 +224,11 @@ All four are `#[ignore]`d under `standard`; `MUX_FAMILY_CYCLES` and
 `MUX_FAMILY_SEED` widen the run. Detection limit, stated rather than implied:
 a zero-hit run of N cycles excludes a per-cycle defect rate above ~3/N at
 95 % — 0.05 % at this file's default 400 cycles per family, 0.0075 % at a
-20 000-cycle family run, and 0.009 % for `reassembly_gap_family`'s 32 000 green
-cycles — and, as for the soak, the cycles share one build, one host and one
-in-memory transport and are seeded replications, so the exclusion is
-order-of-magnitude, not a rate.
+20 000-cycle family run, and 0.002 % for `reassembly_gap_family`'s 148 000
+cycles at 14 000 and 60 000 (the 32 000 green cycles at its default 400 cycles
+are reported above) — and, as for the soak, the cycles share one build, one
+host and one in-memory transport and are seeded replications, so the exclusion
+is order-of-magnitude, not a rate.
 
 #### `reassembly_gap_family`: stream-table release under `frame_reassembly`
 
@@ -264,8 +269,9 @@ symptom of a missing release, not a capacity setting.
 Measured rate: the receiver retained 0.677 peer-materialised entries per cycle
 (8 192 retained at cycle 12 105, read from the admission ledger's insert/retire
 gap) and 0.285 per cycle on its own opens; after the fix the same command is
-green at **14 000** cycles and at **60 000** cycles (seed 1; 3 582 573 frames,
-560 000 job completions), same four shapes, same transport. Regression tests,
+green at **14 000** cycles and at **60 000** cycles on seeds 1 and 555 (148 000
+cycles, ~9.5 M frames, ~1.4 M job completions), same four shapes, same
+transport. Regression tests,
 both failing before the fix and passing after: the lib test
 `control::reassembly_tests::peer_close_write_arriving_last_releases_the_finished_entry`
 drives the order the defect needs through the real close paths and asserts the

@@ -1515,15 +1515,17 @@ async fn report_failure(
 /// is the red-proof mode, not a normal one: the n-th data frame in each
 /// direction is never released, which must turn the family red.
 ///
-/// Current status: green at the default 400 cycles, **red at >=13 000**. Every
-/// run of 14 000 cycles wedges the session between cycle 11 390 and 12 528 —
-/// the client's `open` completes but the peer's `accept` never does, because
-/// the receiver's stream table has grown to `MAX_CONCURRENT_STREAMS` under
-/// `frame_reassembly` and admission is then refused silently for the life of
-/// the session. The same shapes with `frame_reassembly = false` keep the table
-/// flat, so a green 400-cycle run clears these shapes at that length, not the
-/// reassembly path. See `GATE.md` for the reproduction command and the
-/// evidence; the leak itself is not fixed here.
+/// Current status: green at the default 400 cycles, and green at 14 000 and
+/// 60 000 cycles across seeds. Runs of 14 000 cycles used to wedge the session
+/// between cycle 11 390 and 12 528 — the client's `open` completed but the
+/// peer's `accept` never did, because the receiver's stream table had grown to
+/// `MAX_CONCURRENT_STREAMS` under `frame_reassembly` and admission then refused
+/// every later stream. The table filled because the frame that closes the
+/// peer's write half did not release a stream whose last outstanding frame it
+/// was; the release, its regression tests and the measured rate are described
+/// under the family in `GATE.md`. The same shapes with `frame_reassembly =
+/// false` keep the table flat, so the long run remains the end-to-end proof and
+/// a green 400-cycle run still clears these shapes at that length only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "standard tier: frame-reassembly liveness under out-of-order frame delivery"]
 async fn reassembly_gap_family() {
