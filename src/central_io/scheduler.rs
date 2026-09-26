@@ -437,9 +437,9 @@ mod tests {
     use primitive::arena::obj_pool::arc_buf_pool;
 
     use super::{
-        DATA_BULK_CAP, DATA_CONTENDED_CAP, DATA_MEDIUM_CAP, HeadEntry, StreamWriteData,
-        StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxFactory, priority_size,
-        round_robin_distance, write_data_channel,
+        DATA_BULK_CAP, DATA_CONTENDED_CAP, DATA_MEDIUM_CAP, HeadEntry, PollStreamWriteDataTx,
+        StreamWriteData, StreamWriteDataTx, WriteDataMsg, WriteDataRx, WriteDataTxFactory,
+        priority_size, round_robin_distance, write_data_channel,
     };
     use crate::fair_queue;
     use crate::protocol::StreamId;
@@ -1426,5 +1426,90 @@ mod tests {
              original head in place (the fair-queue ready-count and cached-head \
              BTreeMaps reuse their nodes, so nothing else may allocate)",
         );
+    }
+
+    // ---- Egress liveness model soak ----
+
+    /// The egress fair-queue/scheduler path under sustained concurrent stream
+    /// churn: many streams stage messages on the production reserve path and
+    /// then close, while one consumer drains. Every staged byte must be
+    /// dispatched (byte conservation), every stream's close must surface as a
+    /// `Fin`, and the whole run must finish inside a bound. A lost wakeup on
+    /// the fair queue's ready or close mark strands bytes or the `Fin`, which
+    /// is exactly the multi-second interactive stall this crate's audit
+    /// programme cannot reach by mutation. This is the model form of the
+    /// `tests/interactive_liveness_soak.rs` session soak, at the component
+    /// level and with the transport removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_streams_stage_and_close_without_losing_a_byte() {
+        const STREAMS: StreamId = 48;
+        const CHUNK: usize = 8 * 1024;
+        const CHUNKS: usize = 4;
+        const DEFAULT_ROUNDS: usize = 64;
+        // The gate run is short; `MUX_EGRESS_SOAK_ROUNDS` raises it for a hunt.
+        let rounds: usize = std::env::var("MUX_EGRESS_SOAK_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_ROUNDS);
+
+        for round in 0..rounds {
+            let (factory, mut rx) = write_data_channel();
+            let mut producers = tokio::task::JoinSet::new();
+            for stream in 0..STREAMS {
+                let factory = factory.clone();
+                producers.spawn(async move {
+                    let tx = factory.for_stream(stream, false).await.unwrap();
+                    let mut tx = PollStreamWriteDataTx::from(tx);
+                    let chunk = vec![(stream as u8).wrapping_add(round as u8); CHUNK];
+                    for _ in 0..CHUNKS {
+                        std::future::poll_fn(|cx| tx.poll_reserve(cx))
+                            .await
+                            .expect("reserve");
+                        tx.send_item(StreamWriteData::Data(make_data(&chunk)))
+                            .expect("send_item");
+                    }
+                    drop(tx);
+                });
+            }
+
+            let mut bytes = vec![0usize; STREAMS as usize];
+            let mut fins = vec![false; STREAMS as usize];
+            let mut opens = 0usize;
+            let deadline = Duration::from_secs(30);
+            while !fins.iter().all(|fin| *fin) {
+                let msg = match tokio::time::timeout(deadline, rx.recv()).await {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(_dead)) => panic!(
+                        "round {round}: egress died with {} of {} streams still open ",
+                        fins.iter().filter(|fin| !**fin).count(),
+                        STREAMS,
+                    ),
+                    Err(_) => {
+                        panic!("round {round}: egress stalled; bytes={bytes:?} fins={fins:?} ",)
+                    }
+                };
+                match msg.data {
+                    StreamWriteData::Open { wire } => {
+                        assert!(!wire, "for_stream(false) must not emit a wire open");
+                        opens += 1;
+                    }
+                    StreamWriteData::Data(data) => {
+                        bytes[msg.stream_id as usize] += data.len();
+                    }
+                    StreamWriteData::Fin => fins[msg.stream_id as usize] = true,
+                }
+            }
+            assert_eq!(
+                opens, STREAMS as usize,
+                "round {round}: every open surfaced"
+            );
+            assert!(
+                bytes.iter().all(|b| *b == CHUNK * CHUNKS),
+                "round {round}: staged bytes lost: {bytes:?}"
+            );
+            while let Some(result) = producers.join_next().await {
+                result.unwrap();
+            }
+        }
     }
 }
