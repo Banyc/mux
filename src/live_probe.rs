@@ -560,6 +560,223 @@ impl std::fmt::Display for PipelineTotals {
     }
 }
 
+// ─── per-session stream-table ledger ───────────────────────────────────────
+//
+// The stream table is the admission resource: `MuxControl::open` refuses a new
+// stream once the table holds `max_concurrent_streams` entries, and under
+// `frame_reassembly` the peer materialises one slot per stream it opens, so a
+// session that never releases a table entry stops admitting streams for the
+// rest of its life while every counter above still looks healthy (the session
+// is parked on nothing; it is simply full).
+//
+// Both sessions of a mux pair, and every pair an instrument opens, live in one
+// process, so the ledger is published per session *role* rather than as one
+// set of gauges: a reader can then tell which session saturated. Two sessions
+// with the same role sharing a process share a slot and last-writer wins,
+// which is all a stall verdict needs to read the session it names.
+
+/// Which half of a mux pair a session is. The only attribution the ledger
+/// needs: the two roles hold disjoint stream-id spaces, so a saturated peer
+/// table and a saturated local table are different defects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRole {
+    Client,
+    Server,
+}
+
+/// The two states a retained stream-table entry can be in, sampled when
+/// admission refuses a stream (the one moment the whole table is inspected).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionCensus {
+    /// Entries `StreamState::is_closed` already reports finished: every side
+    /// has closed, so no further transition can release them. Non-zero here is
+    /// a release defect, not a load effect.
+    pub closed_but_retained: u64,
+    /// Entries whose only outstanding side is the peer's read close: these are
+    /// still live and are released when that frame arrives, so a table made of
+    /// them is pressure, not a leak.
+    pub awaiting_peer_read_close: u64,
+}
+
+/// One session role's stream-table ledger.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionLedger {
+    /// Entries in the table now.
+    pub stream_table_len: u64,
+    /// Of those, the ones this session opened itself. The rest were
+    /// materialised from the peer's frames (the invariant `local_opened ==
+    /// occupied local ids` is maintained by `MuxControl::retire_stream`).
+    pub local_opened_streams: u64,
+    /// High-water mark of `stream_table_len`: reaching the cap here is what
+    /// makes every later admission refuse.
+    pub max_stream_table_len: u64,
+    /// Streams inserted into the table, and streams released from it. Their
+    /// gap is the table length, so the pair is what shows whether a saturated
+    /// table is steady state or monotonically growing.
+    pub inserted: u64,
+    pub retired: u64,
+    /// Admissions refused because the table was full, split by which id space
+    /// asked. A peer refusal is answered by dropping the peer's frame and
+    /// nothing else; a local refusal is returned to the local `open` caller.
+    pub refused_peer: u64,
+    pub refused_local: u64,
+    /// Census at the most recent refusal.
+    pub census: AdmissionCensus,
+}
+
+#[derive(Debug)]
+struct LedgerSlot {
+    stream_table_len: AtomicU64,
+    local_opened_streams: AtomicU64,
+    max_stream_table_len: AtomicU64,
+    inserted: AtomicU64,
+    retired: AtomicU64,
+    refused_peer: AtomicU64,
+    refused_local: AtomicU64,
+    census_closed_but_retained: AtomicU64,
+    census_awaiting_peer_read_close: AtomicU64,
+}
+impl LedgerSlot {
+    const fn new() -> Self {
+        Self {
+            stream_table_len: AtomicU64::new(0),
+            local_opened_streams: AtomicU64::new(0),
+            max_stream_table_len: AtomicU64::new(0),
+            inserted: AtomicU64::new(0),
+            retired: AtomicU64::new(0),
+            refused_peer: AtomicU64::new(0),
+            refused_local: AtomicU64::new(0),
+            census_closed_but_retained: AtomicU64::new(0),
+            census_awaiting_peer_read_close: AtomicU64::new(0),
+        }
+    }
+    fn get(&self) -> AdmissionLedger {
+        AdmissionLedger {
+            stream_table_len: self.stream_table_len.load(Ordering::Relaxed),
+            local_opened_streams: self.local_opened_streams.load(Ordering::Relaxed),
+            max_stream_table_len: self.max_stream_table_len.load(Ordering::Relaxed),
+            inserted: self.inserted.load(Ordering::Relaxed),
+            retired: self.retired.load(Ordering::Relaxed),
+            refused_peer: self.refused_peer.load(Ordering::Relaxed),
+            refused_local: self.refused_local.load(Ordering::Relaxed),
+            census: AdmissionCensus {
+                closed_but_retained: self.census_closed_but_retained.load(Ordering::Relaxed),
+                awaiting_peer_read_close: self
+                    .census_awaiting_peer_read_close
+                    .load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+static CLIENT_LEDGER: LedgerSlot = LedgerSlot::new();
+static SERVER_LEDGER: LedgerSlot = LedgerSlot::new();
+
+impl SessionRole {
+    fn slot(self) -> &'static LedgerSlot {
+        match self {
+            SessionRole::Client => &CLIENT_LEDGER,
+            SessionRole::Server => &SERVER_LEDGER,
+        }
+    }
+}
+
+impl AdmissionLedger {
+    /// Entries the peer's frames materialised, derived rather than tracked: it
+    /// is the table minus this session's own streams.
+    pub fn peer_materialised_streams(&self) -> u64 {
+        self.stream_table_len
+            .saturating_sub(self.local_opened_streams)
+    }
+}
+
+impl std::fmt::Display for AdmissionLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "table={} local_opened={} peer_materialised={} max_table={} \
+             inserted={} retired={} refused(peer={} local={}) \
+             refusal_census(closed_but_retained={} awaiting_peer_read_close={})",
+            self.stream_table_len,
+            self.local_opened_streams,
+            self.peer_materialised_streams(),
+            self.max_stream_table_len,
+            self.inserted,
+            self.retired,
+            self.refused_peer,
+            self.refused_local,
+            self.census.closed_but_retained,
+            self.census.awaiting_peer_read_close,
+        )
+    }
+}
+
+/// Both session roles' ledgers. Printed whole rather than differenced: a gauge
+/// is a state, and the state at a stall is the reading that names the defect.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionLedgers {
+    pub client: AdmissionLedger,
+    pub server: AdmissionLedger,
+}
+
+impl std::fmt::Display for AdmissionLedgers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "admission: client[{}] server[{}]",
+            self.client, self.server
+        )
+    }
+}
+
+pub fn admission_ledgers() -> AdmissionLedgers {
+    AdmissionLedgers {
+        client: CLIENT_LEDGER.get(),
+        server: SERVER_LEDGER.get(),
+    }
+}
+
+/// A stream entered the table (`len`/`local_opened` are the post-insert
+/// values).
+pub(crate) fn note_stream_table(role: SessionRole, len: usize, local_opened: usize) {
+    let slot = role.slot();
+    slot.stream_table_len.store(len as u64, Ordering::Relaxed);
+    slot.local_opened_streams
+        .store(local_opened as u64, Ordering::Relaxed);
+    slot.max_stream_table_len
+        .fetch_max(len as u64, Ordering::Relaxed);
+    slot.inserted.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A stream left the table: the release side of the ledger.
+pub(crate) fn note_stream_retired(role: SessionRole, len: usize, local_opened: usize) {
+    let slot = role.slot();
+    slot.stream_table_len.store(len as u64, Ordering::Relaxed);
+    slot.local_opened_streams
+        .store(local_opened as u64, Ordering::Relaxed);
+    slot.retired.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Admission refused a stream because the table was full, with the census of
+/// what was retained at that instant. Counted where the refusal is decided, so
+/// a refusal that is then swallowed still appears here.
+pub(crate) fn note_admission_refused(
+    role: SessionRole,
+    peer_stream: bool,
+    census: AdmissionCensus,
+) {
+    let slot = role.slot();
+    if peer_stream {
+        slot.refused_peer.fetch_add(1, Ordering::Relaxed);
+    } else {
+        slot.refused_local.fetch_add(1, Ordering::Relaxed);
+    }
+    slot.census_closed_but_retained
+        .store(census.closed_but_retained, Ordering::Relaxed);
+    slot.census_awaiting_peer_read_close
+        .store(census.awaiting_peer_read_close, Ordering::Relaxed);
+}
+
 /// Both halves of the probe at one instant: what the senders emitted and what
 /// the receivers recorded. A stall reports the delta of a pair across the
 /// stalled cycle.
@@ -567,6 +784,9 @@ impl std::fmt::Display for PipelineTotals {
 pub struct Totals {
     pub egress: EgressTotals,
     pub pipeline: PipelineTotals,
+    /// State, not a delta: carried through `since` so a stall verdict always
+    /// prints the admission ledger of the sessions that ran the cycle.
+    pub ledgers: AdmissionLedgers,
 }
 
 impl Totals {
@@ -574,13 +794,14 @@ impl Totals {
         Totals {
             egress: self.egress.since(&earlier.egress),
             pipeline: self.pipeline.since(&earlier.pipeline),
+            ledgers: self.ledgers,
         }
     }
 }
 
 impl std::fmt::Display for Totals {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}; {}", self.egress, self.pipeline)
+        write!(f, "{}; {}; {}", self.egress, self.pipeline, self.ledgers)
     }
 }
 
@@ -607,5 +828,6 @@ pub fn totals() -> Totals {
             stream_terminal_popped: STREAM_TERMINAL_POPPED.load(Ordering::Relaxed),
             reader_eof_observed: READER_EOF_OBSERVED.load(Ordering::Relaxed),
         },
+        ledgers: admission_ledgers(),
     }
 }

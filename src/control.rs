@@ -305,6 +305,33 @@ impl MuxControl {
             ClassifiedStreamId::Peer
         }
     }
+    /// Which role this session's admission ledger is published under.
+    fn session_role(&self) -> crate::live_probe::SessionRole {
+        match self.initiation {
+            Initiation::Server => crate::live_probe::SessionRole::Server,
+            Initiation::Client => crate::live_probe::SessionRole::Client,
+        }
+    }
+    /// Split the retained entries into the two states that tell a release
+    /// defect from ordinary pressure: an entry `is_closed()` already reports
+    /// finished can never be released by a later transition, while one waiting
+    /// on the peer's read close is released when that frame arrives. Sampled
+    /// only when admission refuses, so the whole-table scan costs nothing on
+    /// the paths that matter.
+    fn admission_census(&self) -> crate::live_probe::AdmissionCensus {
+        let mut census = crate::live_probe::AdmissionCensus::default();
+        for stream in self.stream_table.values() {
+            if stream.is_closed() {
+                census.closed_but_retained += 1;
+            } else if stream.local_read_closed
+                && stream.local_write_closed
+                && stream.is_peer_write_closed
+            {
+                census.awaiting_peer_read_close += 1;
+            }
+        }
+        census
+    }
     fn wire_stream_id(&self, local_stream_id: StreamId) -> StreamId {
         if self.local_ids_set_first_bit() {
             local_stream_id | FIRST_BIT
@@ -360,10 +387,16 @@ impl MuxControl {
         }
     }
     fn retire_stream(&mut self, stream_id: StreamId) {
+        let role = self.session_role();
         if self.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
             self.local_opened_streams -= 1;
         }
         self.stream_table.remove(&stream_id);
+        crate::live_probe::note_stream_retired(
+            role,
+            self.stream_table.len(),
+            self.local_opened_streams,
+        );
     }
     pub fn dispatcher(&self, stream_id: StreamId) -> Option<&StreamDispatcher> {
         self.stream_table.get(&stream_id)?.open_read_sink()
@@ -404,6 +437,11 @@ impl MuxControl {
         stream_id: Option<StreamId>,
     ) -> Result<(StreamId, StreamWriteDataTx), ControlOpenError> {
         if self.stream_table.len() >= self.max_concurrent_streams {
+            crate::live_probe::note_admission_refused(
+                self.session_role(),
+                stream_id.is_some(),
+                self.admission_census(),
+            );
             return Err(ControlOpenError::TooManyOpenStreams(TooManyOpenStreams {}));
         }
         let wire_open = stream_id.is_none();
@@ -418,6 +456,11 @@ impl MuxControl {
         }
         let stream = StreamState::new(dispatcher, peer_read_closed, self.frame_reassembly);
         self.stream_table.insert(stream_id, stream);
+        crate::live_probe::note_stream_table(
+            self.session_role(),
+            self.stream_table.len(),
+            self.local_opened_streams,
+        );
         Ok((
             stream_id,
             self.write_data_tx
