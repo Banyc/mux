@@ -31,18 +31,35 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
+        // Report the park stage before blocking: a stall that reads this
+        // stage is a writer with no frame to send, while one that reads
+        // `TransportWrite` is a transport write that never returned.
+        crate::live_probe::note_egress_select();
         tokio::select! {
             biased;
             res = control.recv() => {
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
-                io_writer.send_control(msg).await.map_err(RunCentralIoWriterError::IoWriter)?;
+                crate::live_probe::note_egress_frame(crate::live_probe::EgressFrameKind::Control);
+                let written = io_writer.send_control(msg).await;
+                crate::live_probe::note_egress_frame_done();
+                written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
             res = data.recv() => {
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
-                io_writer.send_data(msg).await.map_err(RunCentralIoWriterError::IoWriter)?;
+                let kind = match msg.data {
+                    StreamWriteData::Fin => crate::live_probe::EgressFrameKind::CloseWrite,
+                    _ => crate::live_probe::EgressFrameKind::Data,
+                };
+                crate::live_probe::note_egress_frame(kind);
+                let written = io_writer.send_data(msg).await;
+                crate::live_probe::note_egress_frame_done();
+                written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
             () = tokio::time::sleep(heartbeat_interval + heartbeat_jitter(heartbeat_interval)) => {
-                io_writer.send_heartbeat().await.map_err(RunCentralIoWriterError::IoWriter)?;
+                crate::live_probe::note_egress_frame(crate::live_probe::EgressFrameKind::Control);
+                let written = io_writer.send_heartbeat().await;
+                crate::live_probe::note_egress_frame_done();
+                written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
         }
     }

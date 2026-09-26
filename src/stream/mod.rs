@@ -129,6 +129,11 @@ impl Drop for StreamCloseTx {
         self.state.record(self.stream_id, self.side);
     }
 }
+impl StreamCloseTx {
+    pub(crate) fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+}
 #[derive(Debug)]
 pub struct StreamCloseRx {
     state: StreamCloseState,

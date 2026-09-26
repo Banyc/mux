@@ -30,9 +30,13 @@ struct StreamReaderState {
     is_eof: bool,
     read_error: Option<io::ErrorKind>,
     _close: StreamCloseTx,
+    /// Wire id of the stream this reader reads, and whether this session owns
+    /// it. Together they key the liveness probe's per-end byte ledger.
+    trace_key: (crate::protocol::StreamId, bool),
 }
 impl StreamReaderState {
-    pub fn new(close: StreamCloseTx) -> Self {
+    pub fn new(close: StreamCloseTx, is_owner: bool) -> Self {
+        let trace_key = (close.stream_id(), is_owner);
         Self {
             leftover: None,
             prepend: Vec::new(),
@@ -40,6 +44,7 @@ impl StreamReaderState {
             is_eof: false,
             read_error: None,
             _close: close,
+            trace_key,
         }
     }
     pub fn prepend(&mut self, bytes: &[u8]) {
@@ -73,6 +78,8 @@ impl StreamReaderState {
             return Poll::Ready(Err(io::Error::from(kind)));
         }
         if self.is_eof {
+            crate::live_probe::note_reader_eof_observed();
+            crate::live_probe::note_stream_eof(self.trace_key.0, self.trace_key.1);
             return Poll::Ready(Ok(0));
         }
         let (data_buf, pos) = match self.leftover.take() {
@@ -87,6 +94,8 @@ impl StreamReaderState {
                 let data_buf = match msg {
                     StreamReadDataMsg::Fin => {
                         self.is_eof = true;
+                        crate::live_probe::note_reader_eof_observed();
+                        crate::live_probe::note_stream_eof(self.trace_key.0, self.trace_key.1);
                         return Poll::Ready(Ok(0));
                     }
                     StreamReadDataMsg::Data(data_buf) => data_buf,
@@ -103,11 +112,21 @@ impl StreamReaderState {
         let data = &data_buf[pos..];
         let data_len = buf.len().min(data.len());
         buf[..data_len].copy_from_slice(&data[..data_len]);
+        crate::live_probe::note_stream_delivered(self.trace_key.0, self.trace_key.1, data_len);
         let pos = pos + data_len;
         if pos < data_buf.len() {
             self.leftover = Some((data_buf, pos));
         }
         Poll::Ready(Ok(data_len))
+    }
+}
+
+impl Drop for StreamReaderState {
+    fn drop(&mut self) {
+        // The reader is gone: any bytes still queued for it are delivered to
+        // nobody, so the probe marks the ledger instead of reading them as a
+        // stall on this end.
+        crate::live_probe::note_stream_reader_dropped(self.trace_key.0, self.trace_key.1);
     }
 }
 
@@ -117,9 +136,13 @@ pub struct StreamReader {
     state: StreamReaderState,
 }
 impl StreamReader {
-    pub(crate) fn new(data: StreamReadDataRx, close: StreamCloseTx) -> Self {
-        let state = StreamReaderState::new(close);
+    pub(crate) fn new(data: StreamReadDataRx, close: StreamCloseTx, is_owner: bool) -> Self {
+        let state = StreamReaderState::new(close, is_owner);
         Self { data, state }
+    }
+    /// Wire id of the stream this reader reads.
+    pub fn stream_id(&self) -> crate::protocol::StreamId {
+        self.state.trace_key.0
     }
     /// Push `bytes` back to the front of the reader so they are returned
     /// before any subsequent channel data.  Used by peek-style probes
@@ -187,6 +210,10 @@ impl StreamReadDataRx {
         match ready!(self.rx.poll_recv(cx)) {
             Some(msg) => {
                 self.progress.fetch_add(1, Ordering::Relaxed);
+                crate::live_probe::note_stream_read_popped(!matches!(
+                    msg,
+                    StreamReadDataMsg::Data(_)
+                ));
                 Poll::Ready(Ok(msg))
             }
             None => Poll::Ready(Err(DeadControl {})),
@@ -247,6 +274,7 @@ impl StreamDispatcher {
     }
     pub(crate) fn send_data(&self, data: DataBuf) -> Result<(), StreamReadQueueFull> {
         if self.tx.is_closed() {
+            crate::live_probe::note_stream_read_absorbed();
             return Ok(());
         }
         let mut capacity = self.tx.capacity();
@@ -268,6 +296,7 @@ impl StreamDispatcher {
                         // drain that landed after the first read must still
                         // rescue the stream.
                         if self.tx.is_closed() {
+                            crate::live_probe::note_stream_read_absorbed();
                             return Ok(());
                         }
                         self.observe_reader_progress();
@@ -289,6 +318,7 @@ impl StreamDispatcher {
         }
         match self.tx.try_send(StreamReadDataMsg::Data(data)) {
             Ok(()) => {
+                crate::live_probe::note_stream_read_pushed();
                 if queued_data + 1 >= STREAM_READ_SOFT_DATA_LIMIT
                     && self.overloaded_since.get().is_none()
                 {
@@ -296,7 +326,10 @@ impl StreamDispatcher {
                 }
                 Ok(())
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                crate::live_probe::note_stream_read_absorbed();
+                Ok(())
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(StreamReadQueueFull),
         }
     }
@@ -320,8 +353,12 @@ impl StreamDispatcher {
         if self.terminal_sent.swap(true, Ordering::Relaxed) {
             return;
         }
+        crate::live_probe::note_reader_finished();
         match self.tx.try_send(terminal) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
+            Ok(()) => {
+                crate::live_probe::note_stream_terminal_pushed();
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => panic!(
                 "terminal Fin/Error must fit: data admission reserves one headroom slot for it"
             ),

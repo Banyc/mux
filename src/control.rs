@@ -137,9 +137,14 @@ async fn handle_central_read(
 ) -> Result<(), HandleCentralReadError> {
     match msg {
         CentralIoReadMsg::Open(stream_id) => {
+            crate::live_probe::note_frame_handled(crate::live_probe::HandledFrame::Open);
             accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
         }
         CentralIoReadMsg::Close(stream_id, side, final_offset) => {
+            crate::live_probe::note_frame_handled(match side {
+                Side::Read => crate::live_probe::HandledFrame::CloseRead,
+                Side::Write => crate::live_probe::HandledFrame::CloseWrite,
+            });
             if control.frame_reassembly && side == Side::Write {
                 accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
                 if control
@@ -157,6 +162,7 @@ async fn handle_central_read(
             }
         }
         CentralIoReadMsg::Data(stream_id, offset, data_buf) => {
+            crate::live_probe::note_frame_handled(crate::live_probe::HandledFrame::Data);
             if control.frame_reassembly {
                 accept_peer_stream(control, stream_close_tx, stream_init_handle, stream_id).await?;
                 if control
@@ -230,9 +236,14 @@ async fn open_stream(
     let (stream_id, stream_write_data_tx) = control
         .open(stream_read_dispatcher, peer_read_closed.clone(), stream_id)
         .await?;
+    // `owner` marks the side that owns the wire id (the one that opened the
+    // stream) so the liveness probe can attribute a byte ledger to one end of
+    // the stream rather than to both sessions at once.
+    let is_owner = control.classify_stream_id(stream_id) == ClassifiedStreamId::Local;
     let stream_reader = StreamReader::new(
         stream_read_data_rx,
         stream_close_tx.derive(Side::Read, stream_id),
+        is_owner,
     );
     let live_stream_writer = LiveStreamWriter::new(
         stream_write_data_tx,
@@ -335,8 +346,14 @@ impl MuxControl {
     }
     pub fn peer_close(&mut self, stream_id: StreamId, side: Side) {
         let Some(stream) = self.stream_table.get_mut(&stream_id) else {
+            if side == Side::Write {
+                crate::live_probe::note_peer_write_close(false);
+            }
             return;
         };
+        if side == Side::Write {
+            crate::live_probe::note_peer_write_close(!stream.is_peer_write_closed);
+        }
         stream.peer_close(side);
         if stream.is_closed() {
             self.retire_stream(stream_id);
@@ -359,12 +376,22 @@ impl MuxControl {
         if data.is_empty() {
             return Ok(());
         }
+        let data_len = data.len();
         let Some(dispatcher) = self.dispatcher(stream_id) else {
             return Ok(());
         };
         match dispatcher.send_data(data) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                crate::live_probe::note_dispatched_to_reader();
+                crate::live_probe::note_stream_dispatched(
+                    stream_id,
+                    self.classify_stream_id(stream_id) == ClassifiedStreamId::Local,
+                    data_len,
+                );
+                Ok(())
+            }
             Err(StreamReadQueueFull) => {
+                crate::live_probe::note_read_queue_full();
                 self.retire_stream(stream_id);
                 Err(StreamReadQueueFull)
             }

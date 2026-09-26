@@ -29,6 +29,11 @@ mod udp_mux;
 #[cfg(test)]
 mod wire_contract;
 
+// Stall-localisation counters consumed by the interactive liveness soak's
+// stall verdict: they let a parked session name the stage it parked in
+// instead of leaving the mechanism to be guessed at. Report-only, no gate.
+pub mod live_probe;
+
 // The mux layer-testing kit (`mux::testkit`, behind `testing`): re-exported
 // for the cooperation crate's scenario targets. The feature stays OFF for
 // plain library builds so the kit's optional `netem-test` dependency does not

@@ -192,6 +192,23 @@ pub struct Receiver<T> {
     queues: BTreeMap<QueueToken, mpsc::Receiver<T>>,
     recv_queue_start: QueueToken,
 }
+/// Snapshot of the ready set and the per-token queues at one instant, taken
+/// by the sole consumer when it is about to park. See [`crate::live_probe`]
+/// for what each field localizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiverCensus {
+    /// Tokens carrying at least one ready mark: the scan will visit these.
+    pub marked_tokens: usize,
+    /// Tokens left in the ready map with a zero count (already delivered,
+    /// awaiting the next poll that retires them).
+    pub stale_tokens: usize,
+    /// Messages sitting in per-token queues.
+    pub queued_messages: usize,
+    /// Queues holding a message while carrying no ready mark. Every push
+    /// publishes its mark first, so this can only be non-zero if a mark was
+    /// consumed without delivering its message: the lost wake.
+    pub unmarked_queues: usize,
+}
 impl<T> Receiver<T> {
     fn new(opener: mpsc::Receiver<OpenRequest<T>>) -> Self {
         Self {
@@ -218,6 +235,39 @@ impl<T> Receiver<T> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<(QueueToken, ReceiverRecv<T>)>> {
         self.poll_recv_excluding(cx, |_| false)
+    }
+    /// Snapshot the ready set against the per-token queues. Queue lengths are
+    /// read *before* the ready map: a sender publishes its ready mark before
+    /// pushing, so once a push is visible its mark must be too, whereas the
+    /// reverse order would report an unmarked queue for a send still in
+    /// flight and make a lost wake indistinguishable from a race.
+    pub(crate) fn census(&self) -> ReceiverCensus {
+        let queued: Vec<(QueueToken, usize)> = self
+            .queues
+            .iter()
+            .filter_map(|(token, queue)| {
+                let len = queue.len();
+                (len != 0).then_some((*token, len))
+            })
+            .collect();
+        let ready = self.ready.lock().unwrap();
+        ReceiverCensus {
+            marked_tokens: ready
+                .ready_count
+                .values()
+                .filter(|count| **count != 0)
+                .count(),
+            stale_tokens: ready
+                .ready_count
+                .values()
+                .filter(|count| **count == 0)
+                .count(),
+            queued_messages: queued.iter().map(|(_, len)| *len).sum(),
+            unmarked_queues: queued
+                .iter()
+                .filter(|(token, _)| ready.ready_count.get(token).copied().unwrap_or(0) == 0)
+                .count(),
+        }
     }
     /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`
     /// returns true. Open handling is identical to `poll_recv`. If every ready

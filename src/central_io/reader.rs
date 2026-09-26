@@ -197,20 +197,24 @@ where
             Header::Open => {
                 let stream = self.recv_stream_id().await?;
                 crate::padding::skip_tail(&mut self.io_reader).await?;
+                crate::live_probe::note_frame_read(crate::live_probe::EgressFrameKind::Control);
                 Some(CentralIoReadMsg::Open(stream))
             }
             Header::Data => {
                 let (stream, offset, pkt) = self.recv_data().await?;
+                crate::live_probe::note_frame_read(crate::live_probe::EgressFrameKind::Data);
                 Some(CentralIoReadMsg::Data(stream, offset, pkt))
             }
             Header::CloseRead => {
                 let stream = self.recv_stream_id().await?;
                 crate::padding::skip_tail(&mut self.io_reader).await?;
+                crate::live_probe::note_frame_read(crate::live_probe::EgressFrameKind::Control);
                 Some(CentralIoReadMsg::Close(stream, Side::Read, 0))
             }
             Header::CloseWrite => {
                 let (stream, final_offset) = self.recv_close_write().await?;
                 crate::padding::skip_tail(&mut self.io_reader).await?;
+                crate::live_probe::note_frame_read(crate::live_probe::EgressFrameKind::CloseWrite);
                 Some(CentralIoReadMsg::Close(stream, Side::Write, final_offset))
             }
         })

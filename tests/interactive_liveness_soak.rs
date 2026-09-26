@@ -1031,6 +1031,17 @@ async fn interactive_path_liveness_soak() {
     let mut failure: Option<String> = None;
     let inflight = Arc::clone(&soak.inflight);
 
+    // The per-stream byte ledger only records while the probe is enabled, and
+    // is reset per cycle so a stall's report names this cycle's streams.
+    mux::live_probe::enable_stream_trace();
+
+    // Egress probe counts are cumulative across both sessions in this
+    // process, so a stall reports the delta the stalled cycle added: a park
+    // with queued work that first appears inside the stalled cycle is that
+    // cycle's defect, not an earlier one's, and a delta of zero proves the
+    // stall is downstream of the egress fair queue rather than in it. The
+    // snapshot is taken per cycle just below.
+
     // Diagnostic replay: advance the schedule to `MUX_SOAK_REPLAY_TO` without
     // running the earlier cycles, then either run from there or repeat that
     // single cycle `MUX_SOAK_REPEAT` times (RNG restored each repeat, so the
@@ -1054,6 +1065,8 @@ async fn interactive_path_liveness_soak() {
             soak.rng = saved.0;
             soak.next_seed = saved.1;
         }
+        let egress_before = mux::live_probe::totals();
+        mux::live_probe::reset_stream_trace();
         match soak.cycle_verdict(cycle).await {
             CycleVerdict::Pass { elapsed } => {
                 passes += 1;
@@ -1069,9 +1082,10 @@ async fn interactive_path_liveness_soak() {
                     .unwrap_or_default();
                 failure = Some(format!(
                     "cycle {cycle} completed late: {elapsed:?} > {CYCLE_BOUND:?}{detail}; \
-                     in-flight: {:?}; {}",
+                     in-flight: {:?}; {}; {}",
                     inflight.snapshot(),
-                    heartbeat.report()
+                    heartbeat.report(),
+                    mux::live_probe::totals().since(&egress_before)
                 ));
                 break;
             }
@@ -1085,9 +1099,11 @@ async fn interactive_path_liveness_soak() {
                     .unwrap_or_default();
                 failure = Some(format!(
                     "cycle {cycle} stalled: only {progressed} job(s) finished within \
-                     {elapsed:?} and the cycle never completed{detail}; in-flight: {:?}; {}",
+                     {elapsed:?} and the cycle never completed{detail}; in-flight: {:?}; {}; {}; {}",
                     inflight.snapshot(),
-                    heartbeat.report()
+                    heartbeat.report(),
+                    mux::live_probe::totals().since(&egress_before),
+                    mux::live_probe::stream_trace_report()
                 ));
                 break;
             }
@@ -1096,9 +1112,11 @@ async fn interactive_path_liveness_soak() {
                 failure = Some(format!(
                     "cycle {cycle} hung: no progress for at least {HANG_BOUND:?} \
                      (staged={staged} received={received} completed_jobs={jobs}); \
-                     in-flight: {:?}; {}",
+                     in-flight: {:?}; {}; {}; {}",
                     inflight.snapshot(),
-                    heartbeat.report()
+                    heartbeat.report(),
+                    mux::live_probe::totals().since(&egress_before),
+                    mux::live_probe::stream_trace_report()
                 ));
                 break;
             }
@@ -1113,8 +1131,9 @@ async fn interactive_path_liveness_soak() {
     let opened = soak.progress.opened_streams.load(Ordering::Relaxed);
     println!(
         "soak: cycles={passes}/{planned_total} worst_cycle={worst:?} streams_opened={opened} \
-         staged_bytes={staged} received_bytes={received} completed_jobs={jobs} {}",
-        heartbeat.report()
+         staged_bytes={staged} received_bytes={received} completed_jobs={jobs} {}; {}",
+        heartbeat.report(),
+        mux::live_probe::totals()
     );
 
     if staged != received {

@@ -44,6 +44,7 @@ pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
     let rx = WriteDataRx {
         rx,
         token_to_stream: HashMap::new(),
+        token_owner: HashMap::new(),
         heads: BTreeMap::new(),
         head_pick_start: fair_queue::QueueToken(0),
         deficit: HashMap::new(),
@@ -62,6 +63,9 @@ pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
 pub struct WriteDataRx {
     rx: fair_queue::Receiver<WriteDataMsg>,
     token_to_stream: HashMap<fair_queue::QueueToken, StreamId>,
+    /// Whether this session owns each token's wire stream id, learned from the
+    /// stream's `Open` message.
+    token_owner: HashMap<fair_queue::QueueToken, bool>,
     /// At most one cached message per stream/token. The token maps to a
     /// `HeadEntry` (the logical stream message plus a read offset into its
     /// Data payload) ready to be dispatched.
@@ -84,6 +88,10 @@ pub struct WriteDataRx {
 #[derive(Debug)]
 struct HeadEntry {
     msg: WriteDataMsg,
+    /// True when this session owns the wire id (it opened the stream). Carried
+    /// from the stream's `Open` message so the liveness probe can attribute a
+    /// byte ledger to one end of the stream rather than to both sessions.
+    is_owner: bool,
     /// Bytes already dispatched from this head's Data payload; the next
     /// dispatch resumes at `data[offset..]`. Kept here so the original buffer
     /// is reused in place instead of copying the tail on every split.
@@ -117,6 +125,10 @@ impl WriteDataRx {
                     let msg = match msg {
                         fair_queue::ReceiverRecv::Open(value) => {
                             self.token_to_stream.insert(token, value.stream_id);
+                            self.token_owner.insert(
+                                token,
+                                matches!(value.data, StreamWriteData::Open { wire: true }),
+                            );
                             self.latency.open(token, now);
                             value
                         }
@@ -127,13 +139,22 @@ impl WriteDataRx {
                             };
                             self.latency.close(token);
                             self.deficit.remove(&token);
+                            self.token_owner.remove(&token);
                             WriteDataMsg {
                                 stream_id,
                                 data: StreamWriteData::Fin,
                             }
                         }
                     };
-                    self.heads.insert(token, HeadEntry { msg, offset: 0 });
+                    let is_owner = self.token_owner.get(&token).copied().unwrap_or(false);
+                    self.heads.insert(
+                        token,
+                        HeadEntry {
+                            msg,
+                            offset: 0,
+                            is_owner,
+                        },
+                    );
                     continue;
                 }
                 Poll::Ready(None) => {
@@ -151,10 +172,17 @@ impl WriteDataRx {
             if self.rx_closed {
                 return Err(DeadControl {}).into();
             }
+            // About to park with nothing cached. Publish the fair queue's
+            // ready set and queue lengths: the soak reads them to tell a
+            // writer parked on a lost ready mark from one parked with every
+            // queue empty (i.e. blocked somewhere downstream).
+            crate::live_probe::note_egress_park(self.rx.census());
             return Poll::Pending;
         }
         let (chosen, cap) = self.pick_head();
+        crate::live_probe::note_egress_dispatched();
         let (_, mut entry) = self.heads.remove_entry(&chosen).unwrap();
+        let emit_stream = (entry.msg.stream_id, entry.is_owner);
         self.head_pick_start = fair_queue::QueueToken(chosen.0.wrapping_add(1));
         if let StreamWriteData::Data(ref data) = entry.msg.data {
             if entry.offset == 0 || data.len() >= DATA_BULK_CAP {
@@ -170,6 +198,7 @@ impl WriteDataRx {
             }
             let remaining = data.len() - entry.offset;
             let emit = remaining.min(cap);
+            crate::live_probe::note_stream_egress(emit_stream.0, emit_stream.1, emit);
             if emit < remaining {
                 // Emit a fresh buffer holding the prefix; the original `data`
                 // stays with the reinserted tail, its offset advanced past the
@@ -194,6 +223,7 @@ impl WriteDataRx {
                 let mut tail = self.split_pool.take_scoped();
                 tail.clear();
                 tail.extend_from_slice(&data[entry.offset..]);
+                crate::live_probe::note_stream_egress(emit_stream.0, emit_stream.1, tail.len());
                 entry.msg.data = StreamWriteData::Data(tail);
             }
         }
@@ -654,6 +684,7 @@ mod tests {
                         data: StreamWriteData::Data(make_data(&vec![0u8; size])),
                     },
                     offset: 0,
+                    is_owner: true,
                 },
             );
         }
@@ -683,6 +714,7 @@ mod tests {
                         data: StreamWriteData::Data(make_data(&vec![0u8; chunk[stream_id]])),
                     },
                     offset: 0,
+                    is_owner: true,
                 }
             };
             rx.heads.insert(token, refill);
@@ -712,6 +744,7 @@ mod tests {
                     data: StreamWriteData::Data(make_data(&[0u8; DATA_BULK_CAP])),
                 },
                 offset: 0,
+                is_owner: true,
             },
         );
         rx.heads.insert(
@@ -722,6 +755,7 @@ mod tests {
                     data: StreamWriteData::Data(make_data(&[1u8; 10])),
                 },
                 offset: 0,
+                is_owner: true,
             },
         );
         rx.head_pick_start = fair_queue::QueueToken(0);
@@ -744,6 +778,7 @@ mod tests {
                 data: StreamWriteData::Open { wire: false },
             },
             offset: 0,
+            is_owner: true,
         };
         let fin = HeadEntry {
             msg: WriteDataMsg {
@@ -751,6 +786,7 @@ mod tests {
                 data: StreamWriteData::Fin,
             },
             offset: 0,
+            is_owner: true,
         };
         let data = HeadEntry {
             msg: WriteDataMsg {
@@ -758,6 +794,7 @@ mod tests {
                 data: StreamWriteData::Data(make_data(&[0u8; 42])),
             },
             offset: 0,
+            is_owner: true,
         };
         assert_eq!(priority_size(&open), 0);
         assert_eq!(priority_size(&fin), 0);
