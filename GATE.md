@@ -160,6 +160,35 @@ impairment (delay/loss/reordering live in the harness scenarios and
 `rtp_mux/GATE.md`, not in this transport-free crate); `frame_reassembly = true`
 (the soak uses the stock wire); the real transport (mux does not depend on it).
 
+### The egress ready mark carries its wake (structural, default tier)
+
+A bounded channel's receiver waker is consumed by each delivery, so a
+channel whose last poll returned a message has no waker armed until it is
+polled again; the per-token channels alone therefore cannot guarantee that a
+mark published after the consumer's last scan wakes it. The default-tier lib
+test
+`fair_queue::tests::a_ready_mark_wakes_a_parked_consumer_whose_channel_waker_is_gone`
+parks a consumer on the ready set, installs a token channel with no waker
+armed, publishes a mark exactly as a sender does, and asserts the parked
+consumer is woken and the marked token is still deliverable. The state is
+constructed white-box (the runtime interleaving that reaches it is rare
+enough that only a construction pins it); vacuity: removing the `wake()`
+from `ReadyCounts::add` fails the test naming the lost mark.
+
+### Stall localisation probe (report-only, inside the soak)
+
+`mux::live_probe` publishes the egress and ingress stage counters the
+interactive-path soak prints at a stall verdict (fair-queue park census,
+frames emitted and decoded, frames handled, bytes pushed into and dequeued
+from a receiving stream's read queue) plus a per-stream, per-end byte ledger
+(`mux::live_probe::stream_trace_report`, enabled by the soak and off by
+default). It asserts nothing, gates nothing and is not a scenario: it exists
+so that a stall names the stage it parked in. The soak's own assertions,
+bound and verdict kinds are unchanged; the counters are inside its existing
+failure report, next to the heartbeat. Cost of the added instrumentation on
+the measured soak: 1500 cycles still run in **4.1 s** (two runs measured,
+4.08 s and 4.12 s, against the 4 s recorded above).
+
 Two default-tier lib tests pin the same components at unit scale:
 `central_io::scheduler::tests::concurrent_streams_stage_and_close_without_losing_a_byte`
 (48 concurrent streams stage on the production reserve path and close while

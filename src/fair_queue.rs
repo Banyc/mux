@@ -5,8 +5,10 @@ use std::{
     ops::DerefMut,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Waker, ready},
 };
+
+use futures_util::task::AtomicWaker;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -282,6 +284,9 @@ impl<T> Receiver<T> {
         E: FnMut(QueueToken) -> bool,
     {
         let mut excluded = excluded;
+        // Arm the ready set before reading it: a mark added after this point
+        // either appears in the scan below or wakes this task to re-scan.
+        self.ready.lock().unwrap().register(cx.waker());
         while self.queues.len() != MAX_QUEUE_COUNT {
             match self.opener.poll_recv(cx) {
                 Poll::Ready(None) => break,
@@ -420,19 +425,39 @@ fn ready_incr<'a>(tree: &'a Mutex<ReadyCounts>, token: QueueToken) -> UndoGuard<
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ReadyCounts {
     ready_count: BTreeMap<QueueToken, usize>,
+    /// Waker for the consumer parked on this ready set.
+    ///
+    /// The ready mark is the signal that says a message is available, and it
+    /// must carry its own wake. The per-token channels cannot serve as that
+    /// wake: a bounded-channel receiver's waker is consumed by each delivery,
+    /// so between a delivery and the next poll of that same channel the
+    /// channel has no waker registered at all. A mark published inside that
+    /// window then has nothing to wake — the consumer keeps sleeping with a
+    /// deliverable message behind it. Publishing the wake with the mark makes
+    /// the signal and its wake one operation, so no mark can be added after
+    /// the consumer's last observation without waking it to observe it.
+    waker: AtomicWaker,
 }
 impl ReadyCounts {
     pub fn new() -> Self {
         Self {
             ready_count: BTreeMap::new(),
+            waker: AtomicWaker::new(),
         }
+    }
+    /// Arm the ready set's waker. Called by the consumer before it scans, so a
+    /// mark added by any concurrent send is observed by this scan or wakes the
+    /// next one.
+    pub fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
     }
     pub fn add(&mut self, token: QueueToken) {
         let count = self.ready_count.entry(token).or_insert(0);
         *count += 1;
+        self.waker.wake();
     }
     pub fn sub(&mut self, token: QueueToken) {
         let Some(count) = self.ready_count.get_mut(&token) else {
@@ -614,6 +639,77 @@ mod tests {
             MAX_QUEUE_COUNT,
             "the queue table grew past MAX_QUEUE_COUNT"
         );
+    }
+
+    /// A ready mark carries its own wake.
+    ///
+    /// The per-token bounded channels cannot serve as that wake: a channel
+    /// receiver's waker is consumed by each delivery, so between a delivery
+    /// and the next poll of that same channel the channel has no waker
+    /// registered at all, and a mark published in that window would have
+    /// nothing to wake — the consumer sleeps on with a deliverable message
+    /// behind it. The liveness soak parks exactly that way (a staged write the
+    /// egress queue never dispatches, with the session otherwise idle and a
+    /// later stream open draining everything), so the ready set publishes its
+    /// own wake with the mark.
+    ///
+    /// The state is constructed white-box — a consumer parked on the ready
+    /// set, and a token channel with no waker armed — because the interleaving
+    /// that reaches it is rare enough that only a construction can pin it;
+    /// removing the `wake()` from `ReadyCounts::add` makes this fail.
+    #[test]
+    fn a_ready_mark_wakes_a_parked_consumer_whose_channel_waker_is_gone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (_opener, mut receiver) = channel::<u32>();
+        let woken = std::sync::Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+
+        // The consumer parks with nothing ready: this is what arms the ready
+        // set's waker.
+        assert!(receiver.poll_recv(&mut cx).is_pending());
+
+        // A live token whose channel has never had a waker armed by the
+        // consumer — the state a delivery leaves behind, since a delivery
+        // consumes the channel's waker and only a later poll re-arms it.
+        let token = QueueToken(0);
+        let (tx, rx) = mpsc::channel::<u32>(DATA_QUEUE_SIZE);
+        receiver.queues.insert(token, rx);
+
+        // Publish a mark exactly as a sender does, and require the parked
+        // consumer to learn about it.
+        let state = SenderState::new(Arc::clone(&receiver.ready), token);
+        let mut sender = tokio_util::sync::PollSender::new(tx);
+        let mut noop = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            sender.poll_reserve(&mut noop),
+            Poll::Ready(Ok(()))
+        ));
+        state
+            .send_item(&mut sender, 42)
+            .expect("a reserved slot accepts the item");
+        assert_eq!(
+            woken.0.load(Ordering::SeqCst),
+            1,
+            "a ready mark published while the consumer was parked did not wake it: \
+             the mark has no wake of its own and the token's channel had none armed"
+        );
+
+        // The wake is not a substitute for the message: the mark is still
+        // there to be scanned.
+        match receiver.poll_recv(&mut cx) {
+            Poll::Ready(Some((served, ReceiverRecv::Value(42)))) => assert_eq!(served, token),
+            other => panic!("the marked token was not deliverable after the wake: {other:?}"),
+        }
     }
 
     /// A ready mark whose queue is momentarily empty (the window a sender
