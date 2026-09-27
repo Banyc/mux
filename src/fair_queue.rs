@@ -24,13 +24,29 @@ const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
 const DATA_QUEUE_SIZE: usize = 2;
 
+/// Why a registrar's [`QueueRegistrar::open`] produced no sender. Both
+/// outcomes are refusals the caller can act on; neither is a wait, which is
+/// what the queue table's full condition used to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// The receiver is gone, so no request can ever be announced.
+    Closed,
+    /// The per-token queue table holds `max_queues` live queues, so this
+    /// request was refused. A table this size with more streams admitted is
+    /// not backpressure: the request would never be announced, so the caller
+    /// waits for a decision no task will ever make. See
+    /// [`Receiver::poll_recv_excluding`].
+    TableFull,
+}
+
 pub fn channel<T>() -> (QueueRegistrar<T>, Receiver<T>) {
     channel_with_capacity(MAX_QUEUE_COUNT)
 }
 
 /// Like [`channel`], but the per-token queue table admits `max_queues` entries
-/// before it stops announcing opens. See [`Receiver::poll_recv_excluding`] for
-/// what a caller that sizes this below its own stream admission bound risks.
+/// before it refuses further opens. See [`Receiver::poll_recv_excluding`] for
+/// what a caller that sizes this below its own stream admission bound must
+/// expect: a refusal, not an open that waits.
 pub fn channel_with_capacity<T>(max_queues: usize) -> (QueueRegistrar<T>, Receiver<T>) {
     assert!(
         max_queues > 0,
@@ -56,21 +72,22 @@ impl<T> QueueRegistrar<T> {
     fn new(opener: mpsc::Sender<OpenRequest<T>>) -> Self {
         Self { opener }
     }
-    pub async fn open(&self, opening_value: T) -> Option<Sender<T>> {
+    /// Ask the receiver for a per-token queue. The full condition is answered
+    /// with [`OpenError::TableFull`] by the receiver itself rather than by the
+    /// request going unannounced: a caller that cannot tell a full table from
+    /// a slow one waits forever on a full one.
+    pub async fn open(&self, opening_value: T) -> Result<Sender<T>, OpenError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let req = OpenRequest {
             resp: resp_tx,
             opening_value,
         };
-        match self.opener.send(req).await {
-            Ok(_) => (),
-            Err(_) => return None,
-        };
-        let resp = match resp_rx.await {
-            Ok(resp) => resp,
-            Err(_) => return None,
-        };
-        Some(Sender::new(resp))
+        self.opener.send(req).await.map_err(|_| OpenError::Closed)?;
+        match resp_rx.await {
+            Ok(Some(resp)) => Ok(Sender::new(resp)),
+            Ok(None) => Err(OpenError::TableFull),
+            Err(_) => Err(OpenError::Closed),
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -212,10 +229,11 @@ pub struct Receiver<T> {
     ready: Arc<Mutex<ReadyCounts>>,
     queues: BTreeMap<QueueToken, mpsc::Receiver<T>>,
     recv_queue_start: QueueToken,
-    /// How many per-token queues this table admits before it stops announcing
+    /// How many per-token queues this table admits before it refuses further
     /// opens. Sourced from the caller's admission bound, not from
     /// `MAX_QUEUE_COUNT`: a table smaller than the stream table turns the
-    /// admission of one more stream into a wait with no end.
+    /// admission of one more stream into a wait with no end unless the
+    /// refusal is answered, which [`Self::poll_recv_excluding`] does.
     max_queues: usize,
 }
 /// Snapshot of the ready set and the per-token queues at one instant, taken
@@ -248,9 +266,9 @@ impl<T> Receiver<T> {
     }
     /// The live size of the per-token queue table. `O(1)`; read by the egress
     /// token census so a soak can assert every stream's token queue was
-    /// reaped. The table admits exactly `Self::max_queues` queues and stops
-    /// announcing opens once full, so an unreaped entry is a permanent loss of
-    /// stream admission, not a slow leak.
+    /// reaped. The table admits exactly `Self::max_queues` queues and refuses
+    /// further opens once full, so an unreaped entry costs stream admission
+    /// until it is reaped — a refusal the caller sees, not a slow leak.
     pub(crate) fn queue_table_len(&self) -> usize {
         self.queues.len()
     }
@@ -327,10 +345,21 @@ impl<T> Receiver<T> {
         // Arm the ready set before reading it: a mark added after this point
         // either appears in the scan below or wakes this task to re-scan.
         self.ready.lock().unwrap().register(cx.waker());
-        while self.queues.len() < self.max_queues {
+        // The opener channel is polled on every pass, whether or not the table
+        // has room. A full table stops *admitting*, not *answering*: an
+        // unanswered request is a caller parked on a decision no task will
+        // make, and the opener channel itself would fill behind it and turn
+        // every later open into the same wait one queue deeper. Refusing keeps
+        // the request queue draining, so the full condition reaches the caller
+        // as `OpenError::TableFull`.
+        loop {
             match self.opener.poll_recv(cx) {
                 Poll::Ready(None) => break,
                 Poll::Ready(Some(open_req)) => {
+                    if self.queues.len() >= self.max_queues {
+                        let _ = open_req.resp.send(None);
+                        continue;
+                    }
                     let (tx, mut rx) = mpsc::channel(DATA_QUEUE_SIZE);
                     assert!(rx.poll_recv(cx).is_pending(), "register waker");
                     let new_token = loop {
@@ -345,7 +374,7 @@ impl<T> Receiver<T> {
                         token: new_token,
                         ready: self.ready.clone(),
                     };
-                    if open_req.resp.send(resp).is_err() {
+                    if open_req.resp.send(Some(resp)).is_err() {
                         continue;
                     }
                     self.queues.insert(new_token, rx);
@@ -449,7 +478,11 @@ pub enum ReceiverRecv<T> {
 #[derive(Debug)]
 struct OpenRequest<T> {
     pub opening_value: T,
-    pub resp: oneshot::Sender<OpenResponse<T>>,
+    /// `Ok(None)` is the receiver refusing a request the queue table has no
+    /// room for. A *distinguishable* answer, not a dropped request: a dropped
+    /// response is indistinguishable from a dead receiver, which is the
+    /// ambiguity that made the full condition unobservable to the caller.
+    pub resp: oneshot::Sender<Option<OpenResponse<T>>>,
 }
 #[derive(Debug)]
 struct OpenResponse<T> {
@@ -566,7 +599,7 @@ pub struct QueueToken(pub usize);
 
 #[cfg(test)]
 mod tests {
-    use std::task::Waker;
+    use std::{task::Waker, time::Duration};
 
     use super::*;
 
@@ -659,9 +692,11 @@ mod tests {
         }
         assert_eq!(receiver.queues.len(), MAX_QUEUE_COUNT);
 
-        // The next request is pending, but the table is already full: it must
-        // stay unannounced and out of the table.
-        let (resp, _resp_rx) = oneshot::channel();
+        // The next request is refused, but refused *to the caller*: the poll
+        // answers it with `Ok(None)` instead of leaving it unannounced. An
+        // unannounced request is a caller parked on a decision no task will
+        // ever make, which is what this arm exists to make impossible.
+        let (resp, mut resp_rx) = oneshot::channel();
         opener
             .opener
             .try_send(OpenRequest {
@@ -679,6 +714,153 @@ mod tests {
             MAX_QUEUE_COUNT,
             "the queue table grew past MAX_QUEUE_COUNT"
         );
+        assert!(
+            matches!(resp_rx.try_recv(), Ok(None)),
+            "a request the full table cannot admit was not answered with a refusal: the \
+             caller waits on a request no announce will ever come for"
+        );
+    }
+
+    /// Drive one `open` against one receiver poll and report the open's
+    /// outcome. The receiver side is bounded, so the case whose request the
+    /// table cannot admit reports a refusal instead of hanging the join: the
+    /// receiver parks without announcing it.
+    async fn drive_open(
+        opener: &QueueRegistrar<u32>,
+        receiver: &mut Receiver<u32>,
+        value: u32,
+    ) -> Result<Sender<u32>, OpenError> {
+        let mut outcome = None;
+        tokio::join!(
+            async {
+                outcome = Some(opener.open(value).await);
+            },
+            async {
+                let _ = tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await;
+            },
+        );
+        outcome.expect("the open future never resolved")
+    }
+
+    /// A full queue table answers the next open with `OpenError::TableFull`.
+    ///
+    /// Before this, the receiver stopped pulling the opener channel once its
+    /// table was full, so the request went unannounced and the caller waited
+    /// for the life of the receiver. Measured on this arm: the open #CAP+1
+    /// blocked until the arm's bound. `TableFull` is a *different* outcome from
+    /// `Closed`, so a caller can refuse the stream it was opening instead of
+    /// treating a full table as a dead session.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_queue_table_refuses_the_next_open() {
+        const CAP: usize = 2;
+        let (opener, mut receiver) = channel_with_capacity::<u32>(CAP);
+        let mut held = Vec::new();
+        for value in 0..CAP as u32 {
+            held.push(
+                drive_open(&opener, &mut receiver, value)
+                    .await
+                    .expect("an open the table has room for must be admitted"),
+            );
+        }
+        assert_eq!(
+            receiver.queue_table_len(),
+            CAP,
+            "the token table is not actually full, so the refusal below is vacuous"
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            drive_open(&opener, &mut receiver, 99),
+        )
+        .await
+        .expect(
+            "the queue table's full condition was never answered: the open waited on a \
+             request the full table can never announce",
+        );
+        assert!(
+            matches!(outcome, Err(OpenError::TableFull)),
+            "a full table must refuse the open with OpenError::TableFull, got {:?}",
+            outcome.map(|_| "Sender")
+        );
+        assert_eq!(
+            receiver.queue_table_len(),
+            CAP,
+            "the refused request entered the table"
+        );
+
+        // The refusal is the table's count, not a broken receiver: the tokens
+        // admitted before it still carry data, and that data is delivered.
+        held[0].send(7).await.unwrap();
+        let (token, recv) = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("a token admitted before the refusal stopped working")
+            .unwrap();
+        assert_eq!(token, QueueToken(0));
+        assert!(matches!(recv, ReceiverRecv::Value(7)));
+    }
+
+    /// Every later open is refused against a full table, and the request queue
+    /// stays drained while that happens. This is the second bound under the
+    /// first: the opener channel is itself a bounded queue, and if a full table
+    /// stopped the receiver from pulling it, the refusals would merely move the
+    /// wait one queue deeper. The requester is spawned so its `send` really can
+    /// fill the opener channel if nothing drains it.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_queue_table_cannot_wedge_the_request_queue() {
+        const CAP: usize = 1;
+        const REQUESTS: usize = 4 * OPENER_QUEUE_SIZE;
+        let (opener, mut receiver) = channel_with_capacity::<u32>(CAP);
+        // Held for the whole arm: the table has room again the moment this
+        // token drops, so an arm that let it go would measure a table that is
+        // never full.
+        let _held = drive_open(&opener, &mut receiver, 0).await.unwrap();
+        assert_eq!(receiver.queue_table_len(), CAP);
+
+        let requester = opener.clone();
+        // A `JoinSet`, not a detached spawn: the crate forbids tasks no owner
+        // aborts, and this arm's whole point is that the requester completes.
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut refused = 0usize;
+            for value in 0..REQUESTS {
+                match requester.open(value as u32).await {
+                    Err(OpenError::TableFull) => refused += 1,
+                    Ok(_) => panic!("an open past the table's bound was admitted"),
+                    Err(OpenError::Closed) => {
+                        panic!("a held token's registrar reported the receiver closed")
+                    }
+                }
+            }
+            refused
+        });
+
+        // The consumer side of the arm: keep answering requests until a quiet
+        // gap far longer than the requester's whole run. A gap means the
+        // requester either finished or stopped being served; `task` decides
+        // which, and a wedged requester parks the join until the bound below.
+        let consumer = async {
+            while tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .is_ok()
+            {}
+        };
+        let refused = tokio::time::timeout(Duration::from_secs(600), async {
+            let (refused, ()) = tokio::join!(tasks.join_next(), consumer);
+            refused
+                .expect("the requester task vanished")
+                .expect("the requester task panicked")
+        })
+        .await
+        .expect(
+            "the request queue wedged: a full token table stopped the receiver from \
+             draining the opener channel, so opens queued behind an unannounced request",
+        );
+        assert_eq!(
+            refused, REQUESTS,
+            "{REQUESTS} opens were sent against a table holding {CAP}; only {refused} were \
+             answered with a refusal"
+        );
+        assert_eq!(receiver.queue_table_len(), CAP);
     }
 
     /// A ready mark carries its own wake.

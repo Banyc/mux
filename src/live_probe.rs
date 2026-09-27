@@ -79,6 +79,7 @@ static CONTROL_HANDLED_CLOSE_WRITE: AtomicU64 = AtomicU64::new(0);
 static PEER_WRITE_CLOSE_APPLIED: AtomicU64 = AtomicU64::new(0);
 static PEER_WRITE_CLOSE_IGNORED: AtomicU64 = AtomicU64::new(0);
 static DISPATCHED_TO_READER: AtomicU64 = AtomicU64::new(0);
+static ACCEPT_CHANNEL_FULL: AtomicU64 = AtomicU64::new(0);
 static READ_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
 static READER_FINISHED: AtomicU64 = AtomicU64::new(0);
 static STREAM_READ_PUSHED: AtomicU64 = AtomicU64::new(0);
@@ -196,6 +197,15 @@ pub(crate) fn note_peer_write_close(applied: bool) {
 /// A data frame reached the receiving stream's dispatcher.
 pub(crate) fn note_dispatched_to_reader() {
     DISPATCHED_TO_READER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The peer materialised a stream but the application's accept channel was
+/// full, so the stream could not be handed to it and its entry was retired.
+/// Counted here because this is the one refusal on the request path whose
+/// outcome is a *drop*: the peer's open already returned, so nothing else can
+/// tell the application that stream's data stopped arriving.
+pub(crate) fn note_accept_channel_full() {
+    ACCEPT_CHANNEL_FULL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The receiving stream's dispatcher refused a data frame (read queue full).
@@ -532,6 +542,10 @@ pub struct PipelineTotals {
     pub peer_write_close_applied: u64,
     pub peer_write_close_ignored: u64,
     pub dispatched_to_reader: u64,
+    /// Peer streams the application's accept channel refused: materialised,
+    /// then dropped because the application stopped accepting. A drop, not a
+    /// refusal returned to any caller.
+    pub accept_channel_full: u64,
     pub read_queue_full: u64,
     pub reader_finished: u64,
     /// Data messages entered a receiving stream's read queue.
@@ -566,6 +580,7 @@ impl PipelineTotals {
             peer_write_close_ignored: self.peer_write_close_ignored
                 - earlier.peer_write_close_ignored,
             dispatched_to_reader: self.dispatched_to_reader - earlier.dispatched_to_reader,
+            accept_channel_full: self.accept_channel_full - earlier.accept_channel_full,
             read_queue_full: self.read_queue_full - earlier.read_queue_full,
             reader_finished: self.reader_finished - earlier.reader_finished,
             stream_read_pushed: self.stream_read_pushed - earlier.stream_read_pushed,
@@ -599,7 +614,7 @@ impl std::fmt::Display for PipelineTotals {
             "ingress: read(data={} control={} close_write={}) \
              handled(data={} open={} close_read={} close_write={}) \
              peer_write_close(applied={} ignored={}) dispatched_to_reader={} \
-             read_queue_full={} reader_finished={} \
+             accept_channel_full={} read_queue_full={} reader_finished={} \
              stream_read(pushed={} absorbed={} popped={} undelivered={}) \
              stream_terminal(pushed={} popped={} undelivered={}) reader_eof_observed={}",
             self.read_data,
@@ -612,6 +627,7 @@ impl std::fmt::Display for PipelineTotals {
             self.peer_write_close_applied,
             self.peer_write_close_ignored,
             self.dispatched_to_reader,
+            self.accept_channel_full,
             self.read_queue_full,
             self.reader_finished,
             self.stream_read_pushed,
@@ -664,6 +680,24 @@ pub struct AdmissionCensus {
     pub awaiting_peer_read_close: u64,
 }
 
+/// Which admission authority refused a stream. Both are per-session bounded
+/// capacities on the same request path: the stream table holds one entry per
+/// open stream, and the egress fair queue holds one token queue per stream
+/// that still has a live writer. They are counted separately because they are
+/// different resources with different sizes — a refusal from the token table
+/// means live writers have outnumbered table entries, which happens when a
+/// stream's entry is retired by a read-queue severance while the application
+/// still holds its writer — and because the answer to each is different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The stream table holds `max_concurrent_streams` entries.
+    StreamTable,
+    /// The egress fair queue's token table holds a queue for every stream it
+    /// admits, so no token can be issued. Reported to the caller as
+    /// `TooManyOpenStreams`, never as a wait.
+    EgressTokenTable,
+}
+
 /// One session role's stream-table ledger.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdmissionLedger {
@@ -681,11 +715,20 @@ pub struct AdmissionLedger {
     /// table is steady state or monotonically growing.
     pub inserted: u64,
     pub retired: u64,
-    /// Admissions refused because the table was full, split by which id space
-    /// asked. A peer refusal is answered by dropping the peer's frame and
-    /// nothing else; a local refusal is returned to the local `open` caller.
+    /// Admissions refused because the stream table was full, split by which id
+    /// space asked. A peer refusal is answered by dropping the peer's frame
+    /// and nothing else; a local refusal is returned to the local `open`
+    /// caller.
     pub refused_peer: u64,
     pub refused_local: u64,
+    /// Admissions refused because the *egress token table* was full, split by
+    /// id space. Counted apart from the stream-table pair so a refusal from
+    /// the token bound is never read as stream-table pressure: the two
+    /// resources are sized from the same admission bound but are not the same
+    /// table, and only this pair can show the token table refusing while the
+    /// stream table still has room.
+    pub refused_peer_no_token: u64,
+    pub refused_local_no_token: u64,
     /// Census at the most recent refusal.
     pub census: AdmissionCensus,
 }
@@ -699,6 +742,8 @@ struct LedgerSlot {
     retired: AtomicU64,
     refused_peer: AtomicU64,
     refused_local: AtomicU64,
+    refused_peer_no_token: AtomicU64,
+    refused_local_no_token: AtomicU64,
     census_closed_but_retained: AtomicU64,
     census_awaiting_peer_read_close: AtomicU64,
 }
@@ -712,6 +757,8 @@ impl LedgerSlot {
             retired: AtomicU64::new(0),
             refused_peer: AtomicU64::new(0),
             refused_local: AtomicU64::new(0),
+            refused_peer_no_token: AtomicU64::new(0),
+            refused_local_no_token: AtomicU64::new(0),
             census_closed_but_retained: AtomicU64::new(0),
             census_awaiting_peer_read_close: AtomicU64::new(0),
         }
@@ -725,6 +772,8 @@ impl LedgerSlot {
             retired: self.retired.load(Ordering::Relaxed),
             refused_peer: self.refused_peer.load(Ordering::Relaxed),
             refused_local: self.refused_local.load(Ordering::Relaxed),
+            refused_peer_no_token: self.refused_peer_no_token.load(Ordering::Relaxed),
+            refused_local_no_token: self.refused_local_no_token.load(Ordering::Relaxed),
             census: AdmissionCensus {
                 closed_but_retained: self.census_closed_but_retained.load(Ordering::Relaxed),
                 awaiting_peer_read_close: self
@@ -761,7 +810,7 @@ impl std::fmt::Display for AdmissionLedger {
         write!(
             f,
             "table={} local_opened={} peer_materialised={} max_table={} \
-             inserted={} retired={} refused(peer={} local={}) \
+             inserted={} retired={} refused(table: peer={} local={}; token: peer={} local={}) \
              refusal_census(closed_but_retained={} awaiting_peer_read_close={})",
             self.stream_table_len,
             self.local_opened_streams,
@@ -771,6 +820,8 @@ impl std::fmt::Display for AdmissionLedger {
             self.retired,
             self.refused_peer,
             self.refused_local,
+            self.refused_peer_no_token,
+            self.refused_local_no_token,
             self.census.closed_but_retained,
             self.census.awaiting_peer_read_close,
         )
@@ -823,20 +874,27 @@ pub(crate) fn note_stream_retired(role: SessionRole, len: usize, local_opened: u
     slot.retired.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Admission refused a stream because the table was full, with the census of
-/// what was retained at that instant. Counted where the refusal is decided, so
-/// a refusal that is then swallowed still appears here.
+/// Admission refused a stream, with the resource that refused it and, for a
+/// stream-table refusal, the census of what the table retained at that
+/// instant. Counted where the refusal is decided, so a refusal that is then
+/// swallowed still appears here.
 pub(crate) fn note_admission_refused(
     role: SessionRole,
     peer_stream: bool,
+    reason: RefusalReason,
     census: AdmissionCensus,
 ) {
     let slot = role.slot();
-    if peer_stream {
-        slot.refused_peer.fetch_add(1, Ordering::Relaxed);
-    } else {
-        slot.refused_local.fetch_add(1, Ordering::Relaxed);
-    }
+    match (reason, peer_stream) {
+        (RefusalReason::StreamTable, true) => slot.refused_peer.fetch_add(1, Ordering::Relaxed),
+        (RefusalReason::StreamTable, false) => slot.refused_local.fetch_add(1, Ordering::Relaxed),
+        (RefusalReason::EgressTokenTable, true) => {
+            slot.refused_peer_no_token.fetch_add(1, Ordering::Relaxed)
+        }
+        (RefusalReason::EgressTokenTable, false) => {
+            slot.refused_local_no_token.fetch_add(1, Ordering::Relaxed)
+        }
+    };
     slot.census_closed_but_retained
         .store(census.closed_but_retained, Ordering::Relaxed);
     slot.census_awaiting_peer_read_close
@@ -885,6 +943,7 @@ pub fn totals() -> Totals {
             peer_write_close_applied: PEER_WRITE_CLOSE_APPLIED.load(Ordering::Relaxed),
             peer_write_close_ignored: PEER_WRITE_CLOSE_IGNORED.load(Ordering::Relaxed),
             dispatched_to_reader: DISPATCHED_TO_READER.load(Ordering::Relaxed),
+            accept_channel_full: ACCEPT_CHANNEL_FULL.load(Ordering::Relaxed),
             read_queue_full: READ_QUEUE_FULL.load(Ordering::Relaxed),
             reader_finished: READER_FINISHED.load(Ordering::Relaxed),
             stream_read_pushed: STREAM_READ_PUSHED.load(Ordering::Relaxed),

@@ -118,6 +118,7 @@ E`). The test is a lib unit test, so the opt-in manifest above is unaffected.
 
 ```gate-default-required
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
+request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 session_growth_soak::the_growth_assertion_rejects_a_grown_census
 session_growth_soak::the_release_assertion_rejects_a_retained_structure
 ```
@@ -607,6 +608,7 @@ session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_eg
 session_growth_soak::the_growth_assertion_rejects_a_grown_census
 session_growth_soak::the_release_assertion_rejects_a_retained_structure
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
+request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 ```
 
 ## Perf-tier reach into asserting helpers

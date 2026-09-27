@@ -241,6 +241,12 @@ async fn accept_peer_stream(
         }
     };
     if let Err(e) = stream_init_handle.stream_accept_tx.try_send(stream) {
+        // The application is not accepting, so the peer's stream cannot be
+        // handed to it. The entry is retired rather than retained, and the
+        // refusal is counted where it is decided: a capacity reached here
+        // drops a stream the peer believes it opened, and without the count
+        // the only symptom is a peer whose data stops arriving.
+        crate::live_probe::note_accept_channel_full();
         control.retire_stream(stream_id);
         return Err(HandleCentralReadError::DeadStreamInit(e));
     }
@@ -307,6 +313,10 @@ pub struct MuxControl {
     /// refuses every later stream does not become a log flood; the counter in
     /// the admission ledger keeps counting every refusal.
     admission_refusal_logged: bool,
+    /// The same, for a refusal decided by the egress token table rather than
+    /// by the stream table. Kept apart so the line names the resource that is
+    /// actually exhausted.
+    egress_token_refusal_logged: bool,
     /// Peer stream ids released while their peer write half was already closed,
     /// oldest first. Populated by [`MuxControl::retire_stream`], consulted by
     /// the peer-stream admission decision; see
@@ -328,6 +338,7 @@ impl MuxControl {
             frame_reassembly,
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
             admission_refusal_logged: false,
+            egress_token_refusal_logged: false,
             retired_finished_peer_streams: VecDeque::new(),
         }
     }
@@ -538,6 +549,27 @@ impl MuxControl {
              frames are dropped until table entries are released"
         );
     }
+    /// Surface a refusal whose reason is the *egress token table* rather than
+    /// the stream table. The two are different resources with different sizes,
+    /// so a session that refuses every open while its own table has room would
+    /// otherwise look like load with no line naming the bound that is actually
+    /// exhausted. One line per session, like [`Self::log_admission_refusal`];
+    /// the ledger's token-refusal pair keeps counting every refusal.
+    fn log_egress_token_refusal(&mut self, stream_id: StreamId) {
+        if self.egress_token_refusal_logged {
+            return;
+        }
+        self.egress_token_refusal_logged = true;
+        tracing::warn!(
+            stream_id,
+            stream_table_len = self.stream_table.len(),
+            max_concurrent_streams = self.max_concurrent_streams,
+            "mux egress token table full: live stream writers outnumber stream-table \
+             entries, so this stream cannot be given an egress token and is refused \
+             with TooManyOpenStreams rather than waiting for a token that will never \
+             be announced"
+        );
+    }
     /// Release an entry whose every side has closed. [`Self::local_close`] and
     /// [`Self::peer_close`] run this check as part of applying their own
     /// transition; the reassembly paths below set `is_peer_write_closed`
@@ -594,10 +626,12 @@ impl MuxControl {
         peer_read_closed: PeerReadClosedFlag,
         stream_id: Option<StreamId>,
     ) -> Result<(StreamId, StreamWriteDataTx), ControlOpenError> {
+        let peer_stream = stream_id.is_some();
         if self.stream_table.len() >= self.max_concurrent_streams {
             crate::live_probe::note_admission_refused(
                 self.session_role(),
-                stream_id.is_some(),
+                peer_stream,
+                crate::live_probe::RefusalReason::StreamTable,
                 self.admission_census(),
             );
             return Err(ControlOpenError::TooManyOpenStreams(TooManyOpenStreams {}));
@@ -608,6 +642,29 @@ impl MuxControl {
             None => self
                 .next_stream_id()
                 .map_err(ControlOpenError::TooManyOpenStreams)?,
+        };
+        // The egress token is acquired *before* the table entry is inserted,
+        // because the token table is the request path's other admission
+        // authority and its full condition is answered
+        // (`WriteOpenError::EgressTokenTableFull`). Inserting first would leave
+        // the refused stream's entry in the table, so a full token table would
+        // consume one admission slot per attempt. Both refusals reach this
+        // caller as `TooManyOpenStreams`.
+        let write_data_tx = match self.write_data_tx.for_stream(stream_id, wire_open).await {
+            Ok(tx) => tx,
+            Err(crate::central_io::scheduler::WriteOpenError::EgressTokenTableFull) => {
+                crate::live_probe::note_admission_refused(
+                    self.session_role(),
+                    peer_stream,
+                    crate::live_probe::RefusalReason::EgressTokenTable,
+                    self.admission_census(),
+                );
+                self.log_egress_token_refusal(stream_id);
+                return Err(ControlOpenError::TooManyOpenStreams(TooManyOpenStreams {}));
+            }
+            Err(crate::central_io::scheduler::WriteOpenError::DeadCentralIo(e)) => {
+                return Err(ControlOpenError::DeadCentralIo(e));
+            }
         };
         if self.classify_stream_id(stream_id) == ClassifiedStreamId::Local {
             self.local_opened_streams += 1;
@@ -620,13 +677,7 @@ impl MuxControl {
             self.local_opened_streams,
         );
         self.publish_structure_census();
-        Ok((
-            stream_id,
-            self.write_data_tx
-                .for_stream(stream_id, wire_open)
-                .await
-                .map_err(ControlOpenError::DeadCentralIo)?,
-        ))
+        Ok((stream_id, write_data_tx))
     }
 
     async fn ingest_reassembly(
@@ -647,7 +698,14 @@ impl MuxControl {
         let to_release = reassembly.drain_contiguous();
         let dispatcher = &stream.read_dispatcher;
         for chunk in to_release {
-            dispatcher.send_data(chunk).map_err(|_| ())?;
+            if dispatcher.send_data(chunk).is_err() {
+                // The receiving stream's read queue refused, which is the same
+                // capacity `dispatch_data` reports in mode-off. Counted here
+                // too, so `read_queue_full` names one resource reached by both
+                // wire modes rather than the mode-off path alone.
+                crate::live_probe::note_read_queue_full();
+                return Err(());
+            }
         }
         if reassembly.is_complete() && !stream.is_peer_write_closed {
             // The peer's last data frame can be the one that completes the
@@ -686,7 +744,10 @@ impl MuxControl {
                     let to_release = reassembly.drain_contiguous();
                     let dispatcher = &stream.read_dispatcher;
                     for chunk in to_release {
-                        dispatcher.send_data(chunk).map_err(|_| ())?;
+                        if dispatcher.send_data(chunk).is_err() {
+                            crate::live_probe::note_read_queue_full();
+                            return Err(());
+                        }
                     }
                     if reassembly.is_complete() {
                         stream.is_peer_write_closed = true;
@@ -2507,5 +2568,155 @@ mod reassembly_tests {
                 );
             })
             .await;
+    }
+}
+
+/// Request-path capacity arms that need the crate's private admission
+/// machinery (`MuxControl` and the egress channel factory), so they live here
+/// rather than in `tests/`. Each asserts a *local* reading only — the
+/// `MuxControl` it built and the outcome it observed — because the
+/// `live_probe` gauges are process-global and lib tests run in parallel
+/// threads.
+#[cfg(test)]
+mod request_path_capacity_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{central_io::scheduler::write_data_channel, stream::reader::stream_read_channel};
+
+    /// The stream table's bound raised past the egress token table's, so the
+    /// token table is the binding capacity. Without this the stream table
+    /// would refuse first and the arm would never reach the token table.
+    const ADMISSION_ABOVE_THE_TOKEN_BOUND: usize = 2 * MAX_CONCURRENT_STREAMS;
+
+    /// A bound on the *simulated* clock; a wedged open is the failure.
+    const BOUND: Duration = Duration::from_secs(600);
+
+    /// The composed arm for the token-table defect: the stream table admits
+    /// `ADMISSION_ABOVE_THE_TOKEN_BOUND` and the egress token table holds
+    /// `MAX_CONCURRENT_STREAMS`, so opening one stream past the token bound
+    /// reaches `MuxControl::open`'s second admission authority with the first
+    /// still admitting.
+    ///
+    /// Before the fix this open inserted its table entry and then waited on a
+    /// token the full table would never announce, for the life of the session
+    /// (the 600 s bound). After it, the token table's full condition is
+    /// answered by `for_stream` as `OpenError::TableFull`, which this maps to
+    /// the same `TooManyOpenStreams` the stream table's own bound produces, and
+    /// no entry is left behind.
+    #[tokio::test(start_paused = true)]
+    async fn an_egress_token_table_full_refuses_the_open_instead_of_waiting() {
+        let started = std::time::Instant::now();
+        let (write_data_tx, mut write_data_rx) = write_data_channel();
+        // The sole consumer of the egress fair queue: it announces every token
+        // the opens below ask for, so a request that is not announced is the
+        // defect and not an unpolled receiver.
+        let announced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let announced_in_task = std::sync::Arc::clone(&announced);
+        // A `JoinSet`, not a detached spawn: the crate forbids tasks no owner
+        // aborts, so this arm owns the consumer and reaps it before it returns.
+        let mut consumers = tokio::task::JoinSet::new();
+        consumers.spawn(async move {
+            while write_data_rx.recv().await.is_ok() {
+                announced_in_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        let mut control = MuxControl::new(Initiation::Server, write_data_tx, false);
+        control.set_max_concurrent_streams_for_test(ADMISSION_ABOVE_THE_TOKEN_BOUND);
+
+        let mut index = 0usize;
+        let held = tokio::time::timeout(BOUND, async {
+            let mut held = Vec::new();
+            while index < MAX_CONCURRENT_STREAMS {
+                let (dispatcher, _rx) = stream_read_channel();
+                let (_, tx) = control
+                    .open(dispatcher, PeerReadClosedFlag::new(), None)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("open #{index} was refused below the token bound: {e:?}")
+                    });
+                held.push(tx);
+                index += 1;
+            }
+            held
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "open #{index} did not complete: the token table holds \
+                 {MAX_CONCURRENT_STREAMS} queues and every one of them was announced, so the \
+                 open after them waited on a request no announce would come for"
+            )
+        });
+        assert_eq!(
+            held.len(),
+            MAX_CONCURRENT_STREAMS,
+            "the arm did not hold one live writer per token the table admits, so the refusal \
+             below would be vacuous"
+        );
+        assert_eq!(
+            control.stream_table.len(),
+            MAX_CONCURRENT_STREAMS,
+            "the stream table does not hold one entry per live token"
+        );
+
+        // The stream table's own bound is twice the token bound, so this
+        // refusal can only come from the egress token table.
+        let (dispatcher, _rx) = stream_read_channel();
+        let outcome = tokio::time::timeout(
+            BOUND,
+            control.open(dispatcher, PeerReadClosedFlag::new(), None),
+        )
+        .await
+        .expect(
+            "the open past the token bound did not complete: a full egress token table must \
+             answer its caller, not wait for a token it will never announce",
+        );
+        assert!(
+            matches!(outcome, Err(ControlOpenError::TooManyOpenStreams(_))),
+            "a full egress token table must refuse with TooManyOpenStreams, got {:?}",
+            outcome.map(|(id, _)| id)
+        );
+        assert_eq!(
+            control.stream_table.len(),
+            MAX_CONCURRENT_STREAMS,
+            "the refused open left a stream-table entry behind, so a full token table would \
+             still consume admission capacity on every attempt"
+        );
+
+        // The refusal is attributed to the token table, not to the stream
+        // table: the ledger's token-refusal counter is written only on this
+        // path, so its growth is this arm's own reading.
+        let refused = crate::live_probe::admission_ledgers()
+            .server
+            .refused_local_no_token;
+        assert!(
+            refused >= 1,
+            "the refusal was not counted against the egress token table, so a session \
+             refusing every open at this bound would leave no trace of why"
+        );
+        println!(
+            "egress-token-bound-fill: held={} stream_table={} announced_by_consumer={} \
+             wall={:?}",
+            held.len(),
+            control.stream_table.len(),
+            announced.load(std::sync::atomic::Ordering::Relaxed),
+            started.elapsed(),
+        );
+
+        // Release everything. The consumer's announcement count is the sanity
+        // reading for the fill: every token this arm holds was announced by the
+        // egress consumer, which is what makes `open` #`MAX_CONCURRENT_STREAMS`
+        // the token table's refusal rather than an unpolled receiver's.
+        assert!(
+            announced.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the egress consumer never took a token from the fair queue, so this arm read a \
+             session with no egress at all"
+        );
+        drop(held);
+        drop(control);
+        consumers.abort_all();
+        let _ = consumers.join_next().await;
     }
 }

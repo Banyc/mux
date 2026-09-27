@@ -402,21 +402,45 @@ fn round_robin_distance(start: fair_queue::QueueToken, token: fair_queue::QueueT
 pub struct WriteDataTxFactory {
     opener: fair_queue::QueueRegistrar<WriteDataMsg>,
 }
+/// Why [`WriteDataTxFactory::for_stream`] produced no sender. The egress token
+/// table's full condition is separated from a dead central IO because the two
+/// need different answers: a full table is an admission refusal the caller can
+/// return to the application, while a dead central IO tears the session down.
+#[derive(Debug, Clone)]
+pub(crate) enum WriteOpenError {
+    DeadCentralIo(DeadCentralIo),
+    /// The egress token table holds a queue for every stream it admits, so
+    /// this stream cannot be given one. Reachable when live tokens outnumber
+    /// stream-table entries — a stream whose entry was retired by a read-queue
+    /// severance still holds its token until the application drops the writer.
+    EgressTokenTableFull,
+}
 impl WriteDataTxFactory {
     pub async fn for_stream(
         &self,
         stream: StreamId,
         wire_open: bool,
-    ) -> Result<StreamWriteDataTx, DeadCentralIo> {
+    ) -> Result<StreamWriteDataTx, WriteOpenError> {
+        let tx = match self
+            .opener
+            .open(WriteDataMsg {
+                stream_id: stream,
+                data: StreamWriteData::Open { wire: wire_open },
+            })
+            .await
+        {
+            Ok(tx) => tx,
+            Err(fair_queue::OpenError::Closed) => {
+                return Err(WriteOpenError::DeadCentralIo(DeadCentralIo {
+                    side: Side::Write,
+                }));
+            }
+            Err(fair_queue::OpenError::TableFull) => {
+                return Err(WriteOpenError::EgressTokenTableFull);
+            }
+        };
         Ok(StreamWriteDataTx {
-            tx: self
-                .opener
-                .open(WriteDataMsg {
-                    stream_id: stream,
-                    data: StreamWriteData::Open { wire: wire_open },
-                })
-                .await
-                .ok_or(DeadCentralIo { side: Side::Write })?,
+            tx,
             stream_id: stream,
         })
     }
