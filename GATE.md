@@ -223,7 +223,7 @@ frame in each direction is never released.
 All four are `#[ignore]`d under `standard`; `MUX_FAMILY_CYCLES` and
 `MUX_FAMILY_SEED` widen the run. Detection limit, stated rather than implied:
 a zero-hit run of N cycles excludes a per-cycle defect rate above ~3/N at
-95 % — 0.05 % at this file's default 400 cycles per family, 0.0075 % at a
+95 % — 0.75 % at this file's default 400 cycles per family, 0.015 % at a
 20 000-cycle family run, and 0.002 % for `reassembly_gap_family`'s 148 000
 cycles at 14 000 and 60 000 (the 32 000 green cycles at its default 400 cycles
 are reported above) — and, as for the soak, the cycles share one build, one
