@@ -14,7 +14,7 @@ use crate::{
             CentralIoReader, RunCentralIoReaderError, central_io_read_channel,
             run_central_io_reader,
         },
-        scheduler::{write_control_channel, write_data_channel},
+        scheduler::{write_control_channel, write_data_channel_with_census_role},
     },
     control::{Initiation, MuxControl, RunControlArgs, RunControlError, run_control},
     protocol::Side,
@@ -250,7 +250,11 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (write_control_tx, write_control_rx) = write_control_channel();
-    let (write_data_tx, write_data_rx) = write_data_channel();
+    let census_role = match config.initiation {
+        Initiation::Server => crate::live_probe::SessionRole::Server,
+        Initiation::Client => crate::live_probe::SessionRole::Client,
+    };
+    let (write_data_tx, write_data_rx) = write_data_channel_with_census_role(Some(census_role));
     let (central_io_read_tx, central_io_read_rx) = central_io_read_channel();
 
     let initiation = config.initiation;

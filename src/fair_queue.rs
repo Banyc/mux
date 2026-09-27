@@ -221,6 +221,21 @@ impl<T> Receiver<T> {
             recv_queue_start: QueueToken(0),
         }
     }
+    /// The live size of the per-token queue table. `O(1)`; read by the egress
+    /// token census so a soak can assert every stream's token queue was
+    /// reaped. The table admits exactly `MAX_QUEUE_COUNT` queues and stops
+    /// announcing opens once full, so an unreaped entry is a permanent loss of
+    /// stream admission, not a slow leak.
+    pub(crate) fn queue_table_len(&self) -> usize {
+        self.queues.len()
+    }
+    /// The live size of the ready-mark map. `O(1)`; read by the egress token
+    /// census. Stale marks (a count that has already been delivered) linger
+    /// until the next poll that retires them, so a quiesced zero here is the
+    /// strong form of "every mark was consumed by a delivery".
+    pub(crate) fn ready_table_len(&self) -> usize {
+        self.ready.lock().unwrap().ready_count.len()
+    }
     pub async fn recv(&mut self) -> Option<(QueueToken, ReceiverRecv<T>)> {
         struct FairReceiverRecv<'a, T>(&'a mut Receiver<T>);
         impl<T> Future for FairReceiverRecv<'_, T> {

@@ -479,12 +479,44 @@ impl MuxControl {
             self.stream_table.len(),
             self.local_opened_streams,
         );
+        self.publish_structure_census();
     }
     /// Whether `stream_id` names a peer stream that was already released as
     /// finished, so a frame for it is a duplicate rather than a stream to
     /// materialise. See [`RETIRED_FINISHED_PEER_STREAM_WINDOW`].
     fn is_retired_finished_peer_stream(&self, stream_id: StreamId) -> bool {
         self.retired_finished_peer_streams.contains(&stream_id)
+    }
+    /// Publish the live count of every per-stream structure this session
+    /// holds. A leak in any of them is invisible to the through-flow counters
+    /// — the table is the admission resource, but each entry can also hold a
+    /// reorder buffer with its own pending map — so the census is the only
+    /// reading that can tell a released stream from a retained one. The walk
+    /// is paid only while a soak has the census enabled; see
+    /// [`crate::live_probe::enable_structure_census`].
+    fn publish_structure_census(&self) {
+        if !crate::live_probe::structure_census_enabled() {
+            return;
+        }
+        let mut census = crate::live_probe::StructureCensus {
+            stream_table_len: self.stream_table.len() as u64,
+            retired_window_len: self.retired_finished_peer_streams.len() as u64,
+            ..Default::default()
+        };
+        for stream in self.stream_table.values() {
+            if let Some(reassembly) = &stream.reassembly {
+                census.reassembly_buffers += 1;
+                census.reassembly_pending_frames += reassembly.pending_len() as u64;
+                census.reassembly_pending_bytes += reassembly.pending_bytes() as u64;
+            }
+            if stream.open_read_sink().is_some() {
+                census.open_read_sinks += 1;
+            }
+            if stream.is_closed() {
+                census.closed_but_retained += 1;
+            }
+        }
+        crate::live_probe::note_structure_census(self.session_role(), census);
     }
     /// Surface a refused peer admission. The refusal itself is counted where it
     /// is decided (`Self::open`); this is the one place it is not fatal and not
@@ -587,6 +619,7 @@ impl MuxControl {
             self.stream_table.len(),
             self.local_opened_streams,
         );
+        self.publish_structure_census();
         Ok((
             stream_id,
             self.write_data_tx

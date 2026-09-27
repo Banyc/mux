@@ -16,12 +16,12 @@ python3 ../netem_test/tools/check-gate.py \
   --crate . mux tests GATE.md
 ```
 
-The mux layer keeps no `#[ignore]`d scenario. Every `mux`-over-`rtp` scenario
+Every `mux`-over-`rtp` scenario
 is asserted by the cooperation crate (`rtp_mux`) that owns the dual-lane
 topology, so `rtp_mux/GATE.md` holds those tiers, manifests and gates. What
 mux retains is the transport-free kit (`mux::testkit`, behind `testing`), the
-mux-only test targets, and the lib unit tests that always run — in particular
-the memory floor below.
+mux-only test targets, the `standard`-tier long-lived-session soaks below, and
+the lib unit tests that always run — in particular the memory floor below.
 
 ## Performance
 
@@ -118,6 +118,8 @@ E`). The test is a lib unit test, so the opt-in manifest above is unaffected.
 
 ```gate-default-required
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
+session_growth_soak::the_growth_assertion_rejects_a_grown_census
+session_growth_soak::the_release_assertion_rejects_a_retained_structure
 ```
 
 ### Interactive-path liveness under sustained concurrency (standard tier)
@@ -426,6 +428,73 @@ The release side of the same resource — a stream whose last outstanding frame
 is the peer's `CloseWrite` — is described in the `reassembly_gap_family`
 section below.
 
+### Long-lived-session churn, retention and growth (standard tier)
+
+`tests/session_growth_soak.rs` asks the question the two worst defects in this
+workspace were found by answering — do the structures a session holds *per
+stream* grow, or wedge, over a long session with heavy churn and adversarial
+traffic? — on the `mux::live_probe` instrument. `frame_reassembly = true`
+throughout, i.e. the mode the frame-reassembly retention defect was specific
+to, over a plain in-memory duplex; the reorder buffer's *gap* dimension is not
+this arm's (it is `reassembly_gap_family`'s), but every frame is ingested
+into and drained out of a reorder buffer and the census must return to zero.
+
+`a_long_lived_session_releases_every_per_stream_structure` runs 667 rounds of
+a fixed eight-round phase schedule (one varying dimension per arm: a
+concurrent echo round, a peer that accepts and stops reading against a bounded
+read queue, streams dropped mid-transfer with the client's halves closed
+first, a burst of streams written and closed but never read with the closing
+order alternating by index, and a 1063 ms delivery stall), each round followed
+by a full recovery probe that must complete. It samples at two matched points
+(203 and 2 003 completed streams), asserts every per-stream structure reads
+zero at each and does not grow between them, and asserts each session's
+egress token table is empty at the end. `MUX_GROWTH_ROUNDS` and
+`MUX_GROWTH_CHECKPOINT` size it; `MUX_GROWTH_FAULT=leak_stream|no_stall` are
+red-proof modes.
+
+The census (`mux::live_probe::structure_censuses`) reports, per session role,
+the live count of the stream table, the reorder buffers, their pending frame
+and byte totals, the open read sinks, entries `is_stream_closed` already
+reports finished, and the retired-peer-id window; the egress side
+(`mux::live_probe::egress_token_censuses`) reports the fair queue's per-token
+queue table and ready map plus the scheduler's cached-head, token→stream and
+deficit maps. The census is a table walk, so it is off unless a soak enables
+it: with it off the cost is one relaxed load on the stream insert and retire
+paths and on the egress consumer's poll.
+
+Tier: **standard** (`#[ignore]`d, asserting). Measured cost on the release gate
+build: **3.39 s** for the default 667 rounds (1 752 streams opened, 2 003
+completed, 83 stalls, 4 580 s of simulated session time; wall cost measured at
+3.32 s and 3.47 s on two more runs). Detection limit: the per-checkpoint
+assertion is an exact zero, not a rate, so a single retained entry at either
+matched point fails the run; the matched-point comparison additionally catches
+any structure that is non-zero at both points with a larger value later.
+Because the schedule is fixed by the round index, the cycles are seeded
+replications of one schedule rather than independent draws.
+
+Coverage cells provided: per-stream structure release and non-growth over a
+long session (`stream_table`, reorder buffers and their pending maps, open read
+sinks, retired-id window); egress token-table reaping at session scale;
+recovery after a slow consumer, after streams dropped mid-transfer, after a
+closed-without-reading burst, and after a delivery stall; per-round progress
+rather than end-of-run totals;. Cells deliberately **not** covered: the real transport and
+its impairment models (mux is transport-free); frame *reordering* (a duplex
+delivers in order, so the reorder buffer holds for one poll only — the gap
+dimension belongs to `reassembly_gap_family`); and per-stream task counts
+(mux spawns no per-stream task: a session owns three tasks, the per-stream
+resource is the token queue, which the egress census does measure).
+
+Vacuity. Three probes, each pasted in the landing report: `retire_if_closed`
+reduced to a no-op (the retention defect reintroduced) fails the first
+checkpoint naming the structure and both counts (`client retains 5 reorder
+buffer(s) … stream_table=5 reassembly_buffers=5 … closed_but_retained=5`);
+`MUX_GROWTH_FAULT=leak_stream` fails naming 8 retained buffers;
+and `MUX_GROWTH_FAULT=no_stall` fails the stall-applied check (1 645 bytes
+delivered while stalled). Two default-tier tests
+kept in the suite pin the assertions themselves:
+`the_growth_assertion_rejects_a_grown_census` and
+`the_release_assertion_rejects_a_retained_structure`.
+
 ### Session survival under latency spikes (standard tier)
 
 The operator's client multiplexes everything over one long-lived mux session on
@@ -486,6 +555,7 @@ interactive_liveness_families::concurrent_sessions_family = standard
 interactive_liveness_families::control_race_family = standard
 interactive_liveness_families::reassembly_gap_family = standard
 spike_survival_soak::a_live_session_survives_the_fields_spike_schedule = standard
+session_growth_soak::a_long_lived_session_releases_every_per_stream_structure = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -498,6 +568,9 @@ interactive_liveness_families::concurrent_sessions_family
 interactive_liveness_families::control_race_family
 interactive_liveness_families::reassembly_gap_family
 spike_survival_soak::a_live_session_survives_the_fields_spike_schedule
+session_growth_soak::a_long_lived_session_releases_every_per_stream_structure
+session_growth_soak::the_growth_assertion_rejects_a_grown_census
+session_growth_soak::the_release_assertion_rejects_a_retained_structure
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 ```
 
@@ -511,7 +584,7 @@ perf tier reaches. mux has no `perf` scenario, so this block is empty.
 ```gate-perf-guard-helpers
 ```
 
-## The env-scaled opt-in surface: `MUX_FAMILY_*`, `MUX_SOAK_*` and `MUX_EGRESS_SOAK_ROUNDS`
+## The env-scaled opt-in surface: `MUX_FAMILY_*`, `MUX_SOAK_*`, `MUX_EGRESS_SOAK_ROUNDS`, `MUX_SPIKE_*` and `MUX_GROWTH_*`
 
 The five `standard`-tier liveness arms above are `#[ignore]`d, but their load
 shape is not fixed by the ignore set: `tests/interactive_liveness_families.rs`
@@ -596,6 +669,18 @@ that surface is therefore given a row of its own. All four variables above and
 this one are read through a direct `std::env::var` literal, which the checker's
 reader half now resolves.
 
+### The churn/retention soak: `MUX_GROWTH_*`
+
+`tests/session_growth_soak.rs` is the long-lived-session growth arm.
+`MUX_GROWTH_ROUNDS` (`:601`, default derived from the checkpoint: `MUX_GROWTH_CHECKPOINT * 10 / 3 + 8`,
+i.e. `667` at the default checkpoint) sizes the run; `MUX_GROWTH_CHECKPOINT` (`:626`, default `200`)
+places the first matched point, and the second is always ten times it. The round is the trial unit,
+so the rule-of-three bound is stated per round. `MUX_GROWTH_FAULT` (`:797`, default unset) selects the
+red-proof modes: `leak_stream` leaks one stream's peer-side halves per round, so the release and growth
+assertions must fail, and `no_stall` disables the stall phase's hold, so the stall-applied check must
+fail. Both are detectors, never part of a green run; a run with a fault set fails its own last assertion
+even if no property check happened to catch it, so it cannot be read as a pass.
+
 ### Cost
 
 The families row's load is the measured default shape, not a derived one: all
@@ -636,6 +721,7 @@ liveness-schedule-families = MUX_FAMILY_CYCLES,MUX_FAMILY_SEED,MUX_FAMILY_STRAND
 interactive-path-soak = MUX_SOAK_CYCLES,MUX_SOAK_SEED,MUX_SOAK_REPLAY_TO,MUX_SOAK_REPEAT | - | the sustained interactive-path liveness soak sized by MUX_SOAK_CYCLES and volume-seeded by MUX_SOAK_SEED, with MUX_SOAK_REPLAY_TO and MUX_SOAK_REPEAT selecting one cycle index and re-running it with the RNG restored for reproduction: many streams per cycle, interactive request/response interleaved with bulk transfers, writers parked on the fair-queue reserve path, a reader or writer dropped mid-flight and Fin racing pending data, asserting staged-equals-received byte conservation, per-job completion and the 2 s per-cycle bound | liveness@shape=interactive-bulk-concurrency+metric=per-job-completion, byte-conservation@shape=soak+metric=staged-vs-received, liveness-rate@metric=rule-of-three+unit=cycle, reproduction@mode=single-cycle-replay+determinism=rng-restored, stall-localisation@shape=replayed-cycle+probe=in-flight-jobs | MUX_SOAK_CYCLES=1500,total=MUX_SOAK_CYCLES,wall=4.04s,bound=2.0e-3/cycle
 egress-component-soak = MUX_EGRESS_SOAK_ROUNDS | - | the egress fair-queue/scheduler component soak in the lib target, sized by MUX_EGRESS_SOAK_ROUNDS: each round opens 48 concurrent streams that stage four 8 KiB chunks on the production reserve path and close while one consumer drains, asserting byte conservation, a Fin for every stream's close and a bounded round | liveness@shape=egress-reserve-drain+metric=per-stream-fin, byte-conservation@shape=egress-soak+metric=staged-vs-dispatched, liveness-rate@metric=rule-of-three+unit=round | MUX_EGRESS_SOAK_ROUNDS=64,total=48*MUX_EGRESS_SOAK_ROUNDS,wall=0.14s,bound=4.7e-2/round
 spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-session spike soak sized by MUX_SPIKE_ROUNDS, with MUX_SPIKE_FAULT=no_stall the red-proof mode that disables the gate's hold: one session held open across a fixed schedule of delivery stalls (190 ms / 1063 ms / 3205 ms / 19.9 s) with the receive-deadline ledger asserted, so a spike costs time and the session survives, and the default-tier detector arm proves the deadline still fires past its window | liveness@shape=long-lived-session+metric=per-job-completion, timer-ledger@metric=receive-deadline+state=armed-not-expired, stall-detection@fault=no-stall-gate, stall-detection@control=deadline-crossed-tears-down | MUX_SPIKE_ROUNDS=120,total=MUX_SPIKE_ROUNDS,wall=1.20s,bound=2.5e-2/cycle
+growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the long-lived-session churn/retention soak sized by MUX_GROWTH_ROUNDS with its matched points placed by MUX_GROWTH_CHECKPOINT, and MUX_GROWTH_FAULT the red-proof selector (leak_stream leaks a peer half per round, no_stall disables the stall phase's hold): a frame_reassembly-on session driven through a fixed eight-round phase schedule (concurrent echo, a peer that stops reading, streams dropped mid-transfer with the client's halves closed first, a closed-without-reading burst with alternating close order, and a 1063 ms delivery stall) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow and that the egress token table drains | growth@metric=per-stream-structure-live-count+points=matched, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=churn+metric=per-round-recovery-probe, liveness@shape=slow-consumer+metric=recovery, liveness@shape=dropped-mid-transfer+metric=recovery, liveness@shape=closed-without-reading+metric=recovery, liveness@shape=stall+metric=recovery, admission@metric=concurrent-streams-vs-egress-token-cap, staleness@fault=leak-stream-and-no-stall | MUX_GROWTH_CHECKPOINT=200,MUX_GROWTH_ROUNDS=667,total=MUX_GROWTH_ROUNDS,wall=3.39s,bound=4.5e-3/round
 ```
 
 ## Opt-in targets outside this manifest

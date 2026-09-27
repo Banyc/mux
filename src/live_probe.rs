@@ -968,3 +968,283 @@ pub fn timer_ledger() -> TimerLedger {
         last_deadline_ms: LAST_DEADLINE_MS.load(Ordering::Relaxed),
     }
 }
+
+// ─── per-session structure census ──────────────────────────────────────────
+//
+// A long-lived session accumulates state that no counter above can see. The
+// stream table is the admission resource, but it is not the only per-stream
+// map: each `StreamState` may hold a reorder buffer with its own pending-frame
+// map and byte count, the session keeps a bounded window of released peer ids,
+// and the egress path keeps a per-token queue plus the scheduler's token-keyed
+// maps. A structure that is inserted into and never released is invisible to
+// through-flow counters — the session keeps working until the structure hits
+// its cap and then stops for the rest of its life — so the leak probe has to
+// report *live counts*, not rates.
+//
+// The census is a full walk of the stream table, so it is off unless a soak
+// turns it on: the enable flag is read once per stream insert and retire, and
+// with it off the cost is one relaxed load on a path that already allocates a
+// stream.
+
+static STRUCTURE_CENSUS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the structure census on. Idempotent; the soak calls it once.
+pub fn enable_structure_census() {
+    STRUCTURE_CENSUS_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Whether the structure census is on. Read on the stream insert and retire
+/// paths, so it must stay a single relaxed load.
+pub fn structure_census_enabled() -> bool {
+    STRUCTURE_CENSUS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The live count of every per-stream structure one session holds, sampled by
+/// walking the stream table. A soak compares two matched points in its own
+/// run: a structure whose count grows with completed streams is a leak, and a
+/// structure that is non-zero once every stream has closed is a retention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StructureCensus {
+    /// Entries in `MuxControl::stream_table`.
+    pub stream_table_len: u64,
+    /// Entries holding a `ReorderBuffer` (one per entry while
+    /// `frame_reassembly` is on).
+    pub reassembly_buffers: u64,
+    /// Frames buffered across every live `ReorderBuffer::pending` map.
+    pub reassembly_pending_frames: u64,
+    /// Bytes buffered across every live `ReorderBuffer`.
+    pub reassembly_pending_bytes: u64,
+    /// Entries whose read sink is still open, i.e. the peer's write half has
+    /// not been closed yet.
+    pub open_read_sinks: u64,
+    /// Entries `StreamState::is_closed` already reports finished. No later
+    /// transition can release one of these, so a non-zero value is the
+    /// retention signature, not load.
+    pub closed_but_retained: u64,
+    /// Length of `MuxControl::retired_finished_peer_streams`, bounded by
+    /// `RETIRED_FINISHED_PEER_STREAM_WINDOW`.
+    pub retired_window_len: u64,
+}
+
+impl StructureCensus {
+    /// The fields that must return to zero once every stream has closed. The
+    /// retired-id window is excluded: it is a bounded cache, not a live count.
+    pub fn live_stream_structures(&self) -> u64 {
+        self.stream_table_len
+            + self.reassembly_buffers
+            + self.reassembly_pending_frames
+            + self.reassembly_pending_bytes
+            + self.open_read_sinks
+            + self.closed_but_retained
+    }
+}
+
+impl std::fmt::Display for StructureCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stream_table={} reassembly_buffers={} reassembly_pending(frames={} bytes={}) \
+             open_read_sinks={} closed_but_retained={} retired_window={}",
+            self.stream_table_len,
+            self.reassembly_buffers,
+            self.reassembly_pending_frames,
+            self.reassembly_pending_bytes,
+            self.open_read_sinks,
+            self.closed_but_retained,
+            self.retired_window_len,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CensusSlot {
+    census: Mutex<StructureCensus>,
+}
+impl CensusSlot {
+    const fn new() -> Self {
+        Self {
+            census: Mutex::new(StructureCensus {
+                stream_table_len: 0,
+                reassembly_buffers: 0,
+                reassembly_pending_frames: 0,
+                reassembly_pending_bytes: 0,
+                open_read_sinks: 0,
+                closed_but_retained: 0,
+                retired_window_len: 0,
+            }),
+        }
+    }
+    fn get(&self) -> StructureCensus {
+        *self.census.lock().unwrap()
+    }
+    fn set(&self, census: StructureCensus) {
+        *self.census.lock().unwrap() = census;
+    }
+}
+
+static CLIENT_CENSUS: CensusSlot = CensusSlot::new();
+static SERVER_CENSUS: CensusSlot = CensusSlot::new();
+
+/// Publish one session role's live structure census. Called from the stream
+/// insert and retire paths while the census is enabled.
+pub(crate) fn note_structure_census(role: SessionRole, census: StructureCensus) {
+    match role {
+        SessionRole::Client => CLIENT_CENSUS.set(census),
+        SessionRole::Server => SERVER_CENSUS.set(census),
+    }
+}
+
+/// Both session roles' most recent structure census.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StructureCensuses {
+    pub client: StructureCensus,
+    pub server: StructureCensus,
+}
+
+impl StructureCensuses {
+    /// Sum of every live per-stream structure across both sessions. A closed
+    /// session is expected to read 0 here; growth between two matched points
+    /// in a soak is growth in whichever role grew.
+    pub fn total_live_stream_structures(&self) -> u64 {
+        self.client.live_stream_structures() + self.server.live_stream_structures()
+    }
+}
+
+impl std::fmt::Display for StructureCensuses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "structures: client[{}] server[{}]",
+            self.client, self.server
+        )
+    }
+}
+
+pub fn structure_censuses() -> StructureCensuses {
+    StructureCensuses {
+        client: CLIENT_CENSUS.get(),
+        server: SERVER_CENSUS.get(),
+    }
+}
+
+// ─── egress token-table census ─────────────────────────────────────────────
+//
+// The egress path keeps one fair-queue token queue per stream, plus the
+// scheduler's token-keyed maps (cached heads and the token→stream/owner
+// tables). The fair queue admits exactly `MAX_QUEUE_COUNT` distinct queues and
+// stops announcing opens once it holds that many, so a token queue that is
+// never reaped is not a slow leak: it is a permanent loss of stream admission
+// for the life of the session. These gauges are published on the egress
+// consumer's own poll (an `O(1)` length read on each map, gated by the same
+// enable flag), per session role, so the soak can assert the tables are empty
+// at a quiesced checkpoint.
+
+/// The live count of the egress path's token-keyed structures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EgressTokenCensus {
+    /// `fair_queue::Receiver::queues` — one entry per live stream token.
+    pub token_queues: u64,
+    /// `fair_queue::ReadyCounts::ready_count` entries, live and stale.
+    pub ready_tokens: u64,
+    /// `WriteDataRx::heads` — cached head messages.
+    pub cached_heads: u64,
+    /// `WriteDataRx::token_to_stream` entries.
+    pub token_streams: u64,
+    /// `WriteDataRx::deficit` entries.
+    pub token_deficits: u64,
+}
+
+impl EgressTokenCensus {
+    /// Every field must read zero once every stream has closed: a non-zero
+    /// value is a per-stream egress structure that outlived its stream.
+    pub fn total(&self) -> u64 {
+        self.token_queues
+            + self.ready_tokens
+            + self.cached_heads
+            + self.token_streams
+            + self.token_deficits
+    }
+}
+
+impl std::fmt::Display for EgressTokenCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "egress_tokens: queues={} ready={} cached_heads={} token_streams={} deficits={}",
+            self.token_queues,
+            self.ready_tokens,
+            self.cached_heads,
+            self.token_streams,
+            self.token_deficits,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct EgressSlot {
+    census: Mutex<EgressTokenCensus>,
+}
+impl EgressSlot {
+    const fn new() -> Self {
+        Self {
+            census: Mutex::new(EgressTokenCensus {
+                token_queues: 0,
+                ready_tokens: 0,
+                cached_heads: 0,
+                token_streams: 0,
+                token_deficits: 0,
+            }),
+        }
+    }
+    fn get(&self) -> EgressTokenCensus {
+        *self.census.lock().unwrap()
+    }
+}
+
+static CLIENT_EGRESS: EgressSlot = EgressSlot::new();
+static SERVER_EGRESS: EgressSlot = EgressSlot::new();
+
+/// Publish one session role's egress token-table census. Called from the
+/// egress consumer's poll while the census is enabled.
+pub(crate) fn note_egress_token_census(role: SessionRole, census: EgressTokenCensus) {
+    let slot = match role {
+        SessionRole::Client => &CLIENT_EGRESS,
+        SessionRole::Server => &SERVER_EGRESS,
+    };
+    *slot.census.lock().unwrap() = census;
+}
+
+/// Both session roles' most recent egress token-table census.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EgressTokenCensuses {
+    pub client: EgressTokenCensus,
+    pub server: EgressTokenCensus,
+}
+
+impl EgressTokenCensuses {
+    pub fn total(&self) -> u64 {
+        self.client.total() + self.server.total()
+    }
+}
+
+impl std::fmt::Display for EgressTokenCensuses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            [
+                format!("client[{}]", self.client),
+                format!("server[{}]", self.server),
+            ]
+            .join(" ")
+        )
+    }
+}
+
+pub fn egress_token_censuses() -> EgressTokenCensuses {
+    EgressTokenCensuses {
+        client: CLIENT_EGRESS.get(),
+        server: SERVER_EGRESS.get(),
+    }
+}

@@ -67,6 +67,17 @@ impl ReorderBuffer {
         }
     }
 
+    /// Frames held ahead of the cursor. `O(1)`; read by the structure census
+    /// so a soak can see a reorder buffer that is never drained.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Bytes held ahead of the cursor. `O(1)`; read by the structure census.
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
     /// Map a wire `Offset` to its absolute u64 position relative to the
     /// current `cursor`. Returns `None` when the distance is the exact
     /// 2³¹ ambiguity (both "2³¹ ahead" and "2³¹ behind" are equally

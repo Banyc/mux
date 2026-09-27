@@ -38,7 +38,19 @@ pub enum StreamWriteData {
     Fin,
     Data(DataBuf),
 }
+#[cfg(test)]
 pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
+    write_data_channel_with_census_role(None)
+}
+
+/// Like the test-only `write_data_channel`, but the consumer publishes its
+/// token-table census under `role` while the structure census is enabled. A
+/// production session passes its `Initiation`, so the soak can attribute an
+/// unreaped per-stream token queue to the session that leaked it; test-only
+/// channels pass `None` and publish nothing.
+pub fn write_data_channel_with_census_role(
+    role: Option<crate::live_probe::SessionRole>,
+) -> (WriteDataTxFactory, WriteDataRx) {
     let (tx, rx) = fair_queue::channel();
     let tx = WriteDataTxFactory { opener: tx };
     let rx = WriteDataRx {
@@ -51,6 +63,7 @@ pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
         rx_closed: false,
         split_pool: ArcObjPool::new(None, SPLIT_POOL_SHARDS, Vec::new, |v| v.clear()),
         latency: LatencyControl::new(),
+        census_role: role,
     };
     (tx, rx)
 }
@@ -84,6 +97,10 @@ pub struct WriteDataRx {
     split_pool: ArcObjPool<Vec<u8>>,
     /// Per-stream traffic-class observations, keyed by fair-queue token.
     latency: LatencyControl,
+    /// Which session role's egress token-table census this consumer publishes
+    /// under, or `None` for a test-only channel. See
+    /// [`crate::live_probe::EgressTokenCensus`].
+    census_role: Option<crate::live_probe::SessionRole>,
 }
 #[derive(Debug)]
 struct HeadEntry {
@@ -177,6 +194,7 @@ impl WriteDataRx {
             // writer parked on a lost ready mark from one parked with every
             // queue empty (i.e. blocked somewhere downstream).
             crate::live_probe::note_egress_park(self.rx.census());
+            self.publish_token_census();
             return Poll::Pending;
         }
         let (chosen, cap) = self.pick_head();
@@ -210,6 +228,7 @@ impl WriteDataRx {
                 let stream_id = entry.msg.stream_id;
                 entry.offset = split_at;
                 self.heads.insert(chosen, entry);
+                self.publish_token_census();
                 return Ok(WriteDataMsg {
                     stream_id,
                     data: StreamWriteData::Data(prefix),
@@ -227,7 +246,33 @@ impl WriteDataRx {
                 entry.msg.data = StreamWriteData::Data(tail);
             }
         }
+        self.publish_token_census();
         Ok(entry.msg).into()
+    }
+    /// Publish the live size of every token-keyed egress structure this
+    /// consumer holds: the fair queue's per-token queue table and ready map and
+    /// the scheduler's cached-head, token→stream and deficit maps. Each must
+    /// be empty once every stream has closed; a non-zero reading at a quiesced
+    /// checkpoint is a per-stream egress structure that outlived its stream.
+    /// The whole method is one relaxed load plus five `O(1)` lengths, and it is
+    /// skipped entirely unless a soak enabled the census.
+    fn publish_token_census(&self) {
+        let Some(role) = self.census_role else {
+            return;
+        };
+        if !crate::live_probe::structure_census_enabled() {
+            return;
+        }
+        crate::live_probe::note_egress_token_census(
+            role,
+            crate::live_probe::EgressTokenCensus {
+                token_queues: self.rx.queue_table_len() as u64,
+                ready_tokens: self.rx.ready_table_len() as u64,
+                cached_heads: self.heads.len() as u64,
+                token_streams: self.token_to_stream.len() as u64,
+                token_deficits: self.deficit.len() as u64,
+            },
+        );
     }
     /// Pick the next head to dispatch from `heads`, returning its token and
     /// the dispatch cap to apply.
