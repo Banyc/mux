@@ -90,11 +90,13 @@ measured) for the mux session table and its per-stream channels.
 
 `cargo test -p mux` runs the crate's lib unit tests (including the memory
 floor above) and the mux-only non-scenario targets `stream_writer` (a mux
-stream's write/close ordering and EOF semantics) and
+stream's write/close ordering and EOF semantics),
 `reassembly_stream_release` (a finished stream's table entry is released in
-both wire modes; see the `reassembly_gap_family` section below). There is no
-`#[ignore]`d scenario left in this crate, so the `gate-default-required` block
-names the non-scenario target that must keep running in the default tier.
+both wire modes; see the `reassembly_gap_family` section below) and
+`request_path_capacity` (the request-path capacity battery; see the section
+below). There is no `#[ignore]`d scenario left in this crate, so the
+`gate-default-required` block names the non-scenario targets that must keep
+running in the default tier.
 
 ### Stream-read ordering integrity under out-of-order frame delivery (structural, default tier)
 
@@ -431,30 +433,153 @@ section below.
 
 ### Egress token-table capacity vs stream admission (structural, default tier)
 
-The egress path admits one fair-queue token queue per open stream, and it
-stops announcing an open once its table is full. `MuxControl::open` mints the
-stream id and inserts the table entry *before* it asks for the egress token,
-so a token table smaller than the session's admission bound does not apply
-backpressure — the open waits on a request the table will never announce, for
-the life of the session. The token table is now sized from
-`control::MAX_CONCURRENT_STREAMS`, so the bound has one authority and the
-refusal past it comes from the stream table as a
-`TooManyOpenStreams` error rather than as a wait with no end
-(`central_io::scheduler::write_data_channel_with_census_role`, sized through
-`fair_queue::channel_with_capacity`).
+The egress path admits one fair-queue token queue per live stream writer, and
+`MuxControl::open` is the request path's one admission point. Two bounds meet
+there: the stream table (`max_concurrent_streams`, `MAX_CONCURRENT_STREAMS`)
+and the egress token table (`fair_queue::channel_with_capacity`, sized from the
+same constant). Two defects have been found in that meeting.
 
-Measured before the fix, with 1024 held writers on one session and a peer that
-authorised every stream: `open` #1024 returned and `open` #1025 blocked for
-the life of the session (10 s of simulated time, the probe's bound). Measured
-after: 8 300 concurrent opens reach the stream table's own bound, where #8 193
-returns `TooManyOpenStreams(TooManyOpenStreams)` instead of waiting. The
-regression arm is
+**The token table was smaller than the admission bound.** It held the fair
+queue's default 1 024 queues while the stream table admitted 8 192, and the
+receiver stopped pulling the opener channel once its table was full, so the
+open waited on a request the full table could never announce. Measured with
+1 024 held writers on one session and a peer that authorised every stream:
+`open` #1024 returned and `open` #1025 blocked for the life of the session.
+The table is now sized from `control::MAX_CONCURRENT_STREAMS`, so both bounds
+have one authority, and the regression arm is
 `session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap`
-(standard tier), which opens 1 025 streams each holding a live egress token,
-asserts all of them opened and that both sessions' token tables hold 1 025
-queues, then releases them and asserts the census drains to zero. The
-fair-queue level pin stays `fair_queue::tests::queue_table_admits_exactly_max_queue_count`,
-which now exercises the parameterized table.
+(standard tier).
+
+**The two bounds are not the same count, so sizing them equal is not
+sufficient.** The token table's occupancy is *live writers*, the stream table's
+is *live entries*, and a stream's entry can be released while the application
+still holds its writer: `MuxControl::dispatch_data` retires the entry when the
+receiving read queue refuses, and the writer's token lives in the
+application's `StreamWriter` until the application drops it. So the number of
+live tokens is not bounded by stream-table entries, and reaching the token
+bound must be an answer rather than a wait. `MuxControl::open` now acquires the
+token **before** inserting the entry, and a full token table is answered by
+`fair_queue::Receiver` as `OpenError::TableFull` (the receiver drains the
+opener channel whether or not its table has room, so the request queue cannot
+become the same wait one bound deeper). `open` maps that to the same
+`TooManyOpenStreams` the stream table's own bound produces, counts it in the
+admission ledger as a *token* refusal distinct from a *table* refusal, and
+leaves no entry behind. The fair-queue level pins are
+`fair_queue::tests::queue_table_admits_exactly_max_queue_count` (the parameterized
+boundary, and the refusal delivered to the caller),
+`fair_queue::tests::a_full_queue_table_refuses_the_next_open`,
+`fair_queue::tests::a_full_queue_table_cannot_wedge_the_request_queue`, and
+`control::request_path_capacity_tests::an_egress_token_table_full_refuses_the_open_instead_of_waiting`
+(the composed case: stream admission raised past the token bound so the token
+table is the binding one, 8 192 live writers, the next open refused and no
+entry left behind). Vacuity: restoring the receiver's "stop pulling once
+full" loop makes both fair-queue arms fail naming the wait —
+`the queue table's full condition was never answered: the open waited on a
+request the full table can never announce` — and the composed arm fails the
+same way at the 600 s simulated bound. Discharging the request instead of
+answering it (`continue` without the refusal) fails the refusal arm with
+`got Err(Closed)`: a wait and an indistinguishable close are both wrong, and
+only an answer is right.
+
+### Request-path bounded capacities (structural, default tier)
+
+The rule this crate's request path follows is: **every bounded resource on the
+request path answers a full condition with an outcome its caller can act on —
+an error, or a drop that is counted — and never with a wait nothing will end.**
+A wait is acceptable only when the consumer's own progress ends it, which is
+the distinction between backpressure and a hung session. The inventory below
+was taken by asking each bound: what fills it, what happens when it is full,
+who the caller is, and whether a request (an open, a write, a read, a close, a
+heartbeat, a stream error) can reach the full condition.
+
+| bound | file:line | when full | on the request path | measured |
+| --- | --- | --- | --- | --- |
+| `MAX_CONCURRENT_STREAMS` (stream table) | `src/control.rs:288` | error `TooManyOpenStreams`; a peer admission is dropped and counted (`refused_peer`) | yes — an open, from either id space | covered by `control::reassembly_tests::a_table_full_of_peer_streams_refuses_further_opens` and the growth soak's 8 300-open arm |
+| egress token table | `src/central_io/scheduler.rs:59` via `fair_queue::channel_with_capacity` | error `TooManyOpenStreams`, counted as a token refusal | yes — an open | `tests/request_path_capacity.rs` + the three fair-queue arms above |
+| `fair_queue::OPENER_QUEUE_SIZE` = 1 024 | `src/fair_queue.rs:24` | blocks; drained by the receiver on every pass, including when the token table is full | yes — indirect (one entry per in-flight open) | `a_full_queue_table_cannot_wedge_the_request_queue` (4 096 opens against a 1-queue table, all refused, none waiting) |
+| `fair_queue::DATA_QUEUE_SIZE` = 2 per token | `src/fair_queue.rs:25` | blocks the writer; ended by the egress consumer's dispatch | yes — a write | covered by `interactive_path_liveness_soak` (writers parked on the reserve path) |
+| `RETIRED_FINISHED_PEER_STREAM_WINDOW` = 1 024 | `src/control.rs:301` | evicts oldest — a duplicate-suppression cache, not an admission bound | yes — a peer frame | `control::reassembly_tests::the_released_finished_peer_stream_window_is_bounded` |
+| `central_io::reader::CHANNEL_SIZE` = 1 024 | `src/central_io/reader.rs:23` | blocks the reader task; ended by the control loop's drain | yes — every received frame | `session_growth_soak` (a session that wedges here stops recovering) |
+| `scheduler::CONTROL_CHANNEL_SIZE` = 1 024 | `src/central_io/scheduler.rs:23` | blocks the control loop; ended by the writer task's drain | yes — a close | `spike_survival_soak` (stalled transport, session survives and recovers) |
+| `stream::opener::CHANNEL_SIZE` = 1 024 | `src/stream/opener.rs:8` | blocks a local open; ended by the control loop's drain | yes — an open | `session_growth_soak`; not driven to 1 024 simultaneously against a wedged control loop (see the gap note below) |
+| `stream::accepter::CHANNEL_SIZE` = 1 024 | `src/stream/accepter.rs:5` | **drops** the peer's stream (entry retired, counted `accept_channel_full`); the peer's open has already returned, so no error can reach its opener | yes — a peer open while the application is not accepting | `request_path_capacity::arm_application_stops_accepting`: 1 025 opens, `accept_channel_full=1`, 1 024 materialised, session recovered |
+| `STREAM_READ_SOFT_DATA_LIMIT` 1 023 / `STREAM_READ_HARD_DATA_LIMIT` 8 191 / `CHANNEL_SIZE` 8 192 | `src/stream/reader.rs:21-23` | error to the receiving side, which retires the stream and sends `CloseRead`+`ForceCloseWrite`; the writer sees `BrokenPipe` | yes — a write | `request_path_capacity::arm_reader_stops_draining` in both wire modes: 8 192 bytes written, `read_queue_full` fired, `BrokenPipe` returned |
+| `stream::writer::DATA_STAGING_CAP` = 128 KiB | `src/stream/writer.rs:30` | caps one `poll_write`; the caller loops and is backpressured by the fair queue | yes — a write | `stream::writer::tests::poll_write_stages_at_most_staging_cap` |
+| `REASSEMBLY_MAX_BUFFERED_BYTES` / `RANGE_BYTES` = 16 MiB | `src/reassembly.rs:11,17` | error `BufferOverflow`/`RangeOverflow`, stream torn down with a `CloseRead` | yes — a peer data frame | `interactive_liveness_families::reassembly_gap_family` |
+| `scheduler::DATA_*_CAP` (1 200 / 2 048 / 32 KiB) | `src/central_io/scheduler.rs:26-28` | caps one dispatch; no full condition | yes — a write | `central_io::scheduler` unit tests (byte-fairness, split reassembly) |
+| `lane_message::DEFAULT_MAX_INFLIGHT_MESSAGES` = 64 | `src/lane_message.rs:32` | blocks the sender on a permit; ended by a concurrent send's release | yes — a message send | `lane_message::tests::atomic_admission_backpressure_limits_inflight`, `message_admission_reserve_waits_then_completes` |
+| `lane_message::DEFAULT_REORDER_CAP` = 256 | `src/lane_message.rs:40` | pauses acceptance of new substreams; a sequence is skipped only once no read task can deliver it | yes — an ordered-message receive | `lane_message::tests::ordered_force_advance_fires_at_exactly_the_reorder_cap` |
+| `lane_message::DEFAULT_MAX_MESSAGE_LEN` = 16 MiB | `src/lane_message.rs:29` | error `PayloadTooLarge` | yes — a message send | `lane_message` + `wire_contract` |
+| `migration_api::MAX_CONCURRENT_PEEKS` = 256 | `src/migration_api.rs:561`, gate at `:1047` | stops accepting new streams (`select!` guard) while peeks are outstanding; nothing blocks on it | yes — a resume-header peek | **no test of the cap itself**; the gate is in `ResponseRouter::add_accepter`'s accept loop, whose behaviour is "stop pulling" and so cannot wait |
+| `MAX_PENDING_GENERATIONS`, `MAX_ORPHANS_PER_STREAM`, `MAX_SPLICE_STREAMS`, `MAX_ORPHAN_STREAMS` = 256 | `src/migration_wire.rs:56,63,68,75` | typed errors (`TooManyPendingGenerations`, `TooManyOrphans`, `TooManySpliceStreams`); the id is remembered broken so a gen-0 that arrives late is refused rather than stranded | healing path, not the steady-state request path | `migration_wire` bound tests |
+| `SPLICE_QUEUE_CAPACITY` 256 / `SPLICE_CLEANUP_CAPACITY` 64 | `src/migration_wire.rs:83,86` | `try_send` full → reinsert and park on a notify; cleanup full → the drop notification is best-effort (`let _ =`) | healing path | `migration_wire` splice tests |
+| `MAX_UNCLAIMED_GEN0` = 64 | `src/splice_feed.rs:82` | evicts the oldest unclaimed reader | healing path | `splice_feed::tests::the_ready_queue_evicts_at_exactly_the_cap` |
+| `SPLICE_CONT_CAPACITY` 1 024 / `SPLICE_GEN0_CAPACITY` 64 / `SPLICE_REGISTER_CAPACITY` 64 | `src/splice_feed.rs:83-85` | blocks a send; drained by the router's own driver/matcher tasks | healing path | `splice_feed` router tests |
+| `traffic_class::HISTORY_MAX` 16 / `DEMOTE_STREAK` 4 | `src/traffic_class.rs:33-35` | fixed-size observation windows, evict oldest | yes — every dispatch | `central_io::scheduler` latency-class tests |
+| `padding::MAX_PAD` 1 500 / `encoder::REASSEMBLY_MAX_BODY` | `src/padding.rs:12`, `src/central_io/encoder.rs:22` | bounds a frame's padding/body; no full condition | yes — every frame | `wire_contract`, `padding` unit tests |
+| `central_io::reader::RECEIVE_DEADLINE_INTERVALS` = 4 | `src/central_io/reader.rs:25` | not a capacity: the session's only liveness timer, sliding on *byte progress*, so a slow-but-progressing peer is not severed | yes — every read | `spike_survival_soak` (the deadline ledger is armed, not expired, across the 190 ms/1 063 ms/3 205 ms/19.9 s schedule) |
+
+The two capacities this inventory **does not** drive to their bound, and why:
+
+- **The stream table at 8 192** is measured at the bound by
+  `session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap`
+  (standard tier, 8 300 opens) and at small scale by
+  `control::reassembly_tests::a_table_full_of_peer_streams_refuses_further_opens`; the
+  default-tier arms work the token table instead, because that is the bound the
+  sizing assumption can miss.
+- **`stream::opener::CHANNEL_SIZE` and `scheduler::CONTROL_CHANNEL_SIZE` at
+  1 024 each, with the control loop wedged**, would need 1 024 concurrent
+  requests whose consumer is blocked on a transport that is *held* rather than
+  slow, which the default tier cannot afford and which the spike soak already
+  covers as a *slow* transport. Their waits are ended by their consumers'
+  progress, which is the property the soak asserts.
+
+The battery itself is
+`request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting`
+(default tier; measured 0.24-1.6 s across runs, the spread being how many
+simulated grace periods the severance arms cross) plus the lib arm
+`control::request_path_capacity_tests::an_egress_token_table_full_refuses_the_open_instead_of_waiting`
+(measured 0.20-0.34 s, of which ~0.19-0.34 s is the 8 192-open fill). One
+function and not one test per arm because `mux::live_probe`'s censuses,
+ledgers and counters are process-global statics and the default tier runs a
+test binary's tests in parallel threads; separate arms would read each other's
+sessions. Each arm prints the count that proves its capacity was reached
+(`read_queue_full`, `accept_channel_full`, `announced_by_consumer=8192`,
+`stream_table=8192`) before it asserts the outcome, so an arm that never filled
+the resource cannot pass by vacancy.
+
+#### Deliberately blocking, and the bound that makes each safe
+
+Five bounds wait rather than answer. Each is recorded with the reason its wait
+is ended, because an unrecorded field-reachable wait is the defect this
+inventory exists to catch:
+
+- **The per-token fair-queue data queue** (`DATA_QUEUE_SIZE` = 2): the wait is
+  ended by the egress consumer dispatching the queued message, which it does
+  for every token in round-robin order (`pick_head` credits every ready head a
+  quantum per round). The consumer cannot be the blocked party — it is a
+  separate task from every writer — so the wait is bounded by dispatch, not by
+  a cycle.
+- **The central-io read channel** (1 024) and **the control channel** (1 024):
+  ended by the control loop's and the writer task's drains respectively, each of
+  which runs on every loop iteration and neither of which can be waiting on the
+  other's queue.
+- **`stream::opener`'s request channel** (1 024): ended by the control loop
+  draining it. It is the one wait that is *transitively* ended — if the control
+  loop is inside a frame handler, the drain resumes when that handler returns,
+  and the only handler that could not return was the token-table wait this
+  change removes.
+- **The opener channel inside the fair queue** (1 024): ended by the receiver's
+  opener drain, which now runs on **every** pass whether or not the token table
+  has room (this is what makes a full token table a refusal instead of moving
+  the wait one queue deeper).
+- **`lane_message`'s in-flight admission** (64) and **the splice feed's router
+  channels** (1 024 / 64 / 64): ended by a permit release in the first case and
+  by the router's own driver and matcher tasks in the second. Neither is on the
+  steady-state request path, and neither wait is entered while its consumer is
+  the waiting task itself.
+- **`MAX_CONCURRENT_PEEKS`** (256) does not wait at all: its accept loop stops
+  pulling from the accept channel, which buffers beneath it.
 
 ### Long-lived-session churn, retention and growth (standard tier)
 
