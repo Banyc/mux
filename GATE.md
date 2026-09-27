@@ -492,7 +492,11 @@ paths and on the egress consumer's poll.
 Tier: **standard** (`#[ignore]`d, asserting). Measured cost on the release gate
 build: **3.39 s** for the default 667 rounds (1 752 streams opened, 2 003
 completed, 83 stalls, 4 580 s of simulated session time; wall cost measured at
-3.32 s and 3.47 s on two more runs). Detection limit: the per-checkpoint
+3.32 s and 3.47 s on two more runs). On a loaded host the same arm measured
+4.40 s at load average 32.7 — with `spike_survival_soak`'s 1.21 s against its
+recorded 1.20 s in the same window as the control, so the difference is host
+load and not the arm — and 24.4 s once at load average 27.7 while a peer
+target was building. Detection limit: the per-checkpoint
 assertion is an exact zero, not a rate, so a single retained entry at either
 matched point fails the run; the matched-point comparison additionally catches
 any structure that is non-zero at both points with a larger value later.
