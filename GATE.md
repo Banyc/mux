@@ -426,6 +426,53 @@ The release side of the same resource — a stream whose last outstanding frame
 is the peer's `CloseWrite` — is described in the `reassembly_gap_family`
 section below.
 
+### Session survival under latency spikes (standard tier)
+
+The operator's client multiplexes everything over one long-lived mux session on
+a path whose measured floor is ~190 ms and whose measured worst spikes are
+1063 ms and 3205 ms; a spike must cost *time*, not the session, because a
+teardown during a finite stall pays a cold re-establishment worse than the
+spike. mux's only session liveness timer is the central reader's sliding
+receive deadline (`central_io::reader::RECEIVE_DEADLINE_INTERVALS` = 4 x the
+heartbeat, so 20 s at the production 5 s heartbeat).
+`tests/spike_survival_soak.rs` holds one session open across 120 rounds and
+stalls *delivery* in both directions — a gate that withholds reads and is
+released by the test, so the advance is the only clock movement — for a fixed
+schedule of 190 ms / 1063 ms / 3205 ms / 19.9 s, i.e. ~753 s of simulated
+session time. It asserts per-round payload integrity, that every round
+completes, that no session tore down, and that `receive_deadline_expiries` is
+zero, with three non-vacuity checks on its own instrument: the gate held at
+least one read and let no byte through while stalled (`held_polls`,
+`delivered_while_stalled`), a heartbeat due inside each long stall was
+withheld (`heartbeats_received` unchanged across the stall), and the deadline
+was actually armed (`receive_deadline_sleeps_armed`, `receive_deadline_arms`,
+`heartbeats_sent`/`received`). The same target's default-tier
+`a_stall_past_the_deadline_still_trips_the_detector` is the positive half:
+a stall past the deadline must expire and tear the session down, so the
+soak's zero-expiry result cannot mean "the deadline can never fire". The
+advance there is a full second past the deadline, not a millisecond:
+`tokio::time::advance` does not reliably cascade a coarse timer-wheel slot on
+a 1 ms step at 20 s (measured: 20.001 s -> `expiries=0`, 21 s -> `expiries=2`),
+so a millisecond-exact crossing would assert the harness's granularity; the
+exact boundary is pinned at a fine scale by the in-crate
+`the_steady_receive_deadline_is_four_heartbeat_intervals`.
+
+Tier: **standard** (`#[ignore]`d, asserting). Measured cost on the release
+gate build: **1.12-1.20 s** for the default 120 rounds. `MUX_SPIKE_ROUNDS`
+sizes the soak; `MUX_SPIKE_FAULT=no_stall` is the red-proof mode (it disables
+the gate's hold and must fail the "spike was applied" checks). The schedule
+is fixed, so the cycles are seeded replications of one schedule, not
+independent draws: a zero-hit run of N cycles excludes a per-cycle defect rate
+above ~3/N at 95 % (0.025 per cycle at 120).
+
+Coverage cells provided: long-lived-session liveness across transport silence
+at the field's own magnitudes; the receive-deadline arm/expiry ledger; and
+the detector's positive control. Cells deliberately **not** covered: the real
+transport and its impairment models (mux is transport-free; delay/loss belong
+to the harness scenarios in `rtp_mux/GATE.md`), and the birth window
+(`first_receive_deadline`), whose production value and red-proof arm live in
+`rtp_mux`.
+
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of
@@ -438,6 +485,7 @@ interactive_liveness_families::quiet_egress_tail_family = standard
 interactive_liveness_families::concurrent_sessions_family = standard
 interactive_liveness_families::control_race_family = standard
 interactive_liveness_families::reassembly_gap_family = standard
+spike_survival_soak::a_live_session_survives_the_fields_spike_schedule = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -449,6 +497,7 @@ interactive_liveness_families::quiet_egress_tail_family
 interactive_liveness_families::concurrent_sessions_family
 interactive_liveness_families::control_race_family
 interactive_liveness_families::reassembly_gap_family
+spike_survival_soak::a_live_session_survives_the_fields_spike_schedule
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 ```
 
@@ -586,6 +635,7 @@ and are not independent draws.
 liveness-schedule-families = MUX_FAMILY_CYCLES,MUX_FAMILY_SEED,MUX_FAMILY_STRAND | - | the per-family liveness of the interactive path under the four schedules the soak holds fixed: quiet message-boundary publishes, three concurrent sessions with one idle, control-frame races against in-flight data, and frame-reassembly under out-of-order delivery, each asserting per-stream payload integrity, per-job completion and a 2 s per-cycle bound, with MUX_FAMILY_STRAND=n the red-proof hold that must fail the reassembly family | liveness@shape=quiet-boundary+metric=per-job-completion, liveness@shape=multi-session-idle+metric=per-job-completion, liveness@shape=control-race+metric=per-job-completion, liveness@shape=reassembly-reorder+metric=per-job-completion, payload-integrity@shape=control-race-and-reassembly+order=per-stream, liveness-rate@metric=rule-of-three+unit=cycle, stall-detection@fault=strand-never-release | MUX_FAMILY_CYCLES=400,total=4*MUX_FAMILY_CYCLES,wall=2.33s,bound=7.5e-3/cycle
 interactive-path-soak = MUX_SOAK_CYCLES,MUX_SOAK_SEED,MUX_SOAK_REPLAY_TO,MUX_SOAK_REPEAT | - | the sustained interactive-path liveness soak sized by MUX_SOAK_CYCLES and volume-seeded by MUX_SOAK_SEED, with MUX_SOAK_REPLAY_TO and MUX_SOAK_REPEAT selecting one cycle index and re-running it with the RNG restored for reproduction: many streams per cycle, interactive request/response interleaved with bulk transfers, writers parked on the fair-queue reserve path, a reader or writer dropped mid-flight and Fin racing pending data, asserting staged-equals-received byte conservation, per-job completion and the 2 s per-cycle bound | liveness@shape=interactive-bulk-concurrency+metric=per-job-completion, byte-conservation@shape=soak+metric=staged-vs-received, liveness-rate@metric=rule-of-three+unit=cycle, reproduction@mode=single-cycle-replay+determinism=rng-restored, stall-localisation@shape=replayed-cycle+probe=in-flight-jobs | MUX_SOAK_CYCLES=1500,total=MUX_SOAK_CYCLES,wall=4.04s,bound=2.0e-3/cycle
 egress-component-soak = MUX_EGRESS_SOAK_ROUNDS | - | the egress fair-queue/scheduler component soak in the lib target, sized by MUX_EGRESS_SOAK_ROUNDS: each round opens 48 concurrent streams that stage four 8 KiB chunks on the production reserve path and close while one consumer drains, asserting byte conservation, a Fin for every stream's close and a bounded round | liveness@shape=egress-reserve-drain+metric=per-stream-fin, byte-conservation@shape=egress-soak+metric=staged-vs-dispatched, liveness-rate@metric=rule-of-three+unit=round | MUX_EGRESS_SOAK_ROUNDS=64,total=48*MUX_EGRESS_SOAK_ROUNDS,wall=0.14s,bound=4.7e-2/round
+spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-session spike soak sized by MUX_SPIKE_ROUNDS, with MUX_SPIKE_FAULT=no_stall the red-proof mode that disables the gate's hold: one session held open across a fixed schedule of delivery stalls (190 ms / 1063 ms / 3205 ms / 19.9 s) with the receive-deadline ledger asserted, so a spike costs time and the session survives, and the default-tier detector arm proves the deadline still fires past its window | liveness@shape=long-lived-session+metric=per-job-completion, timer-ledger@metric=receive-deadline+state=armed-not-expired, stall-detection@fault=no-stall-gate, stall-detection@control=deadline-crossed-tears-down | MUX_SPIKE_ROUNDS=120,total=MUX_SPIKE_ROUNDS,wall=1.20s,bound=2.5e-2/cycle
 ```
 
 ## Opt-in targets outside this manifest

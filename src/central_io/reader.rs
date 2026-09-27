@@ -56,6 +56,7 @@ impl<R> LivenessRead<R> {
         self.deadline = deadline;
         self.last_progress = tokio::time::Instant::now();
         self.sleep = None;
+        crate::live_probe::note_receive_deadline_armed();
     }
 }
 impl<R: std::fmt::Debug> std::fmt::Debug for LivenessRead<R> {
@@ -87,16 +88,21 @@ where
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 let (deadline, last_progress) = (self.deadline, self.last_progress);
+                let fire_at = last_progress + deadline;
                 let sleep = self.sleep.get_or_insert_with(|| {
-                    Box::pin(tokio::time::sleep_until(last_progress + deadline))
+                    crate::live_probe::note_receive_deadline_sleep_armed();
+                    crate::live_probe::note_receive_deadline_sleep_deadline(fire_at);
+                    Box::pin(tokio::time::sleep_until(fire_at))
                 });
                 if sleep.as_mut().poll(cx).is_ready() {
                     self.sleep = None;
+                    crate::live_probe::note_receive_deadline_expired();
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "receive deadline - session timed out",
                     )))
                 } else {
+                    crate::live_probe::note_receive_deadline_pending_poll();
                     Poll::Pending
                 }
             }
@@ -191,6 +197,7 @@ where
         })?;
         Ok(match hdr {
             Header::Heartbeat => {
+                crate::live_probe::note_heartbeat_received();
                 crate::padding::skip_tail(&mut self.io_reader).await?;
                 None
             }

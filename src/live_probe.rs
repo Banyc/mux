@@ -88,6 +88,72 @@ static STREAM_TERMINAL_PUSHED: AtomicU64 = AtomicU64::new(0);
 static STREAM_TERMINAL_POPPED: AtomicU64 = AtomicU64::new(0);
 static READER_EOF_OBSERVED: AtomicU64 = AtomicU64::new(0);
 
+// ─── liveness-timer ledger ─────────────────────────────────────────────────
+//
+// The session's only liveness timer is the sliding receive deadline in the
+// central reader. A soak that claims "the session survived a spike" must be
+// able to show *which* timers were armed and whether any of them expired, or
+// a green run is indistinguishable from a run that never armed one. These
+// counters are the ledger: heartbeats emitted and consumed (the traffic that
+// resets the deadline), and receive-deadline arms and expiries.
+
+static HEARTBEATS_SENT: AtomicU64 = AtomicU64::new(0);
+static HEARTBEATS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_DEADLINE_ARMS: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_DEADLINE_SLEEPS_ARMED: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_DEADLINE_PENDING_POLLS: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_DEADLINE_EXPIRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Origin for diagnostic timestamps, captured the first time a deadline is
+/// armed. A soak reads `now_ms()` and the ledger's `last_deadline_ms` to see
+/// exactly when the window it is about to cross was set.
+static DEADLINE_ORIGIN: LazyLock<tokio::time::Instant> = LazyLock::new(tokio::time::Instant::now);
+static LAST_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since [`DEADLINE_ORIGIN`] on the runtime clock.
+pub fn now_ms() -> u64 {
+    (tokio::time::Instant::now() - *DEADLINE_ORIGIN).as_millis() as u64
+}
+
+/// The central writer emitted a periodic or birth heartbeat frame.
+pub(crate) fn note_heartbeat_sent() {
+    HEARTBEATS_SENT.fetch_add(1, Ordering::Relaxed);
+}
+/// The central reader consumed a heartbeat frame (either a periodic keepalive
+/// or the birth liveness heartbeat).
+pub(crate) fn note_heartbeat_received() {
+    HEARTBEATS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+}
+/// A receive-deadline window was armed (or re-armed after a frame).
+pub(crate) fn note_receive_deadline_armed() {
+    RECEIVE_DEADLINE_ARMS.fetch_add(1, Ordering::Relaxed);
+}
+/// The deadline's sleep future was created and registered with the timer
+/// wheel: the window is not merely configured, it is on the clock. A soak
+/// waits for this before moving the clock, so it cannot "advance past" a
+/// deadline that was never armed.
+pub(crate) fn note_receive_deadline_sleep_armed() {
+    RECEIVE_DEADLINE_SLEEPS_ARMED.fetch_add(1, Ordering::Relaxed);
+}
+/// Record the absolute instant a deadline's sleep was armed for.
+pub(crate) fn note_receive_deadline_sleep_deadline(deadline: tokio::time::Instant) {
+    LAST_DEADLINE_MS.store(
+        (deadline - *DEADLINE_ORIGIN).as_millis() as u64,
+        Ordering::Relaxed,
+    );
+}
+/// The deadline's sleep was polled while the read stayed pending: the reader
+/// is parked on the deadline. A soak uses this to prove the reader had
+/// reached its timer before the clock moved.
+pub(crate) fn note_receive_deadline_pending_poll() {
+    RECEIVE_DEADLINE_PENDING_POLLS.fetch_add(1, Ordering::Relaxed);
+}
+/// A receive-deadline window expired with no byte arriving in it: the verdict
+/// the session treats as a dead peer.
+pub(crate) fn note_receive_deadline_expired() {
+    RECEIVE_DEADLINE_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The central reader decoded a frame of the named kind.
 pub(crate) fn note_frame_read(kind: EgressFrameKind) {
     match kind {
@@ -829,5 +895,76 @@ pub fn totals() -> Totals {
             reader_eof_observed: READER_EOF_OBSERVED.load(Ordering::Relaxed),
         },
         ledgers: admission_ledgers(),
+    }
+}
+
+/// The liveness-timer ledger at one instant. A soak snapshots it before and
+/// after a spike and reports the delta, so "no timer fired" is a measured
+/// statement about armed windows rather than an absence of observed error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimerLedger {
+    /// Heartbeat frames the central writer emitted.
+    pub heartbeats_sent: u64,
+    /// Heartbeat frames the central reader consumed.
+    pub heartbeats_received: u64,
+    /// Receive-deadline windows armed or re-armed.
+    pub receive_deadline_arms: u64,
+    /// Receive-deadline sleep futures registered on the timer wheel.
+    pub receive_deadline_sleeps_armed: u64,
+    /// Polls that found the read pending and the deadline still ahead.
+    pub receive_deadline_pending_polls: u64,
+    /// The instant the most recently armed deadline fires, on the runtime
+    /// clock relative to the first arm.
+    pub last_deadline_ms: u64,
+    /// Receive-deadline windows that expired with no byte arriving.
+    pub receive_deadline_expiries: u64,
+}
+
+impl TimerLedger {
+    /// The delta between an earlier snapshot and this one.
+    pub fn since(&self, earlier: &TimerLedger) -> TimerLedger {
+        TimerLedger {
+            heartbeats_sent: self.heartbeats_sent - earlier.heartbeats_sent,
+            heartbeats_received: self.heartbeats_received - earlier.heartbeats_received,
+            receive_deadline_arms: self.receive_deadline_arms - earlier.receive_deadline_arms,
+            receive_deadline_sleeps_armed: self.receive_deadline_sleeps_armed
+                - earlier.receive_deadline_sleeps_armed,
+            receive_deadline_pending_polls: self.receive_deadline_pending_polls
+                - earlier.receive_deadline_pending_polls,
+            last_deadline_ms: self.last_deadline_ms,
+            receive_deadline_expiries: self.receive_deadline_expiries
+                - earlier.receive_deadline_expiries,
+        }
+    }
+}
+
+impl std::fmt::Display for TimerLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timers: heartbeats_sent={} heartbeats_received={} \
+             receive_deadline_arms={} receive_deadline_sleeps_armed={} \
+             receive_deadline_pending_polls={} receive_deadline_expiries={} \
+             last_deadline_ms={}",
+            self.heartbeats_sent,
+            self.heartbeats_received,
+            self.receive_deadline_arms,
+            self.receive_deadline_sleeps_armed,
+            self.receive_deadline_pending_polls,
+            self.receive_deadline_expiries,
+            self.last_deadline_ms,
+        )
+    }
+}
+
+pub fn timer_ledger() -> TimerLedger {
+    TimerLedger {
+        heartbeats_sent: HEARTBEATS_SENT.load(Ordering::Relaxed),
+        heartbeats_received: HEARTBEATS_RECEIVED.load(Ordering::Relaxed),
+        receive_deadline_arms: RECEIVE_DEADLINE_ARMS.load(Ordering::Relaxed),
+        receive_deadline_sleeps_armed: RECEIVE_DEADLINE_SLEEPS_ARMED.load(Ordering::Relaxed),
+        receive_deadline_pending_polls: RECEIVE_DEADLINE_PENDING_POLLS.load(Ordering::Relaxed),
+        receive_deadline_expiries: RECEIVE_DEADLINE_EXPIRIES.load(Ordering::Relaxed),
+        last_deadline_ms: LAST_DEADLINE_MS.load(Ordering::Relaxed),
     }
 }

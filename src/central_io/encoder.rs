@@ -69,8 +69,10 @@ where
 /// `[Header 1][pad_len u16][padding pad_len]`, so the heartbeat does not
 /// fingerprint as a fixed 1-byte frame. Built in a buffer and written
 /// atomically so the transport sees one frame. Shared by the periodic
-/// heartbeat and the birth liveness heartbeat.
+/// heartbeat and the birth liveness heartbeat, so the ledger counts both at
+/// this single choke point.
 pub(crate) async fn write_heartbeat_frame<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
+    crate::live_probe::note_heartbeat_sent();
     let mut frame = Vec::with_capacity(crate::padding::MAX_PAD + 2);
     frame.push(Header::Heartbeat.encode()[0]);
     crate::padding::append_tail(&mut frame);
