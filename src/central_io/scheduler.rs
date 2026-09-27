@@ -51,7 +51,12 @@ pub fn write_data_channel() -> (WriteDataTxFactory, WriteDataRx) {
 pub fn write_data_channel_with_census_role(
     role: Option<crate::live_probe::SessionRole>,
 ) -> (WriteDataTxFactory, WriteDataRx) {
-    let (tx, rx) = fair_queue::channel();
+    // The token table is sized from the session's admission bound, not the
+    // fair queue's default: `MuxControl::open` mints the stream id and inserts
+    // the table entry *before* it asks for the egress token, so a token table
+    // smaller than `MAX_CONCURRENT_STREAMS` does not apply backpressure — it
+    // waits forever on a request the table will never announce.
+    let (tx, rx) = fair_queue::channel_with_capacity(crate::control::MAX_CONCURRENT_STREAMS);
     let tx = WriteDataTxFactory { opener: tx };
     let rx = WriteDataRx {
         rx,

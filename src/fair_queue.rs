@@ -12,14 +12,33 @@ use futures_util::task::AtomicWaker;
 
 use tokio::sync::{mpsc, oneshot};
 
+/// The queue table's default bound. The egress token table must be able to hold
+/// one queue for every stream the *session's* admission bound admits: a table
+/// this size while the stream table admits more is not backpressure but a
+/// permanent stall, because `open` mints the id before it asks for the token
+/// and the request it is waiting on is never announced. `mux` therefore sizes
+/// the table from `control::MAX_CONCURRENT_STREAMS`
+/// (`write_data_channel_with_census_role`) rather than from this constant,
+/// which remains the default for a standalone fair queue.
 const MAX_QUEUE_COUNT: usize = 1 << 10;
 const OPENER_QUEUE_SIZE: usize = 1 << 10;
 const DATA_QUEUE_SIZE: usize = 2;
 
 pub fn channel<T>() -> (QueueRegistrar<T>, Receiver<T>) {
+    channel_with_capacity(MAX_QUEUE_COUNT)
+}
+
+/// Like [`channel`], but the per-token queue table admits `max_queues` entries
+/// before it stops announcing opens. See [`Receiver::poll_recv_excluding`] for
+/// what a caller that sizes this below its own stream admission bound risks.
+pub fn channel_with_capacity<T>(max_queues: usize) -> (QueueRegistrar<T>, Receiver<T>) {
+    assert!(
+        max_queues > 0,
+        "the queue table must admit at least one queue"
+    );
     let (opener_tx, opener_rx) = mpsc::channel(OPENER_QUEUE_SIZE);
     let tx = QueueRegistrar::new(opener_tx);
-    let rx = Receiver::new(opener_rx);
+    let rx = Receiver::new(opener_rx, max_queues);
     (tx, rx)
 }
 #[derive(Debug)]
@@ -193,6 +212,11 @@ pub struct Receiver<T> {
     ready: Arc<Mutex<ReadyCounts>>,
     queues: BTreeMap<QueueToken, mpsc::Receiver<T>>,
     recv_queue_start: QueueToken,
+    /// How many per-token queues this table admits before it stops announcing
+    /// opens. Sourced from the caller's admission bound, not from
+    /// `MAX_QUEUE_COUNT`: a table smaller than the stream table turns the
+    /// admission of one more stream into a wait with no end.
+    max_queues: usize,
 }
 /// Snapshot of the ready set and the per-token queues at one instant, taken
 /// by the sole consumer when it is about to park. See [`crate::live_probe`]
@@ -212,18 +236,19 @@ pub struct ReceiverCensus {
     pub unmarked_queues: usize,
 }
 impl<T> Receiver<T> {
-    fn new(opener: mpsc::Receiver<OpenRequest<T>>) -> Self {
+    fn new(opener: mpsc::Receiver<OpenRequest<T>>, max_queues: usize) -> Self {
         Self {
             opener,
             next_new_token: QueueToken(0),
             ready: Arc::new(Mutex::new(ReadyCounts::new())),
             queues: BTreeMap::new(),
             recv_queue_start: QueueToken(0),
+            max_queues,
         }
     }
     /// The live size of the per-token queue table. `O(1)`; read by the egress
     /// token census so a soak can assert every stream's token queue was
-    /// reaped. The table admits exactly `MAX_QUEUE_COUNT` queues and stops
+    /// reaped. The table admits exactly `Self::max_queues` queues and stops
     /// announcing opens once full, so an unreaped entry is a permanent loss of
     /// stream admission, not a slow leak.
     pub(crate) fn queue_table_len(&self) -> usize {
@@ -302,7 +327,7 @@ impl<T> Receiver<T> {
         // Arm the ready set before reading it: a mark added after this point
         // either appears in the scan below or wakes this task to re-scan.
         self.ready.lock().unwrap().register(cx.waker());
-        while self.queues.len() != MAX_QUEUE_COUNT {
+        while self.queues.len() < self.max_queues {
             match self.opener.poll_recv(cx) {
                 Poll::Ready(None) => break,
                 Poll::Ready(Some(open_req)) => {

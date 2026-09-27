@@ -175,6 +175,9 @@ struct Pair {
     accepter: StreamAccepter,
     teardowns: JoinSet<MuxError>,
     _server_teardowns: JoinSet<MuxError>,
+    /// Streams opened and deliberately held open, so every per-stream
+    /// structure they allocate stays live. Dropping it releases them.
+    held: Vec<(StreamReader, StreamWriter, StreamReader, StreamWriter)>,
 }
 
 impl Pair {
@@ -212,6 +215,7 @@ impl Pair {
             accepter,
             teardowns,
             _server_teardowns: server_teardowns,
+            held: Vec::new(),
         }
     }
 
@@ -237,6 +241,14 @@ impl Pair {
         let (server_reader, server_writer) =
             accept_res.map_err(|e| io::Error::other(format!("accept: {e:?}")))?;
         Ok((client_reader, client_writer, server_reader, server_writer))
+    }
+
+    /// Open one stream and hold all four of its halves, so no close runs and
+    /// every structure the stream allocated stays live.
+    async fn open_and_hold(&mut self) -> io::Result<()> {
+        let halves = self.open_pair().await?;
+        self.held.push(halves);
+        Ok(())
     }
 
     /// The recovery probe every phase ends with: a full open/write/echo round
@@ -611,6 +623,76 @@ fn checkpoint_streams() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CHECKPOINT)
+}
+
+/// The per-token queue table's bound before it was derived from the session's
+/// admission bound. Every stream holds one egress token for as long as it is
+/// open, so a table this size while the stream table admits more does not
+/// apply backpressure — `MuxControl::open` mints the id and inserts the entry
+/// before asking for the token, so the open waits on a request the table will
+/// never announce. Measured before the fix: `open` #1024 completed and #1025
+/// blocked for the life of the session.
+const FORMER_EGRESS_TOKEN_CAP: usize = 1 << 10;
+
+/// The regression arm for that defect: a session must admit more concurrent
+/// streams than the former token cap, and every one of them must hold a live
+/// egress token while it is open.
+#[tokio::test(start_paused = true)]
+#[ignore = "standard tier: concurrent-stream admission vs the egress token table"]
+async fn a_session_admits_more_concurrent_streams_than_the_former_egress_cap() {
+    mux::live_probe::enable_structure_census();
+    let target = FORMER_EGRESS_TOKEN_CAP + 1;
+    let switch = StallSwitch::new();
+    let mut pair = Pair::spawn(Arc::clone(&switch));
+
+    for index in 0..target {
+        // The bound is on the simulated clock and deliberately generous: the
+        // defect this arm pins is an `open` that never completes, so an
+        // `open` that has not completed by now is the failure.
+        match tokio::time::timeout(Duration::from_secs(60), pair.open_and_hold()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                panic!("concurrent open #{index} failed while the stream table admits it: {e}")
+            }
+            Err(_) => panic!(
+                "concurrent open #{index} did not complete: the egress token table admits 
+                 fewer streams than the session's admission bound, so `open` waits on a token 
+                 that is never announced"
+            ),
+        }
+    }
+
+    settle().await;
+    let live = Checkpoint::sample("concurrent", target as u64, 0);
+    println!("{live}");
+    let queues = live.egress.client.token_queues + live.egress.server.token_queues;
+    assert!(
+        queues >= target as u64,
+        "only {queues} of the {target} held streams hold a live egress token queue, so the 
+         arm did not actually put the token table under pressure ({})",
+        live.egress,
+    );
+    assert_eq!(
+        live.ledger.client.stream_table_len, target as u64,
+        "the client's stream table does not hold every stream it opened ({}), so the token 
+         count above is not the table's pressure",
+        live.ledger,
+    );
+
+    // Release everything: every structure the held streams allocated must be
+    // released, which is the growth question asked at the token table's own
+    // scale rather than at the churn soak's.
+    pair.held.clear();
+    settle().await;
+    let released = Checkpoint::sample("concurrent-released", target as u64, 0);
+    println!("{released}");
+    assert_released(&released);
+    assert_eq!(
+        released.egress.total(),
+        0,
+        "the egress token table did not drain after every held stream was released ({})",
+        released.egress,
+    );
 }
 
 /// The growth assertion has teeth on its own, independent of the per-checkpoint
