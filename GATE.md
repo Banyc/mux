@@ -462,6 +462,106 @@ perf tier reaches. mux has no `perf` scenario, so this block is empty.
 ```gate-perf-guard-helpers
 ```
 
+## The env-scaled opt-in surface: `MUX_FAMILY_*` and `MUX_SOAK_*`
+
+The five `standard`-tier liveness arms above are `#[ignore]`d, but their load
+shape is not fixed by the ignore set: `tests/interactive_liveness_families.rs`
+and `tests/interactive_liveness_soak.rs` read it from the process environment,
+so the same green arm judges a few hundred cycles or a few hundred thousand.
+That surface is declared in the `gate-env-tier` block below; both rows are
+scriptless (`-`), because no script of this crate sets any of the names.
+
+### The schedule families: `MUX_FAMILY_*`
+
+`tests/interactive_liveness_families.rs` runs four families, each a different
+injection schedule over a real mux session pair on an in-memory duplex: the
+quiet message-boundary timing axis, several concurrent sessions with one idle,
+control-frame races against in-flight data, and frame reassembly under
+out-of-order delivery. Each family asserts the soak's three properties over its
+cycles — per-stream payload integrity, every job complete, every cycle inside
+the 2 s bound with a never-completing cycle reported as a hang rather than a
+late one — and fails if it ran no cycles; `reassembly_gap_family` additionally
+fails if the reorderer delivered nothing out of order, so its own instrument
+cannot be vacuous.
+
+- `MUX_FAMILY_CYCLES` (`:139`, default `DEFAULT_CYCLES = 400`, `:74`) sizes
+  each family's cycle count. Cycles are the trial unit — each is a fresh stream
+  set — and the run's detection limit is the rule-of-three bound `3/N` per
+  cycle.
+- `MUX_FAMILY_SEED` (`:143`, default `0x5EED_2244_ABCD_0001`) seeds the
+  per-cycle draw of stream counts, message lengths and shapes. It widens the
+  *volume* the fixed schedule is applied to; the schedule itself is fixed by
+  the cycle index, so another seed is not an independent family.
+- `MUX_FAMILY_STRAND` (`:1533`, default `0`, off) is the red-proof fault
+  injection: the n-th data frame in each direction is never released. A
+  non-zero value must turn `reassembly_gap_family` red inside its first cycle;
+  it is a detector check, and no green run uses it.
+
+### The soak's cycle replay: `MUX_SOAK_*`
+
+`tests/interactive_liveness_soak.rs` is the sustained-concurrency arm: many
+streams per cycle, interactive request/response interleaved with bulk
+transfers, writers parked on the fair-queue reserve path, a reader or writer
+dropped mid-flight, `Fin` racing pending data, thousands of open/close cycles.
+It asserts the same three properties and compares the staged and received byte
+totals at the end, so a silent loss fails even when every cycle returned. Two
+of its variables replay one cycle for reproduction:
+
+- `MUX_SOAK_REPLAY_TO` (`:1049`, default `0`, off) advances the schedule to
+  that cycle index without running the earlier ones, so a stall seen at cycle
+  k is reached without paying for the cycles before it.
+- `MUX_SOAK_REPEAT` (`:1050`, default `0`, off) runs that one cycle this many
+  times with the RNG state restored between repeats, so an intermittent stall
+  at one schedule position is re-rolled rather than averaged over a schedule.
+
+### Read through a direct literal, and so outside the block
+
+Three more variables scale these arms and the checker cannot see them.
+`MUX_SOAK_CYCLES` (`tests/interactive_liveness_soak.rs:962`, default
+`DEFAULT_CYCLES = 1_500`, `:66`) is the soak's cost key — its whole planned
+cycle count — and `MUX_SOAK_SEED` (`:971`, default
+`0x5EED_1234_ABCD_0001`) is its volume seed; both are read by a direct
+`std::env::var` literal in `cycles()` and `base_seed()`. `MUX_EGRESS_SOAK_ROUNDS`
+(`src/central_io/scheduler.rs:1487`, default `64`) is the same kind of knob for
+the default-tier component soak
+`central_io::scheduler::tests::concurrent_streams_stage_and_close_without_losing_a_byte`,
+which is a `lib`-target test and so appears in no scenario block either. The
+checker resolves a name only through a crate-local helper that forwards it to
+`env::var`, so a direct literal is invisible to its reader half and naming one
+in a variable list trips the other half (`passed to no env-reading function of
+this crate; a declared variable the crate never reads is a stale declaration`).
+The three are recorded here in prose for that reason, and the repair belongs in
+the checker.
+
+### Cost
+
+The families row's load is the measured default shape, not a derived one: all
+four families at `MUX_FAMILY_CYCLES=400`, i.e. 4 × 400 = **1 600 cycle
+executions in 2.33 s** (one `--ignored --test-threads=1` run of the target,
+`finished in 2.33s`, exit 0, four summary lines; per family 2.21 s quiet,
+0.02 s concurrent, 0.04 s control, 0.08 s reassembly). The run reported
+9 004 completed jobs and, from the reassembly family, 3 671 out-of-order
+deliveries and 542 close overtakes — the non-vacuity evidence that the reorder
+path was reached. The row's `bound=7.5e-3/cycle` is the rule of three at
+`MUX_FAMILY_CYCLES=400` (3/400), stated per family rather than over the summed
+1 600: the four families are different schedules sharing one build and one
+host, so they are not independent draws of one schedule.
+
+The soak row states no load. The soak's own cost is sized by `MUX_SOAK_CYCLES`
+— measured at its default 1 500 cycles as **4.07 s** (`finished in 4.07s`,
+exit 0) — and that variable is the one the checker cannot see;
+`MUX_FAMILY_CYCLES` and `MUX_SOAK_CYCLES` are the surface's cost keys, and only
+the former is nameable. `MUX_SOAK_REPLAY_TO` and `MUX_SOAK_REPEAT` select and
+repeat one cycle for reproduction and do not size the arm's cost, so a load
+naming them would record a reproduction shape as the arm's cost. The soak's
+detection limit at its default is the same rule of three: 0.2 % per cycle at
+1 500 cycles, and a replay run's exclusion covers only the repeated cycle.
+
+```gate-env-tier
+liveness-schedule-families = MUX_FAMILY_CYCLES,MUX_FAMILY_SEED,MUX_FAMILY_STRAND | - | the per-family liveness of the interactive path under the four schedules the soak holds fixed: quiet message-boundary publishes, three concurrent sessions with one idle, control-frame races against in-flight data, and frame-reassembly under out-of-order delivery, each asserting per-stream payload integrity, per-job completion and a 2 s per-cycle bound, with MUX_FAMILY_STRAND=n the red-proof hold that must fail the reassembly family | liveness@shape=quiet-boundary+metric=per-job-completion, liveness@shape=multi-session-idle+metric=per-job-completion, liveness@shape=control-race+metric=per-job-completion, liveness@shape=reassembly-reorder+metric=per-job-completion, payload-integrity@shape=control-race-and-reassembly+order=per-stream, liveness-rate@metric=rule-of-three+unit=cycle, stall-detection@fault=strand-never-release | MUX_FAMILY_CYCLES=400,total=4*MUX_FAMILY_CYCLES,wall=2.33s,bound=7.5e-3/cycle
+soak-cycle-replay = MUX_SOAK_REPLAY_TO,MUX_SOAK_REPEAT | - | the interactive-path soak's diagnostic replay: MUX_SOAK_REPLAY_TO reaches one cycle index without running the earlier cycles and MUX_SOAK_REPEAT re-runs that one cycle with the RNG restored, so a stall the soak reports at a named cycle is reproduced in isolation; the soak itself asserts staged-equals-received byte conservation, per-job completion and the 2 s per-cycle bound over sustained interactive and bulk concurrency | liveness@shape=interactive-bulk-concurrency+metric=per-job-completion, byte-conservation@shape=soak+metric=staged-vs-received, liveness-rate@metric=rule-of-three+unit=cycle, reproduction@mode=single-cycle-replay+determinism=rng-restored, stall-localisation@shape=replayed-cycle+probe=in-flight-jobs
+```
+
 ## Opt-in targets outside this manifest
 
 `check-gate.py` covers only the mux scenario targets; mux has none, so the
