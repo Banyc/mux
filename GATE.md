@@ -123,6 +123,9 @@ reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_mo
 request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 session_growth_soak::the_growth_assertion_rejects_a_grown_census
 session_growth_soak::the_release_assertion_rejects_a_retained_structure
+frame_reorder_soak::the_default_schedule_is_the_declared_one
+frame_reorder_soak::the_growth_assertion_rejects_a_grown_census
+frame_reorder_soak::the_release_assertion_rejects_a_retained_structure
 ```
 
 ### Interactive-path liveness under sustained concurrency (standard tier)
@@ -701,6 +704,120 @@ to the harness scenarios in `rtp_mux/GATE.md`), and the birth window
 (`first_receive_deadline`), whose production value and red-proof arm live in
 `rtp_mux`.
 
+### Frame reordering on a long-lived session (standard tier)
+
+`tests/frame_reorder_soak.rs` asks the one question both soaks above name as
+*not theirs*: what does one session hold, over its whole life, when the
+transport delivers complete frames **out of sent order**? Reordering is what a
+real path does — the deployment's interactive lane hands frames up in arrival
+order, and `ReorderBuffer` is the consumer that restores per-stream order — and
+neither existing soak reaches it: `session_growth_soak` runs a plain duplex
+whose delivery is in order (its reorder buffer holds for at most one poll and
+never carries a gap into a close), and `spike_survival_soak` stalls delivery
+without reordering it. `reassembly_gap_family` does reorder, but a fresh
+stream set per cycle cannot see a retention that needs a long session to reach
+a bound.
+
+The transport is a frame-reordering shim the test owns: it holds a data frame
+and writes the frames queued behind it first — the rest of the message, a
+`CloseWrite`, another stream's frames — and re-delivers one data frame in three
+one frame later, so a frame whose bytes were already released arrives again.
+Both sessions run `frame_reassembly` on. One session stays open for the whole
+run; the phases vary the *load shape* and the impairment is constant.
+
+Eight-round fixed schedule, one varying dimension per phase from the `Echo`
+baseline (small concurrent full echo rounds under reordering): `Bulk` (a
+multi-frame bidirectional message), `SlowConsumer` (**the brief's slow consumer
+× reordering**: the peer accepts and never reads while the transport reorders,
+so the receiving read queue's bound is reached under reordering, asserted
+within the phase), `DroppedMidTransfer`, `ClosedWithoutReading`, `FinRace` (a
+multi-frame message whose `CloseWrite` overtakes in-flight data), and
+`ReorderStall` (a delivery stall at the field's own spike magnitudes — 190 ms,
+1063 ms, 3205 ms — applied while frames are being reordered and are in
+flight). Every phase is followed by a full open/write/echo recovery probe, so a
+wedge fails where it happens.
+
+The instrument is two-sided and neither side can be satisfied by the other:
+
+- **Inside the structure under test** — `mux::live_probe::reorder_ledger`
+  counts, at the frame, from `ReorderBuffer::ingest` itself: frames ingested,
+  frames that arrived **ahead of the cursor** and were buffered, and frames
+  whose whole range was already released and were dropped idempotently. The
+  soak fails on a zero for `buffered_out_of_order`, so a run whose transport
+delivered in order cannot read as coverage however the shim behaved.
+- **The shim's own counts** — frames, reorders, overtaken, max gap,
+  `CloseWrite` overtakes, and duplicates — asserted non-zero, and asserted to
+  include a gap above one frame.
+
+Assertions: (1) the disturbance reached the structure (`buffered > 0`,
+`ingests >= completed`, `dropped_late > 0`, `reorders > 0`, `max_gap > 1`,
+`close_overtakes > 0`); (2) at two matched points (after N and 10N completed
+streams) every per-stream structure reads zero — `stream_table`, reassembly
+buffers, their pending frame and byte totals, open read sinks,
+`closed_but_retained`, the egress token tables — and none holds more live state
+later; (3) every reordered burst is byte-exact and in stream order (compared
+against a freshly generated position-dependent pattern, not against itself);
+(4) the read-queue bound was reached on every slow-consumer occurrence; (5) no
+receive-deadline window expired while the deadline was armed across the run;
+(6) the admission ledger's inserts cover the completed streams and both roles
+retired entries.
+
+Tier: **standard** (`#[ignore]`d, asserting). `MUX_REORDER_ROUNDS` and
+`MUX_REORDER_CHECKPOINT` size the soak; `MUX_REORDER_FAULT=no_reorder` delivers
+in order (`buffered_out_of_order=0`), `never_release` strands a held frame (the
+recovery probe fails at the phase that held it), and `no_duplicate` never
+after-delivers (`dropped_late=0`).
+
+Measured cost on the release gate build: **7.47 s** for the default shape
+(841 rounds, 2 525 streams opened, 2 000 completed, 105 stalls, 8 566 s of
+simulated session time, 886 982 frames through the shim); two further runs
+without stdout capture measured **7.51 s** and **7.52 s** at load average
+2.6-3.1, and the same shape with `--nocapture` (the reporter's view, with every
+checkpoint and the per-phase counters printed) measured **9.46 s**, plus
+1.10 s for `spike_survival_soak` against its recorded 1.20 s in the same window
+as the load control. The run's own
+counters over that shape: mux — `ingests=1 016 105`,
+`buffered_out_of_order=437 545`, `dropped_late=143 535`; shim —
+`reorders=435 025`, `overtaken=441 965`, `max_gap=4`, `close_overtakes=4 315`,
+`duplicates=145 007`; timers — `heartbeats_sent=received=1 682`,
+`receive_deadline_expiries=0`. Matched points at 204 and 2 000 completed
+streams both read zero on every structure. The cost is dominated by the
+slow-consumer phase (~8 191 queued messages per occurrence, ~97 % of the run's
+frames), which is the irreducible price of reaching that queue's bound; the
+rest of the schedule costs milliseconds.
+
+Vacuity (each probe run on this revision, outputs in the landing report):
+`MUX_REORDER_FAULT=no_reorder` fails naming the structure and both counts
+(`buffered_out_of_order=0` across `ingests=33 146`); the instrument's counter
+removed at `src/reassembly.rs` (`note_reassembly_buffered()` occurrences 1 →
+0, mutated line printed) fails the same assertion; `MUX_REORDER_FAULT=never_release`
+fails inside the first cycle with the round, the phase and the bound;
+`MUX_REORDER_FAULT=no_duplicate` fails naming `dropped_late=0` and
+`dropped_dup_buffered=0`; and `retire_if_closed` reduced to a no-op (a source
+mutation, restored with `touch`) fails the `later` checkpoint naming the
+retained structure and both counts (`stream_table=12 reassembly_buffers=12 …
+closed_but_retained=12`). Three default-tier arms keep the assertions from
+rotting: `the_default_schedule_is_the_declared_one`,
+`the_growth_assertion_rejects_a_grown_census` and
+`the_release_assertion_rejects_a_retained_structure`.
+
+Detection limit, stated rather than implied: the schedule is fixed by the round
+index, so cycles are seeded replications of one schedule rather than
+independent draws; a zero-hit run of N rounds excludes a per-round defect rate
+above ~3/N at 95 % (3.6e-3 per round at the default 841). What the soak cannot
+catch, stated rather than implied: the real transport and its impairment models
+(mux is transport-free — the reordering is the test's own in-memory shim, and
+netem belongs to the harness scenarios in `rtp_mux/GATE.md`); byte-for-byte
+wire shape; and **the receive deadline's boundary magnitude**. The 19.9 s entry
+of the field schedule is deliberately not duplicated here: it is
+`spike_survival_soak`'s cell, and at this phase's structure it is not
+measurable — the two sessions' sliding windows are armed at different instants
+and the ledger publishes only the most recent arm, so on this revision a 19.9 s
+advance expired one window while the margin check on the last-armed window
+still passed. The stall schedule therefore stops at the field's measured
+maximum (3 205 ms), which leaves a ≥ 16 s margin on both windows, so the stall
+is unambiguously the silence the phase claims.
+
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of
@@ -716,6 +833,7 @@ interactive_liveness_families::reassembly_gap_family = standard
 spike_survival_soak::a_live_session_survives_the_fields_spike_schedule = standard
 session_growth_soak::a_long_lived_session_releases_every_per_stream_structure = standard
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap = standard
+frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -732,6 +850,10 @@ session_growth_soak::a_long_lived_session_releases_every_per_stream_structure
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap
 session_growth_soak::the_growth_assertion_rejects_a_grown_census
 session_growth_soak::the_release_assertion_rejects_a_retained_structure
+frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering
+frame_reorder_soak::the_default_schedule_is_the_declared_one
+frame_reorder_soak::the_growth_assertion_rejects_a_grown_census
+frame_reorder_soak::the_release_assertion_rejects_a_retained_structure
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 ```
@@ -884,6 +1006,7 @@ interactive-path-soak = MUX_SOAK_CYCLES,MUX_SOAK_SEED,MUX_SOAK_REPLAY_TO,MUX_SOA
 egress-component-soak = MUX_EGRESS_SOAK_ROUNDS | - | the egress fair-queue/scheduler component soak in the lib target, sized by MUX_EGRESS_SOAK_ROUNDS: each round opens 48 concurrent streams that stage four 8 KiB chunks on the production reserve path and close while one consumer drains, asserting byte conservation, a Fin for every stream's close and a bounded round | liveness@shape=egress-reserve-drain+metric=per-stream-fin, byte-conservation@shape=egress-soak+metric=staged-vs-dispatched, liveness-rate@metric=rule-of-three+unit=round | MUX_EGRESS_SOAK_ROUNDS=64,total=48*MUX_EGRESS_SOAK_ROUNDS,wall=0.14s,bound=4.7e-2/round
 spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-session spike soak sized by MUX_SPIKE_ROUNDS, with MUX_SPIKE_FAULT=no_stall the red-proof mode that disables the gate's hold: one session held open across a fixed schedule of delivery stalls (190 ms / 1063 ms / 3205 ms / 19.9 s) with the receive-deadline ledger asserted, so a spike costs time and the session survives, and the default-tier detector arm proves the deadline still fires past its window | liveness@shape=long-lived-session+metric=per-job-completion, timer-ledger@metric=receive-deadline+state=armed-not-expired, stall-detection@fault=no-stall-gate, stall-detection@control=deadline-crossed-tears-down | MUX_SPIKE_ROUNDS=120,total=MUX_SPIKE_ROUNDS,wall=1.20s,bound=2.5e-2/cycle
 growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the long-lived-session churn/retention soak sized by MUX_GROWTH_ROUNDS with its matched points placed by MUX_GROWTH_CHECKPOINT, and MUX_GROWTH_FAULT the red-proof selector (leak_stream leaks a peer half per round, no_stall disables the stall phase's hold): a frame_reassembly-on session driven through a fixed eight-round phase schedule (concurrent echo, a peer that stops reading, streams dropped mid-transfer with the client's halves closed first, a closed-without-reading burst with alternating close order, and a 1063 ms delivery stall) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow and that the egress token table drains; the second arm opens one more concurrent stream than the former egress token-table cap and asserts every open completes and every token is reaped | growth@metric=per-stream-structure-live-count+points=matched, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=churn+metric=per-round-recovery-probe, liveness@shape=slow-consumer+metric=recovery, liveness@shape=dropped-mid-transfer+metric=recovery, liveness@shape=closed-without-reading+metric=recovery, liveness@shape=stall+metric=recovery, admission@metric=concurrent-streams-vs-egress-token-cap, staleness@fault=leak-stream-and-no-stall | MUX_GROWTH_CHECKPOINT=200,MUX_GROWTH_ROUNDS=667,total=MUX_GROWTH_ROUNDS,wall=3.39s,bound=4.5e-3/round
+reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - | the long-lived-session frame-reordering soak sized by MUX_REORDER_ROUNDS with its matched points placed by MUX_REORDER_CHECKPOINT, and MUX_REORDER_FAULT the red-proof selector (no_reorder delivers every frame in sent order, never_release strands a held data frame, no_duplicate never re-delivers one): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame and write the frames queued behind it first and re-deliver one data frame in three a frame later (concurrent echo rounds, a multi-frame bidirectional message, a peer that accepts and stops reading until the read queue's bound is reached, streams dropped mid-transfer, a closed-without-reading burst, a CloseWrite overtaking in-flight data, and a delivery stall at the field's 190 ms/1063 ms/3205 ms magnitudes applied while frames are reordered in flight) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that the mux's own ReorderBuffer held out-of-order frames and dropped after-release ones idempotently, that every reordered burst delivered byte-exact in stream order, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, reorder@metric=frames-buffered-out-of-order+source=mux-internal-ingest-counter, ordering@metric=byte-exact-in-stream-order+impairment=frame-reorder, idempotence@metric=frame-dropped-after-release, liveness@shape=reorder-across-close+metric=CloseWrite-overtake, liveness@shape=reorder-plus-stall+metric=receive-deadline-armed-not-expired, liveness@shape=slow-consumer-x-reorder+metric=read-queue-bound-reached, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-reorder-never-release-and-no-duplicate | MUX_REORDER_CHECKPOINT=200,MUX_REORDER_ROUNDS=841,total=MUX_REORDER_ROUNDS,wall=7.47s,bound=3.6e-3/round
 ```
 
 ## Opt-in targets outside this manifest

@@ -1028,6 +1028,97 @@ pub fn timer_ledger() -> TimerLedger {
     }
 }
 
+// ─── reorder-buffer ledger ─────────────────────────────────────────────────
+//
+// The structure census reports the *live* count of reorder-buffer state at a
+// quiesced checkpoint, so a soak that never applies frame reordering reads the
+// same zeroes as one that applies it heavily. These counters are the
+// through-flow half: they are incremented inside `ReorderBuffer::ingest`, at
+// the frame, so a run can show that frames really did arrive ahead of the
+// cursor and were held, and that a frame really did arrive after its bytes had
+// already been released. Without them a green reorder soak is
+// indistinguishable from a soak whose transport delivered in order — which is
+// the exact vacuity the soak exists to rule out.
+
+static REASSEMBLY_INGESTS: AtomicU64 = AtomicU64::new(0);
+static REASSEMBLY_BUFFERED: AtomicU64 = AtomicU64::new(0);
+static REASSEMBLY_DROPPED_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static REASSEMBLY_DROPPED_BUFFERED: AtomicU64 = AtomicU64::new(0);
+
+/// A non-empty frame reached `ReorderBuffer::ingest`. The denominator of the
+/// reorder rate, so a soak can show the reorder path was reached at all.
+pub(crate) fn note_reassembly_ingest() {
+    REASSEMBLY_INGESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The frame's offset was strictly ahead of the cursor, so the buffer held it
+/// rather than delivering it: one out-of-order arrival the receiver had to
+/// reassemble. Zero of these means the transport delivered every frame in
+/// order and the soak proved nothing about reordering.
+pub(crate) fn note_reassembly_buffered() {
+    REASSEMBLY_BUFFERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The frame's whole byte range had already been delivered: a late or
+/// duplicate frame `ingest` dropped idempotently. Zero of these means the run
+/// never delivered a frame *after* the buffer had released its bytes.
+pub(crate) fn note_reassembly_dropped_delivered() {
+    REASSEMBLY_DROPPED_DELIVERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The frame duplicated one already buffered ahead of the cursor: dropped
+/// idempotently while a gap was still outstanding.
+pub(crate) fn note_reassembly_dropped_buffered() {
+    REASSEMBLY_DROPPED_BUFFERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Through-flow counters of the reorder buffer: what arrived, what had to be
+/// held, and what arrived too late to be anything but a duplicate. Cumulative,
+/// so a soak differences them across a phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReorderLedger {
+    /// Non-empty frames ingested.
+    pub ingests: u64,
+    /// Frames that arrived ahead of the cursor and were buffered.
+    pub buffered: u64,
+    /// Frames whose whole range was already delivered and were dropped.
+    pub dropped_delivered: u64,
+    /// Frames that duplicated a frame already buffered and were dropped.
+    pub dropped_buffered: u64,
+}
+
+impl ReorderLedger {
+    /// The delta between an earlier snapshot and this one.
+    pub fn since(&self, earlier: &ReorderLedger) -> ReorderLedger {
+        ReorderLedger {
+            ingests: self.ingests - earlier.ingests,
+            buffered: self.buffered - earlier.buffered,
+            dropped_delivered: self.dropped_delivered - earlier.dropped_delivered,
+            dropped_buffered: self.dropped_buffered - earlier.dropped_buffered,
+        }
+    }
+}
+
+impl std::fmt::Display for ReorderLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reorder: ingests={} buffered_out_of_order={} dropped_late={} dropped_dup_buffered={}",
+            self.ingests, self.buffered, self.dropped_delivered, self.dropped_buffered,
+        )
+    }
+}
+
+/// The reorder-buffer ledger at one instant.
+pub fn reorder_ledger() -> ReorderLedger {
+    ReorderLedger {
+        ingests: REASSEMBLY_INGESTS.load(Ordering::Relaxed),
+        buffered: REASSEMBLY_BUFFERED.load(Ordering::Relaxed),
+        dropped_delivered: REASSEMBLY_DROPPED_DELIVERED.load(Ordering::Relaxed),
+        dropped_buffered: REASSEMBLY_DROPPED_BUFFERED.load(Ordering::Relaxed),
+    }
+}
+
 // ─── per-session structure census ──────────────────────────────────────────
 //
 // A long-lived session accumulates state that no counter above can see. The

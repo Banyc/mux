@@ -102,13 +102,18 @@ impl ReorderBuffer {
         if data.is_empty() {
             return Ok(());
         }
+        crate::live_probe::note_reassembly_ingest();
         let Some(mut abs) = self.wire_to_abs(offset) else {
             return Err(ReassemblyError::AmbiguousOffset);
         };
         let len = data.len() as u64;
         let mut end_abs = abs + len;
-        // Already fully delivered: idempotent drop.
+        // Already fully delivered: idempotent drop. This is the frame that
+        // arrives *after* the buffer released its bytes — a duplicate or a
+        // straggler overtaken past its own range — and counting it is what
+        // makes the soak's "nothing was resurrected" claim non-vacuous.
         if end_abs <= self.cursor {
+            crate::live_probe::note_reassembly_dropped_delivered();
             return Ok(());
         }
         // If final_offset_abs is set, the frame must lie entirely within
@@ -139,6 +144,7 @@ impl ReorderBuffer {
         // Exact duplicate of a buffered frame (same offset, same len).
         if let Some(existing) = self.pending.get(&abs) {
             if existing.len() as u64 == len {
+                crate::live_probe::note_reassembly_dropped_buffered();
                 return Ok(());
             }
             return Err(ReassemblyError::Overlap);
@@ -149,6 +155,7 @@ impl ReorderBuffer {
             let prev_end = prev_abs + prev_data.len() as u64;
             if abs < prev_end {
                 if prev_end == end_abs && prev_data.len() as u64 == len {
+                    crate::live_probe::note_reassembly_dropped_buffered();
                     return Ok(());
                 }
                 return Err(ReassemblyError::Overlap);
@@ -177,6 +184,10 @@ impl ReorderBuffer {
             return Err(ReassemblyError::RangeOverflow);
         }
         self.buffered_bytes = new_buffered;
+        if abs > self.cursor {
+            // Held, not delivered: the cursor cannot advance over the gap yet.
+            crate::live_probe::note_reassembly_buffered();
+        }
         self.pending.insert(abs, data);
         Ok(())
     }
