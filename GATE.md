@@ -4,15 +4,15 @@ This file is the authoritative scope of the mux scenario gate. `cargo test
 -p mux` silently skips every `#[ignore]`d scenario, so the gate is defined in
 tiers and the `gate-manifest` block below names every opt-in scenario and its
 tier. The manifest is machine-checked by the shared checker
-(`netem_test/tools/check-gate.py`, parameterized per crate), which fails if a
+(`netem-tools check-gate`, parameterized per crate), which fails if a
 scenario is added or removed without the manifest being updated, making an
 unnoticed `#[ignore]` skip impossible.
 
-Run the checker after adding, removing, or re-tiering any scenario (from the
-`netem_test` checkout, so the checker finds the sibling kit sources):
+Run the checker after adding, removing, or re-tiering any scenario (from this
+crate's checkout, so the checker reads this crate's sources):
 
 ```sh
-python3 ../netem_test/tools/check-gate.py \
+netem-tools check-gate \
   --crate . mux tests GATE.md
 ```
 
@@ -80,11 +80,11 @@ measured) for the mux session table and its per-stream channels.
 - **perf** — `#[ignore]`d, report-only measurement or long-run tooling; these
   produce numbers (or feed the harness perf-loop), they do not assert a gate
   floor. A `perf` scenario must not contain an assertion in its own body;
-  `check-gate.py` fails with the scenario name, its file, and the token if
-  one does. It must also not reach an assertion through a helper: the checker
-  derives the crate-local call-graph closure of every `perf` scenario and
-  requires every asserting helper it reaches to be declared report-only in the
-  `gate-perf-guard-helpers` block.
+  `netem-tools check-gate` fails with the scenario name, its file, and the
+  token if one does. It must also not reach an assertion through a helper: the
+  checker derives the crate-local call-graph closure of every `perf` scenario
+  and requires every asserting helper it reaches to be declared report-only in
+  the `gate-perf-guard-helpers` block.
 
 ## The gate that always runs
 
@@ -1142,9 +1142,9 @@ dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the lon
 
 ## Opt-in targets outside this manifest
 
-`check-gate.py` covers only the mux scenario targets; mux has none, so the
-checker only confirms the blocks above stay consistent with the compiled test
-binaries. `tests/reassembly_stream_release.rs` and `tests/stream_writer.rs` are non-scenario
+`netem-tools check-gate` covers only the mux scenario targets; mux has none, so
+the checker only confirms the blocks above stay consistent with the compiled
+test binaries. `tests/reassembly_stream_release.rs` and `tests/stream_writer.rs` are non-scenario
 targets (their tests run in the default tier and are not gated as scenarios). The `nightly` bench (`mux`
 with `--features nightly`, `bench::profile_mux_send`) is an infinite profiling
 loop and is never run to completion by any gate. The harness crate has its own
