@@ -316,6 +316,13 @@ async fn a_live_session_survives_the_fields_spike_schedule() {
         teardowns.is_empty(),
         "the session did not survive: {teardowns:?}"
     );
+    // Red proof, recorded in GATE.md ("Session survival under latency spikes"):
+    // with `central_io::reader::RECEIVE_DEADLINE_INTERVALS` 4 -> 3 the 19.9 s
+    // spike crosses the 15 s production deadline and this arm fails at the
+    // per-round teardown assert below, naming the deadline:
+    //   `round 3: a 19.9s spike (receive deadline 20s) tore the session down:
+    //    [IoReader(Custom { kind: TimedOut, error: "receive deadline -
+    //    session timed out" }), …]`
     assert_eq!(
         delta.receive_deadline_expiries, 0,
         "a receive-deadline window expired during a spike the session survived",

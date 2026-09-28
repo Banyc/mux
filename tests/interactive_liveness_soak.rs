@@ -1170,6 +1170,12 @@ async fn interactive_path_liveness_soak() {
     monitors.abort_all();
     while monitors.join_next().await.is_some() {}
 
+    // Red proofs, recorded in GATE.md ("Interactive-path liveness under
+    // sustained concurrency"): removing `ReadyCounts::add`'s `self.waker.wake()`
+    // (`src/fair_queue.rs:551`) strands a staged egress tail and this panic
+    // fires at `MUX_SOAK_CYCLES=20000 MUX_SOAK_SEED=2` (cycle 3190, a `Partial`
+    // verdict, `delivered=0`); `MUX_SOAK_CYCLES=0` fails the no-cycles assert
+    // below with `soak ran no cycles`.
     if let Some(message) = failure {
         panic!("interactive-path liveness soak failed: {message}");
     }

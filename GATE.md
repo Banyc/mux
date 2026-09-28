@@ -166,6 +166,28 @@ magnitude exclusion, not a rate. Host-capacity failures are not catches: this
 soak binds no sockets (no port exhaustion), and the heartbeat separates a
 starved runtime from a parked task.
 
+Vacuity. The property this soak exists for is a lost wakeup, so the red proof
+is a lost wake: removing `ReadyCounts::add`'s `self.waker.wake()`
+(`src/fair_queue.rs:551`, occurrences 1 -> 0 in a backup-compared edit,
+restored with `touch`) removes the ready set's own wake and leaves only the
+per-token channel push. The default 1500-cycle run stays **green** under that
+mutation — a lost wake is an interleaving event, not a per-cycle one, so the
+rule-of-three bound above does not reach it — but
+`MUX_SOAK_CYCLES=20000 MUX_SOAK_SEED=2` fails at cycle 3190 after 18.4 s wall
+with `interactive-path liveness soak failed: cycle 3190 stalled: only 16 job(s)
+finished within 10.004s and the cycle never completed; in-flight: ["c3190
+ping-client#5 rounds=6 len=16 staged=96 received=96", "c3190 ping-server#5
+len=16 staged=96 received=96"]` and a stream trace ending
+`[19036/owner egress=2048 dispatched=256 delivered=0 …] unbalanced=2` — a
+staged tail stranded in the egress queue. The default-tier
+`fair_queue::tests::a_ready_mark_wakes_a_parked_consumer_whose_channel_waker_is_gone`
+fails on the same build (`src/fair_queue.rs:939`). Two other seeds (the default
+and `MUX_SOAK_SEED=3`) ran 20 000 cycles green under the same mutation, in line
+with the 6/8 seed hit rate the fix's own commit records (`aeeb70aef997`).
+So the liveness oracle can fail, on a schedule and cycle count that reach the
+lost-wakeup interleaving; the default 1500-cycle tier does not prove the
+absence of one.
+
 Coverage cells provided: liveness under sustained interactive+bulk concurrency;
 the `fair_queue` scan/ready discipline and the reserve/`Pending` path; egress
 rotation under a full queue; teardown (`Fin`/close/drop) racing pending data;
@@ -928,6 +950,22 @@ the gate's hold and must fail the "spike was applied" checks). The schedule
 is fixed, so the cycles are seeded replications of one schedule, not
 independent draws: a zero-hit run of N cycles excludes a per-cycle defect rate
 above ~3/N at 95 % (0.025 per cycle at 120).
+
+A second red proof covers the deadline ledger itself rather than the gate's
+hold: with the value of `central_io::reader::RECEIVE_DEADLINE_INTERVALS`
+changed 4 -> 3 (`src/central_io/reader.rs:25`; the only occurrence of the
+*literal* — the name occurs three times — restored with `touch` and verified
+byte-identical), the production deadline is 15 s at the production 5 s
+heartbeat and the 19.9 s spike crosses it, so the arm fails at its per-round
+teardown check: `round 3: a 19.9s spike (receive deadline 20s) tore the
+session down: [IoReader(Custom { kind: TimedOut, error: "receive deadline -
+session timed out" }), …]` (`tests/spike_survival_soak.rs:293`, revision
+487f3fe7, exit 101, 0.07 s). That proves the zero-expiry / zero-teardown
+assertions are sensitive to the deadline they read; the default-tier
+`a_stall_past_the_deadline_still_trips_the_detector` proves the deadline can
+fire at all, and `MUX_SPIKE_FAULT=no_stall` proves the "spike was applied"
+checks (`round 3: the 19.9s spike delivered 1706 bytes while stalled, so the
+spike was not applied and this run proves nothing`, `:267`).
 
 Coverage cells provided: long-lived-session liveness across transport silence
 at the field's own magnitudes; the receive-deadline arm/expiry ledger; and
