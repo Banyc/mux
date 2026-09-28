@@ -975,6 +975,69 @@ to the harness scenarios in `rtp_mux/GATE.md`), and the birth window
 (`first_receive_deadline`), whose production value and red-proof arm live in
 `rtp_mux`.
 
+### Timer inventory: every deadline in `mux` and what re-arms it
+
+Taken from the code (`rg -n 'Duration::from|Instant::now|deadline|timeout|interval' src/`,
+each hit read, production separated from `#[cfg(test)]`), one row per timer.
+`value` is the production value; the two birth values are supplied by `rtp_mux`,
+which owns `BIRTH_LIVENESS_DEADLINE`. `margin` is against the field's worst
+measured spike (3205 ms); the field's worst observed silence, 19.9 s, is stated
+where it changes the reading. "Fires on slowness?" asks whether expiry is pure
+elapsed time on a *live* path, and what it does.
+
+| timer | file:line | value | re-armed by | margin vs 3205 ms | fires on slowness? |
+| --- | --- | --- | --- | --- | --- |
+| sliding receive deadline | `central_io/reader.rs:25,123` | `heartbeat_interval * 4` = 20 s (5 s heartbeat) | every received byte resets `last_progress` (`:83`); every completed frame re-sets the deadline | +16 795 ms; **+100 ms** against the 19.9 s silence | yes in principle: a silence past 20 s ends the session (`RunCentralIoReaderError::IoReader`). The observed worst (19.9 s) does **not** reach it — `spike_survival_soak` asserts zero expiries — and no longer silence has been measured. Left alone; thinnest margin in the inventory |
+| first-receive (birth) deadline | `session.rs:96-151`, used at `central_io/reader.rs:124` | `rtp_mux`'s `BIRTH_LIVENESS_DEADLINE` = 4 s | cleared by the first complete frame; re-armed on every reconnect | +795 ms | birth only; a birth silence past 4 s aborts and re-pays the cold birth. The 19.9 s one-off would fire it; the value is owned by `rtp_mux` (`birth_liveness`) |
+| heartbeat send interval | `central_io/encoder.rs:60,123` | 5 s + 0..20 % jitter | each send | send-only | no expiry of its own; a transport write that is stalled delays the heartbeat and so consumes the peer's receive-deadline budget |
+| stream read drain grace | `stream/reader.rs:20`, gate `:285-315` | 10 ms | reader progress (`observe_reader_progress`, `:339-343`), or the queue falling below the soft limit | n/a (progress-gated) | no: refusal requires the queue over the soft limit **and** no reader drain since the overload began; one observed drain disables the time path for the rest of the overload, and a spike delays *arrival* and so helps the reader drain. Pinned by `stream::reader::tests::a_progressing_reader_behind_a_sustained_backlog_is_not_refused` |
+| successor-generation deadline | `migration_wire.rs:52,715-717` | 30 s | a successor generation taken from the queue (`:793,815,844`) | +26 795 ms | only on a chain-specific gap: the session's own receive deadline (20 s) fires first under pure path silence, so this can only expire while heartbeats still flow and one chain's successor never comes — a dead chain, not a slow path |
+| orphan TTL | `migration_wire.rs:91,501` | **30 s** (was 1500 ms) | n/a; expiry reaps the orphan and remembers the id broken | +26 795 ms (was **−1705 ms**, i.e. fired) | **was** firing on the field's worst spike; fixed — see below |
+| resume-header deadline | `migration_api.rs:38` | 30 s | the header read completing | +26 795 ms | no: expiry does **not** drop the substream; the read continues *off* the bounded peek budget (`migration_api.rs:785`), so a late header is a late header, not a lost generation |
+| lane-migration cooldown | `traffic_class.rs:34` | 150 ms | `note_migration` (`:166`) | n/a | no: expiry *enables* a lane-migration decision; a migration inside the cooldown is deferred, not refused |
+| latency idle | `traffic_class.rs:181` | 30 s | every send (`:249`) and every open (`:232`) | +26 795 ms | no: expiry reclassifies an idle stream from latency-sensitive to bulk. It changes dispatch caps, not liveness, and any send re-arms it |
+| lane-hello deadline | `dual_lane.rs:717` | `rtp_mux`'s `BIRTH_LIVENESS_DEADLINE` = 4 s | the lane hello byte | +795 ms | birth only; `begin_lane_pairing` fails the lane, and `rtp_mux` owns the value |
+| unarmed sentinel | `central_io/reader.rs:29` | 1 year | n/a | — | never: a finite sentinel so `Instant + deadline` cannot overflow; never in force for a real read |
+
+**The one that fired: `ORPHAN_TTL`.** A successor generation can overtake its
+generation 0 when a stream's two lanes have different delay — the successor is
+written on the faster lane while gen-0 waits on the stalled one. The registry
+holds the successor as an orphan until gen-0 arrives, but reaps it on a *pure
+elapsed-time* TTL the instant any other stream's generation is dispatched, and
+remembers the logical id as broken, so the delayed gen-0 is then refused with
+`BrokenChain`: the stream dies although the session that carried it was alive
+for the whole spike. At 1500 ms the TTL sat **1705 ms below** the field's worst
+measured spike (3205 ms), and **18.4 s below** the 19.9 s silence — the same
+defect shape as `rtp_mux`'s `BIRTH_LIVENESS_DEADLINE` at 2500 ms. The TTL is
+not an independent quantity: it bounds the same inter-generation boundary a
+`SplicedReader` waits across in the other direction
+(`DEFAULT_SUCCESSOR_DEADLINE`, 30 s), so the two ends of that boundary used
+different clocks (1.5 s against 30 s), and it was also shorter than the
+session's own liveness window (20 s). It is now `DEFAULT_SUCCESSOR_DEADLINE`,
+which restores the symmetry and outlasts every silence a session survives.
+`migration_wire::tests::a_spike_delayed_generation_zero_is_not_declared_a_broken_chain`
+pins both field magnitudes (3205 ms and 19.9 s): on the old value it fails at
+the gen-0 dispatch with *"a 3205 ms spike delayed a stream's gen-0 behind its
+successor and the chain was declared broken, so the gen-0 was refused even
+though the session's own liveness window had not closed"*; with the value
+mutated back to 1500 ms it fails identically, and with `ORPHAN_TTL =
+DEFAULT_SUCCESSOR_DEADLINE` it passes. The mutation was applied and printed
+(`pub const ORPHAN_TTL: Duration = Duration::from_millis(1500);`,
+one literal occurrence) before the verdict, and the file was restored with
+`touch` and re-verified green.
+
+**Honest negatives.** The receive deadline's **100 ms** margin against the 19.9 s
+silence is the thinnest in the inventory and is left alone: the harness pins
+that magnitude as a pass (`spike_survival_soak`), no longer silence has been
+observed, and raising `RECEIVE_DEADLINE_INTERVALS` is a death-detection trade
+that needs a measurement this revision does not have. The birth and lane-hello
+deadlines (4 s) clear the field's measured maxima by 795 ms but not the 19.9 s
+one-off; both values are owned by `rtp_mux`. The orphan **capacity** bounds
+(`MAX_ORPHAN_STREAMS`/`MAX_ORPHANS_PER_STREAM`, `migration_wire.rs:63,75`) can
+refuse a generation under a spike that produces more than 256 orphan streams
+and mark the id broken the same way; they are a sizing bound rather than a
+deadline and are unchanged here.
+
 ### Frame reordering on a long-lived session (standard tier)
 
 `tests/frame_reorder_soak.rs` asks the one question both soaks above name as
