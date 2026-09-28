@@ -234,6 +234,7 @@ where
             let mut remaining = usize::from(hdr.body_len);
             let mut buf = self.buf_pool.take_scoped();
             buf.reserve(remaining);
+            let mut chunks = 0usize;
             while remaining != 0 {
                 let chunk = self.io_reader.fill_buf().await?;
                 if chunk.is_empty() {
@@ -243,6 +244,20 @@ where
                 buf.extend_from_slice(&chunk[..n]);
                 self.io_reader.consume(n);
                 remaining -= n;
+                chunks += 1;
+            }
+            // A frame small enough to have arrived whole (`< REASSEMBLY_MAX_BODY`)
+            // but consumed across more than one transport segment is a segment
+            // boundary that cut a frame. A frame at the maximum is excluded:
+            // its whole on-wire size equals the 64 KiB per-write capacity of a
+            // byte-stream transport, so it is split by the transport whatever
+            // the writer does. Smaller frames can still be cut when a
+            // transport segment boundary lands mid-frame, so this reading has
+            // a small natural floor; a soak that asserts on it states that
+            // floor beside the count (`mux/GATE.md`, the duplication/partial
+            // soak).
+            if chunks > 1 && usize::from(hdr.body_len) < super::encoder::REASSEMBLY_MAX_BODY {
+                crate::live_probe::note_reassembly_partial_body();
             }
             Ok((hdr.stream_id, hdr.offset, buf))
         } else {

@@ -19,7 +19,7 @@ use crate::{
 /// Maximum body length in a single Data frame when `frame_reassembly` is on.
 /// The total on-wire frame is `Header::SIZE (1) + DataHeaderExt::SIZE (10) +
 /// body`, which must fit within a single 64 KiB transport frame.
-const REASSEMBLY_MAX_BODY: usize = 64 * 1024 - Header::SIZE - DataHeaderExt::SIZE;
+pub(crate) const REASSEMBLY_MAX_BODY: usize = 64 * 1024 - Header::SIZE - DataHeaderExt::SIZE;
 
 pub async fn run_central_io_writer<W>(
     mut io_writer: CentralIoEncoder<W>,

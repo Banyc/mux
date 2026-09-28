@@ -1044,6 +1044,7 @@ static REASSEMBLY_INGESTS: AtomicU64 = AtomicU64::new(0);
 static REASSEMBLY_BUFFERED: AtomicU64 = AtomicU64::new(0);
 static REASSEMBLY_DROPPED_DELIVERED: AtomicU64 = AtomicU64::new(0);
 static REASSEMBLY_DROPPED_BUFFERED: AtomicU64 = AtomicU64::new(0);
+static REASSEMBLY_PARTIAL_BODIES: AtomicU64 = AtomicU64::new(0);
 
 /// A non-empty frame reached `ReorderBuffer::ingest`. The denominator of the
 /// reorder rate, so a soak can show the reorder path was reached at all.
@@ -1072,6 +1073,20 @@ pub(crate) fn note_reassembly_dropped_buffered() {
     REASSEMBLY_DROPPED_BUFFERED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One frame's body was consumed across more than one transport segment, so
+/// the frame-boundary decoder had to reassemble the frame itself before the
+/// `ReorderBuffer` ever saw it. Counted in the reader's body loop, and only
+/// for a frame that fits in a single segment (`body_len < REASSEMBLY_MAX_BODY`):
+/// a frame at the maximum has a whole on-wire size equal to a byte-stream
+/// transport's 64 KiB per-write capacity, so it is split by the transport
+/// however the writer behaves and a reading that counted it could not be
+/// attributed. Smaller frames can still be cut when a segment boundary lands
+/// mid-frame, so this reading has a small natural floor rather than a clean
+/// zero; a soak asserting on it states that floor beside the count.
+pub(crate) fn note_reassembly_partial_body() {
+    REASSEMBLY_PARTIAL_BODIES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Through-flow counters of the reorder buffer: what arrived, what had to be
 /// held, and what arrived too late to be anything but a duplicate. Cumulative,
 /// so a soak differences them across a phase.
@@ -1085,6 +1100,10 @@ pub struct ReorderLedger {
     pub dropped_delivered: u64,
     /// Frames that duplicated a frame already buffered and were dropped.
     pub dropped_buffered: u64,
+    /// Frames whose body arrived across more than one transport segment, and
+    /// whose whole frame fits in one segment. A small natural floor, stated by
+    /// the soak that asserts on it.
+    pub partial_bodies: u64,
 }
 
 impl ReorderLedger {
@@ -1095,6 +1114,7 @@ impl ReorderLedger {
             buffered: self.buffered - earlier.buffered,
             dropped_delivered: self.dropped_delivered - earlier.dropped_delivered,
             dropped_buffered: self.dropped_buffered - earlier.dropped_buffered,
+            partial_bodies: self.partial_bodies - earlier.partial_bodies,
         }
     }
 }
@@ -1103,8 +1123,13 @@ impl std::fmt::Display for ReorderLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reorder: ingests={} buffered_out_of_order={} dropped_late={} dropped_dup_buffered={}",
-            self.ingests, self.buffered, self.dropped_delivered, self.dropped_buffered,
+            "reorder: ingests={} buffered_out_of_order={} dropped_late={} \
+             dropped_dup_buffered={} partial_bodies={}",
+            self.ingests,
+            self.buffered,
+            self.dropped_delivered,
+            self.dropped_buffered,
+            self.partial_bodies,
         )
     }
 }
@@ -1116,6 +1141,7 @@ pub fn reorder_ledger() -> ReorderLedger {
         buffered: REASSEMBLY_BUFFERED.load(Ordering::Relaxed),
         dropped_delivered: REASSEMBLY_DROPPED_DELIVERED.load(Ordering::Relaxed),
         dropped_buffered: REASSEMBLY_DROPPED_BUFFERED.load(Ordering::Relaxed),
+        partial_bodies: REASSEMBLY_PARTIAL_BODIES.load(Ordering::Relaxed),
     }
 }
 

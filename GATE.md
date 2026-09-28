@@ -126,6 +126,9 @@ session_growth_soak::the_release_assertion_rejects_a_retained_structure
 frame_reorder_soak::the_default_schedule_is_the_declared_one
 frame_reorder_soak::the_growth_assertion_rejects_a_grown_census
 frame_reorder_soak::the_release_assertion_rejects_a_retained_structure
+frame_dup_partial_soak::the_default_schedule_is_the_declared_one
+frame_dup_partial_soak::the_growth_assertion_rejects_a_grown_census
+frame_dup_partial_soak::the_release_assertion_rejects_a_retained_structure
 ```
 
 ### Interactive-path liveness under sustained concurrency (standard tier)
@@ -818,6 +821,128 @@ still passed. The stall schedule therefore stops at the field's measured
 maximum (3 205 ms), which leaves a ≥ 16 s margin on both windows, so the stall
 is unambiguously the silence the phase claims.
 
+### Frame duplication while buffered, and partial delivery (standard tier)
+
+`tests/frame_dup_partial_soak.rs` closes the two cells the reordering soak
+records against its own schedule as empty. Its author wrote that
+`dropped_dup_buffered` stayed 0 because its duplicate always lands *after* the
+original's bytes were released, and its transport writes one whole frame per
+`poll_write`, so a frame boundary never lands inside a transport segment (and
+`session_growth_soak` / `spike_survival_soak` cannot disturb delivery at all).
+This soak keeps the one-session, fixed-schedule shape and changes the transport
+instead: it holds a data frame, writes the frames queued behind it first —
+including a **copy of the frame the receiver is still holding**, so that copy is
+dropped *while a gap is outstanding* rather than after release — re-delivers
+frames after the fact, and writes every data frame as **two transport
+segments**, one of them withheld across the field's own spike magnitudes.
+
+Where the disturbance reaches the structure under test, read from inside the
+mux, not from the shim:
+
+- `mux::live_probe::reorder_ledger`'s `dropped_dup_buffered` — the counter the
+  reordering soak records as zero — is asserted non-zero: a frame duplicating
+  one already buffered ahead of the cursor. `dropped_late` (after-release
+  duplicates) and `buffered_out_of_order` are asserted non-zero too.
+- `reorder_ledger`'s `partial_bodies` is a **new instrument**, added with this
+  arm: it is counted in `central_io::reader`'s frame-body loop when a frame's
+  body is consumed across more than one transport segment, and only for a frame
+  that fits in one segment (`body_len < REASSEMBLY_MAX_BODY`), so a split forced
+  by the writer's own per-write capacity cannot make it fire. Zero means no
+  segment boundary ever cut a frame.
+- The shim's own counts — `data_frames`, `reorders`, `overtaken`,
+  `dup_while_held`, `dup_after_release`, `splits`, `gated_splits`, `injected` —
+  are asserted non-zero, and the duplicate-across-close count covers every
+  occurrence of that phase.
+
+Phases, one varying dimension each from the `Echo` baseline (small concurrent
+full echo rounds over the same disturbed transport): `DupWhileBuffered` (a
+multi-frame message whose held frame's own successor is duplicated while it is
+still buffered — asserted on *every* occurrence, not only in the run total),
+`SplitBody` (each direction's frames split across segments), `DupSlowConsumer`
+(the brief's duplication × a slow consumer: the peer accepts and never reads,
+asserted to reach the receiving read queue's bound and to drop a duplicate),
+`SplitTailStall` (a single-frame message whose only frame is split with the
+second half withheld across one of 190 ms / 1063 ms / 3205 ms, so the stream's
+tail stays incomplete for the whole window — the partial × stall combination),
+and `DupAcrossClose` (a finished stream's data frame re-delivered after its
+entry retired, which must not materialise a phantom stream). Every phase is
+followed by a full open/write/echo recovery probe, so a wedge fails where it
+happens.
+
+Assertions: (1) the three disturbance counters above are non-zero, with the shim
+counters behind them, so a run whose disturbance never applied fails rather than
+passing vacuously; (2) every phase's payload is compared byte-exact against a
+freshly generated position-dependent pattern, so a duplicate delivered *into*
+a stream shows as a repeated subsequence; (3) at two matched points (after N and
+10N completed streams, default 50 and 500) `stream_table`, reassembly buffers
+and their pending frames and bytes, `open_read_sinks`, `closed_but_retained`,
+the retired-id window's bound and the egress token tables all read zero, and no
+structure holds more live state later; (4) no receive-deadline window expired
+while the deadline was armed across the run, and the read-queue bound was
+reached on every slow-consumer occurrence; (5) the admission ledger's inserts
+cover the completed streams and both roles retired entries.
+
+Tier: **standard** (`#[ignore]`d, asserting). `MUX_DUP_ROUNDS` and
+`MUX_DUP_CHECKPOINT` size the soak; `MUX_DUP_FAULT` is the red-proof selector:
+`no_hold` removes the reorder hold (`dropped_dup_buffered=0`), `no_duplicate`
+removes both duplicate injections, `no_split` removes the split injection.
+
+Measured cost on the release gate build at load average 4.5/3.2/2.9 and again
+at 12.7/7.1/4.5: **5.18-5.46 s** for the default shape (210 rounds, 316 streams
+opened, 500 completed, 26 stalls, 2 687 s of simulated session time, 43 876
+data frames through the shim). At load average ~22 the same shape measured
+5.22 s and 8.51 s, and one run concurrent with a heavy build measured 49.2 s;
+the load control in that window is `spike_survival_soak` at 4.72 s against its
+recorded 1.20 s, so the spread is the host, not the arm. Counters over that
+shape: mux —
+`ingests=281 032`, `buffered_out_of_order=172 220`, `dropped_late=21 268`,
+`dropped_dup_buffered=43 772`, `partial_bodies=4 079`; shim —
+`data_frames=reorders=43 876`, `overtaken=173 636`, `dup_while_held=43 876`,
+`dup_after_release=21 937`, `splits=260 336`, `gated_splits=26`,
+`injected=26`; timers — `receive_deadline_expiries=0`,
+`read_queue_full=26`, `accept_channel_full=0`. Matched points at 51 and 500
+completed streams both read 0 on every structure (retired window 54 → 526,
+inside its bound). Three further runs of the same shape reproduced these
+counters byte-for-byte.
+
+Vacuity (each probe run on this revision): `MUX_DUP_FAULT=no_duplicate` fails
+naming the cell (`the duplicate-while-buffered phase dropped no frame that was
+still buffered ahead of the cursor (0 in this phase)`); `MUX_DUP_FAULT=no_hold`
+fails the same assertion (nothing is ever buffered); `MUX_DUP_FAULT=no_split`
+fails naming the split counter (`the gated split withheld no second half …
+(0 split frame(s) so far, 8 partial bod(y|ies))`); `retire_if_closed` reduced to
+a no-op (a source mutation, restored with `touch`) fails the `first` checkpoint
+naming the structure and both counts (`stream_table=1 reassembly_buffers=1 …
+closed_but_retained=1`); and the counter call `note_reassembly_partial_body()`
+removed at `src/central_io/reader.rs` (occurrences 1 → 0, mutated line printed)
+fails the split-tail phase naming `0 partial bod(y|ies)`. Three default-tier arms
+keep the assertions from rotting: `the_default_schedule_is_the_declared_one`,
+`the_growth_assertion_rejects_a_grown_census` and
+`the_release_assertion_rejects_a_retained_structure`.
+
+Detection limit and what the soak cannot catch, stated rather than implied: the
+schedule is fixed by the round index, so the rounds are seeded replications of
+one schedule, and a zero-hit run of 210 rounds excludes a per-round defect rate
+above ~1.4e-2 at 95 %. `partial_bodies` is a *reader-side observation* with a
+small natural floor — a duplex whose pipe runs full can cut a frame mid-write
+even when the shim writes it whole; a `no_split` run measured 8 such cuts over
+281 032 ingested frames (3e-5), against 4 079 with the injection on — so the
+attributable assertions are the shim's `splits`/`gated_splits`, and
+`partial_bodies` is corroboration. The soak is transport-free: the impairment is
+its own in-memory shim (netem belongs to `rtp_mux/GATE.md`), it does not cover
+byte-for-byte wire shape, and it does not cover the receive deadline's boundary
+magnitude (that is `spike_survival_soak`). It exercises only the ids the
+**retired-id window still holds**: a duplicate delivered after more than
+`RETIRED_FINISHED_PEER_STREAM_WINDOW` (1024) further peer retirements is beyond
+the window's reach by construction, and this arm does not manufacture it.
+Finally, a segment carrying **more than one whole frame** is not a new cell:
+the reader is a `BufReader` over a byte stream, so coalesced whole frames are
+what it sees whenever the writer is ahead, in every duplex-based soak in this
+crate. There is deliberately no join injection here — injecting one changed the
+shim's pacing enough to suppress the reordering this soak exists to apply (with
+it on, 8 435 of 37 348 frames were held with a follower; with it off, 8 435 of
+8 435).
+
 ## Opt-in manifest
 
 Each line is `target::test_name = tier`. The set must equal the set of
@@ -834,6 +959,7 @@ spike_survival_soak::a_live_session_survives_the_fields_spike_schedule = standar
 session_growth_soak::a_long_lived_session_releases_every_per_stream_structure = standard
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap = standard
 frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering = standard
+frame_dup_partial_soak::a_long_lived_session_survives_duplicated_and_partial_frames = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -854,6 +980,10 @@ frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering
 frame_reorder_soak::the_default_schedule_is_the_declared_one
 frame_reorder_soak::the_growth_assertion_rejects_a_grown_census
 frame_reorder_soak::the_release_assertion_rejects_a_retained_structure
+frame_dup_partial_soak::a_long_lived_session_survives_duplicated_and_partial_frames
+frame_dup_partial_soak::the_default_schedule_is_the_declared_one
+frame_dup_partial_soak::the_growth_assertion_rejects_a_grown_census
+frame_dup_partial_soak::the_release_assertion_rejects_a_retained_structure
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 ```
@@ -868,9 +998,9 @@ perf tier reaches. mux has no `perf` scenario, so this block is empty.
 ```gate-perf-guard-helpers
 ```
 
-## The env-scaled opt-in surface: `MUX_FAMILY_*`, `MUX_SOAK_*`, `MUX_EGRESS_SOAK_ROUNDS`, `MUX_SPIKE_*` and `MUX_GROWTH_*`
+## The env-scaled opt-in surface: `MUX_FAMILY_*`, `MUX_SOAK_*`, `MUX_EGRESS_SOAK_ROUNDS`, `MUX_SPIKE_*`, `MUX_GROWTH_*` and `MUX_DUP_*`
 
-The five `standard`-tier liveness arms above are `#[ignore]`d, but their load
+The `standard`-tier liveness arms above are `#[ignore]`d, but their load
 shape is not fixed by the ignore set: `tests/interactive_liveness_families.rs`
 and `tests/interactive_liveness_soak.rs` read it from the process environment,
 so the same green arm judges a few hundred cycles or a few hundred thousand.
@@ -1007,6 +1137,7 @@ egress-component-soak = MUX_EGRESS_SOAK_ROUNDS | - | the egress fair-queue/sched
 spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-session spike soak sized by MUX_SPIKE_ROUNDS, with MUX_SPIKE_FAULT=no_stall the red-proof mode that disables the gate's hold: one session held open across a fixed schedule of delivery stalls (190 ms / 1063 ms / 3205 ms / 19.9 s) with the receive-deadline ledger asserted, so a spike costs time and the session survives, and the default-tier detector arm proves the deadline still fires past its window | liveness@shape=long-lived-session+metric=per-job-completion, timer-ledger@metric=receive-deadline+state=armed-not-expired, stall-detection@fault=no-stall-gate, stall-detection@control=deadline-crossed-tears-down | MUX_SPIKE_ROUNDS=120,total=MUX_SPIKE_ROUNDS,wall=1.20s,bound=2.5e-2/cycle
 growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the long-lived-session churn/retention soak sized by MUX_GROWTH_ROUNDS with its matched points placed by MUX_GROWTH_CHECKPOINT, and MUX_GROWTH_FAULT the red-proof selector (leak_stream leaks a peer half per round, no_stall disables the stall phase's hold): a frame_reassembly-on session driven through a fixed eight-round phase schedule (concurrent echo, a peer that stops reading, streams dropped mid-transfer with the client's halves closed first, a closed-without-reading burst with alternating close order, and a 1063 ms delivery stall) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow and that the egress token table drains; the second arm opens one more concurrent stream than the former egress token-table cap and asserts every open completes and every token is reaped | growth@metric=per-stream-structure-live-count+points=matched, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=churn+metric=per-round-recovery-probe, liveness@shape=slow-consumer+metric=recovery, liveness@shape=dropped-mid-transfer+metric=recovery, liveness@shape=closed-without-reading+metric=recovery, liveness@shape=stall+metric=recovery, admission@metric=concurrent-streams-vs-egress-token-cap, staleness@fault=leak-stream-and-no-stall | MUX_GROWTH_CHECKPOINT=200,MUX_GROWTH_ROUNDS=667,total=MUX_GROWTH_ROUNDS,wall=3.39s,bound=4.5e-3/round
 reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - | the long-lived-session frame-reordering soak sized by MUX_REORDER_ROUNDS with its matched points placed by MUX_REORDER_CHECKPOINT, and MUX_REORDER_FAULT the red-proof selector (no_reorder delivers every frame in sent order, never_release strands a held data frame, no_duplicate never re-delivers one): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame and write the frames queued behind it first and re-deliver one data frame in three a frame later (concurrent echo rounds, a multi-frame bidirectional message, a peer that accepts and stops reading until the read queue's bound is reached, streams dropped mid-transfer, a closed-without-reading burst, a CloseWrite overtaking in-flight data, and a delivery stall at the field's 190 ms/1063 ms/3205 ms magnitudes applied while frames are reordered in flight) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that the mux's own ReorderBuffer held out-of-order frames and dropped after-release ones idempotently, that every reordered burst delivered byte-exact in stream order, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, reorder@metric=frames-buffered-out-of-order+source=mux-internal-ingest-counter, ordering@metric=byte-exact-in-stream-order+impairment=frame-reorder, idempotence@metric=frame-dropped-after-release, liveness@shape=reorder-across-close+metric=CloseWrite-overtake, liveness@shape=reorder-plus-stall+metric=receive-deadline-armed-not-expired, liveness@shape=slow-consumer-x-reorder+metric=read-queue-bound-reached, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-reorder-never-release-and-no-duplicate | MUX_REORDER_CHECKPOINT=200,MUX_REORDER_ROUNDS=841,total=MUX_REORDER_ROUNDS,wall=7.47s,bound=3.6e-3/round
+dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the long-lived-session frame-duplication and partial-delivery soak sized by MUX_DUP_ROUNDS with its matched points placed by MUX_DUP_CHECKPOINT, and MUX_DUP_FAULT the red-proof selector (no_hold removes the reorder hold, no_duplicate removes both duplicate injections, no_split removes the split injection): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame, write the frames queued behind it first and re-deliver a copy of the frame the receiver is still holding, re-deliver frames after release, and write every data frame as two transport segments (one of them withheld across the field's 190 ms/1063 ms/3205 ms spike) (concurrent echo rounds, a multi-frame bidirectional message whose held frame's successor is duplicated while buffered, a peer that accepts and stops reading, a tail frame split across a spike, and a finished stream's data frame re-delivered after its entry retired) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that duplicates were dropped both while buffered and after release and never delivered into the stream, that a frame body really was consumed across more than one segment, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, duplication@metric=frame-dropped-while-buffered+source=mux-internal-ingest-counter, duplication@metric=frame-dropped-after-release, ordering@metric=byte-exact-in-stream-order+impairment=frame-split-and-duplicate, partial-delivery@metric=frame-body-across-multiple-segments+source=reader-body-loop-counter, resurrection@metric=stream-materialised-from-duplicate-after-close+state=refused, liveness@shape=duplication-x-slow-consumer+metric=read-queue-bound-reached, liveness@shape=partial-x-spike+metric=receive-deadline-armed-not-expired, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-hold-no-duplicate-and-no-split | MUX_DUP_CHECKPOINT=50,MUX_DUP_ROUNDS=210,total=MUX_DUP_ROUNDS,wall=5.18s,bound=1.4e-2/round
 ```
 
 ## Opt-in targets outside this manifest
