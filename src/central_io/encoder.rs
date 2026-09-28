@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     io::{self, IoSlice},
+    task::Poll,
     time::Duration,
 };
 
@@ -40,7 +42,7 @@ where
             res = control.recv() => {
                 let msg = res.map_err(RunCentralIoWriterError::Control)?;
                 crate::live_probe::note_egress_frame(crate::live_probe::EgressFrameKind::Control);
-                let written = io_writer.send_control(msg).await;
+                let written = write_answering_opens::<_>(io_writer.send_control(msg), &mut data).await;
                 crate::live_probe::note_egress_frame_done();
                 written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
@@ -51,17 +53,54 @@ where
                     _ => crate::live_probe::EgressFrameKind::Data,
                 };
                 crate::live_probe::note_egress_frame(kind);
-                let written = io_writer.send_data(msg).await;
+                let written = write_answering_opens::<_>(io_writer.send_data(msg), &mut data).await;
                 crate::live_probe::note_egress_frame_done();
                 written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
             () = tokio::time::sleep(heartbeat_interval + heartbeat_jitter(heartbeat_interval)) => {
                 crate::live_probe::note_egress_frame(crate::live_probe::EgressFrameKind::Control);
-                let written = io_writer.send_heartbeat().await;
+                let written = write_answering_opens::<_>(io_writer.send_heartbeat(), &mut data).await;
                 crate::live_probe::note_egress_frame_done();
                 written.map_err(RunCentralIoWriterError::IoWriter)?;
             }
         }
+    }
+}
+
+/// Complete one transport write while continuing to answer pending egress-open
+/// requests.
+///
+/// `MuxControl::open` acquires the egress fair-queue token and *then* inserts
+/// its stream-table entry, so a refused open leaves no entry behind. That token
+/// is minted by the consumer task draining this receiver, so if the drain runs
+/// only when a write returns, an ingress frame that introduces a stream — and
+/// every frame queued behind it in the control loop — waits for the write's
+/// whole duration. Measured on a paused clock with a 190 ms/1063 ms/3205 ms
+/// transport write: a peer open paid the full write, and a data frame on an
+/// *established* stream queued behind that blocked open for the same duration.
+///
+/// This keeps the admission order exactly as it was — the caller still waits
+/// for the token before it inserts — and removes only the dependence of that
+/// wait on the transport. The opener channel registers its waker in this task,
+/// so an arriving request wakes the write's own `select` and the drain runs
+/// before the write resumes.
+async fn write_answering_opens<F>(write: F, data: &mut WriteDataRx) -> io::Result<()>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let mut write = std::pin::pin!(write);
+    // A drain that never completes: it is polled on every wakeup of this task
+    // (an arriving open request is one), does its work, and yields back to the
+    // write rather than cancelling it.
+    let answering = std::future::poll_fn(|cx| {
+        data.poll_openers(cx);
+        Poll::<()>::Pending
+    });
+    let mut answering = std::pin::pin!(answering);
+    tokio::select! {
+        biased;
+        res = &mut write => res,
+        () = &mut answering => unreachable!("the opener drain never completes"),
     }
 }
 
@@ -1084,5 +1123,157 @@ mod tests {
             &body[..],
             "the body the writer received is not the caller's payload bytes"
         );
+    }
+
+    /// A transport write that has not returned must not hold up an open.
+    ///
+    /// `MuxControl::open` acquires the egress token and *then* inserts its
+    /// stream-table entry, so the answer to an open request is what the whole
+    /// ingress path waits on: the peer's new stream and every frame queued
+    /// behind it in the control loop. That answer is minted by the task draining
+    /// this receiver, so a consumer that drains only between writes parks the
+    /// ingress for one transport write's whole duration.
+    ///
+    /// The writer here parks inside `poll_write` and is released by the test, so
+    /// the assertion is a *state* rather than a timing: the open resolves while
+    /// the write has provably not returned. Vacuity: removing the `answering`
+    /// branch's drain in `write_answering_opens` makes this test fail on the
+    /// timeout below (`an open was not answered while the transport write was in
+    /// flight`).
+    #[tokio::test]
+    async fn an_open_is_answered_while_a_transport_write_is_in_flight() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use super::run_central_io_writer;
+        use crate::central_io::scheduler::{write_control_channel, write_data_channel};
+
+        /// The first transport write parks until the test releases it.
+        #[derive(Default)]
+        struct Gate {
+            entered: AtomicUsize,
+            released: AtomicBool,
+            completed: AtomicUsize,
+            waker: Mutex<Option<std::task::Waker>>,
+        }
+        impl Gate {
+            fn release(&self) {
+                self.released.store(true, Ordering::SeqCst);
+                let waker = self.waker.lock().unwrap().take();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+        }
+        struct ParkedWrite {
+            gate: Arc<Gate>,
+        }
+        impl AsyncWrite for ParkedWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = self.get_mut();
+                // Park *until released*, however many times the write is
+                // re-polled: an arriving open wakes this task, and a park that
+                // released on the second poll would let the write finish at the
+                // very moment the open is answered, proving nothing.
+                this.gate.entered.fetch_add(1, Ordering::SeqCst);
+                if !this.gate.released.load(Ordering::SeqCst) {
+                    *this.gate.waker.lock().unwrap() = Some(cx.waker().clone());
+                    if !this.gate.released.load(Ordering::SeqCst) {
+                        return Poll::Pending;
+                    }
+                }
+                this.gate.completed.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn is_write_vectored(&self) -> bool {
+                false
+            }
+        }
+
+        let (control_tx, control_rx) = write_control_channel();
+        let (factory, data_rx) = write_data_channel();
+        let gate = Arc::new(Gate::default());
+        let mut writer_tasks = tokio::task::JoinSet::new();
+        writer_tasks.spawn(run_central_io_writer(
+            CentralIoEncoder::new(
+                ParkedWrite {
+                    gate: Arc::clone(&gate),
+                },
+                false,
+            ),
+            Duration::from_secs(3_600),
+            control_rx,
+            data_rx,
+        ));
+
+        // Put the writer inside a transport write: `CloseRead` is one control
+        // frame, i.e. one `poll_write`.
+        control_tx
+            .send(WriteControlMsg::CloseRead(7))
+            .await
+            .expect("control channel");
+        for _ in 0..1_024 {
+            if gate.entered.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            gate.entered.load(Ordering::SeqCst) >= 1,
+            "the transport write never entered poll_write, so this run would measure an open \
+             with nothing in flight"
+        );
+        assert!(
+            writer_tasks.try_join_next().is_none(),
+            "the writer task returned before the write parked"
+        );
+
+        // The property: the open resolves *while* the write is still parked.
+        // The timeout is the oracle for a writer that answers only between
+        // writes, where nothing ever answers and the read side would park
+        // forever.
+        let opened = tokio::time::timeout(Duration::from_secs(5), factory.for_stream(11, true))
+            .await
+            .expect(
+                "an open was not answered while the transport write was in flight: the egress \
+                 writer answers the token an open waits on only between writes, so the ingress \
+                 path is parked for the write's whole duration",
+            )
+            .expect("the open request was refused");
+        assert_eq!(
+            gate.completed.load(Ordering::SeqCst),
+            0,
+            "the transport write completed before the open was answered, so this run does not \
+             show the open resolving behind a write in flight"
+        );
+        assert!(
+            writer_tasks.try_join_next().is_none(),
+            "the writer task returned before the open was answered"
+        );
+        drop(opened);
+
+        // Release and let the parked write finish, so the run is not left with
+        // an aborted task holding the verdict.
+        gate.release();
+        for _ in 0..1_024 {
+            if gate.completed.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            gate.completed.load(Ordering::SeqCst) >= 1,
+            "the released transport write never completed"
+        );
+        writer_tasks.abort_all();
     }
 }

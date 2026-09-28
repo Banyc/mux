@@ -329,32 +329,31 @@ impl<T> Receiver<T> {
                 .count(),
         }
     }
-    /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`
-    /// returns true. Open handling is identical to `poll_recv`. If every ready
-    /// token is excluded, returns `Poll::Pending` rather than yielding a
-    /// message from an excluded stream.
-    pub fn poll_recv_excluding<E>(
+    /// Answer the opener channel's pending requests and return the first the
+    /// table admitted, or `None` once the channel has no request left to
+    /// answer.
+    ///
+    /// Sole authority for announcing an open. It is polled from the ordinary
+    /// receive path (`poll_recv_excluding` above) and directly by the egress
+    /// writer while a transport write is in flight, which is the whole point:
+    /// the token a caller is waiting on is minted here, so an answer deferred
+    /// until the write returns parks the *caller* — the ingress path's
+    /// `MuxControl::open`, which acquires this token before it inserts its
+    /// stream-table entry — for the write's duration.
+    ///
+    /// The channel is drained whether or not the table has room. A full table
+    /// stops *admitting*, not *answering*: an unanswered request is a caller
+    /// parked on a decision no task will make, and the opener channel itself
+    /// would fill behind it and turn every later open into the same wait one
+    /// queue deeper. Refusing keeps the request queue draining, so the full
+    /// condition reaches the caller as `OpenError::TableFull`.
+    pub(crate) fn poll_openers(
         &mut self,
         cx: &mut Context<'_>,
-        excluded: E,
-    ) -> Poll<Option<(QueueToken, ReceiverRecv<T>)>>
-    where
-        E: FnMut(QueueToken) -> bool,
-    {
-        let mut excluded = excluded;
-        // Arm the ready set before reading it: a mark added after this point
-        // either appears in the scan below or wakes this task to re-scan.
-        self.ready.lock().unwrap().register(cx.waker());
-        // The opener channel is polled on every pass, whether or not the table
-        // has room. A full table stops *admitting*, not *answering*: an
-        // unanswered request is a caller parked on a decision no task will
-        // make, and the opener channel itself would fill behind it and turn
-        // every later open into the same wait one queue deeper. Refusing keeps
-        // the request queue draining, so the full condition reaches the caller
-        // as `OpenError::TableFull`.
+    ) -> Option<(QueueToken, ReceiverRecv<T>)> {
         loop {
             match self.opener.poll_recv(cx) {
-                Poll::Ready(None) => break,
+                Poll::Ready(None) | Poll::Pending => return None,
                 Poll::Ready(Some(open_req)) => {
                     if self.queues.len() >= self.max_queues {
                         let _ = open_req.resp.send(None);
@@ -378,10 +377,29 @@ impl<T> Receiver<T> {
                         continue;
                     }
                     self.queues.insert(new_token, rx);
-                    return Some((new_token, ReceiverRecv::Open(open_req.opening_value))).into();
+                    return Some((new_token, ReceiverRecv::Open(open_req.opening_value)));
                 }
-                Poll::Pending => break,
             }
+        }
+    }
+    /// Like `poll_recv`, but skips ready tokens for which `excluded(token)`
+    /// returns true. Open handling is identical to `poll_recv`. If every ready
+    /// token is excluded, returns `Poll::Pending` rather than yielding a
+    /// message from an excluded stream.
+    pub fn poll_recv_excluding<E>(
+        &mut self,
+        cx: &mut Context<'_>,
+        excluded: E,
+    ) -> Poll<Option<(QueueToken, ReceiverRecv<T>)>>
+    where
+        E: FnMut(QueueToken) -> bool,
+    {
+        let mut excluded = excluded;
+        // Arm the ready set before reading it: a mark added after this point
+        // either appears in the scan below or wakes this task to re-scan.
+        self.ready.lock().unwrap().register(cx.waker());
+        if let Some(open) = self.poll_openers(cx) {
+            return Poll::Ready(Some(open));
         }
         let scan_start = self.recv_queue_start;
         let mut wrapped = false;

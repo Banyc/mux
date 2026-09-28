@@ -130,6 +130,52 @@ impl WriteDataRx {
         }
         WriteDataRecv(self).await
     }
+    /// Answer the egress open requests that are pending, with no dispatch and
+    /// no dependency on the transport.
+    ///
+    /// The egress writer races this against a transport write that is in
+    /// flight. `MuxControl::open` awaits the token this answers *before* it
+    /// inserts its stream-table entry (so a refused open leaves no entry
+    /// behind), and this consumer is the only task that mints that token — so
+    /// an answer deferred until the write returns parks the whole ingress path,
+    /// the peer's new stream and every frame queued behind it in the control
+    /// loop, for the write's duration.
+    pub(crate) fn poll_openers(&mut self, cx: &mut Context<'_>) {
+        let now = Instant::now();
+        while let Some((token, msg)) = self.rx.poll_openers(cx) {
+            match msg {
+                fair_queue::ReceiverRecv::Open(value) => self.install_open_head(token, value, now),
+                fair_queue::ReceiverRecv::Value(_) | fair_queue::ReceiverRecv::Close => {
+                    unreachable!("the opener drain yields only an admitted open")
+                }
+            }
+        }
+    }
+    /// Install an admitted open as a cached head, with the per-token
+    /// bookkeeping the egress consumer owns. One authority for both the
+    /// ordinary receive path and [`Self::poll_openers`].
+    fn install_open_head(
+        &mut self,
+        token: fair_queue::QueueToken,
+        value: WriteDataMsg,
+        now: Instant,
+    ) {
+        self.token_to_stream.insert(token, value.stream_id);
+        self.token_owner.insert(
+            token,
+            matches!(value.data, StreamWriteData::Open { wire: true }),
+        );
+        self.latency.open(token, now);
+        let is_owner = self.token_owner.get(&token).copied().unwrap_or(false);
+        self.heads.insert(
+            token,
+            HeadEntry {
+                msg: value,
+                offset: 0,
+                is_owner,
+            },
+        );
+    }
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<WriteDataMsg, DeadControl>> {
         // Drain ready streams into `heads`, caching at most one message per
         // token. `poll_recv_excluding` skips tokens that already have a cached
@@ -146,13 +192,8 @@ impl WriteDataRx {
                 Poll::Ready(Some((token, msg))) => {
                     let msg = match msg {
                         fair_queue::ReceiverRecv::Open(value) => {
-                            self.token_to_stream.insert(token, value.stream_id);
-                            self.token_owner.insert(
-                                token,
-                                matches!(value.data, StreamWriteData::Open { wire: true }),
-                            );
-                            self.latency.open(token, now);
-                            value
+                            self.install_open_head(token, value, now);
+                            continue;
                         }
                         fair_queue::ReceiverRecv::Value(value) => value,
                         fair_queue::ReceiverRecv::Close => {

@@ -429,12 +429,15 @@ write the ingress path does not advance, and a new peer stream's frames queue
 behind it for the duration of one egress write. That is bounded by a transport
 write and affects stream *opening*, not steady-state per-message delivery, so
 it is not the residual this arm measures — but it is the one mux-owned coupling
-that can turn a transport stall into ingress delay, and it is recorded here as
-a **hypothesis with its call chain**, not as a measured defect, because this
-arm's shim never blocks a write. The fence is deliberate: `MuxControl::open`
-acquires the egress token *before* inserting the table entry so a full token
-table cannot consume an admission slot, so decoupling the two trades that
-invariant — a fix belongs with the invariant, not around it.
+that can turn a transport stall into ingress delay. It **was** recorded here as
+a hypothesis with its call chain, with the fence that decoupling `open` from the
+token would trade the admission invariant (`MuxControl::open` acquires the egress
+token *before* inserting the table entry so a full token table cannot consume an
+admission slot). It is now **measured and fixed** on that invariant, in the
+`egress_write_ingress_coupling` section below: the coupled build paid the whole
+write, and for a data frame on an *established* stream queued behind one blocked
+peer open as well; the fix answers the token while the write is in flight and
+leaves the acquire-then-insert order untouched.
 
 Coverage cells provided: withheld-delivery amplification on the receive path
 over an impairing frame transport, in both wire modes; the reorder-buffer gap
@@ -454,6 +457,110 @@ more than 1 023 queued messages on one flow and its outcome is a refusal, which
 an egress *write* blocked mid-frame (the coupling named above); and wall-clock
 cost (a paused clock measures task-scheduling cost, which is exactly zero, and
 says nothing about a loaded host).
+
+### An ingress event does not wait behind an egress transport write (standard tier)
+
+`MuxControl::open` acquires the egress fair-queue token and only then inserts its
+stream-table entry, so a refused open leaves no entry behind. The token is minted
+by the task that drains the egress receiver, and the ingress path reaches `open`
+through `handle_central_read` -> `accept_peer_stream` -> `open_stream` — so if that
+drain runs only when a transport write returns, the whole control loop parks
+behind the write: the peer's new stream, and every frame queued behind it.
+
+`tests/egress_write_ingress_coupling.rs` measures it on a paused clock, over a
+transport whose client-side write half parks inside `poll_write` for `D` and
+stamps that write's begin and end in simulated time itself. The stall is keyed on
+the trigger payload, so a heartbeat or any other frame passes through and cannot
+consume the arm. Four shapes, one varying dimension from the `SteadyOpen`
+baseline:
+
+- `SteadyOpen` — no write stalled; a peer open is the ingress event.
+- `OpenUnderStall` — the **write duration** varies (`D` = 190 ms / 1063 ms / 3205 ms).
+- `DataUnderStallNoOpen` — the isolating control: the write stalls and a data
+  frame on an *established* stream arrives with no stream introduced.
+  `accept_peer_stream` returns before it reaches the egress, so this frame must be
+  delivered while the writer is parked. It separates the blocking `open` from the
+  write itself.
+- `DataUnderStallWithOpen` — the same data frame, but a peer open is introduced
+  first, so the control loop is inside `accept_peer_stream` when the frame arrives.
+
+The assertion is a **state**, not a latency bound: every ingress event must be
+serviced while the stalled write is *still in flight*, and with the clock still at
+the write's begin. Per-round sanity: the transport entered exactly the one write
+the round armed, that write was in flight both when the event was issued and when
+it was answered, the transport's recorded begin equals the issue instant, and the
+run's whole elapsed simulated time equals the sum of the stalls the arm itself
+armed — so a timer firing outside the arm is a failure rather than an unexplained
+reading.
+
+**The defect this measured and closed, with what it cost before.** On the coupled
+build (12 rounds per shape): a peer open issued during a 190 ms / 1063 ms / 3205 ms
+transport write was accepted after **exactly that duration** (`OpenUnderStall`
+open waits min 190 ms, max **3.205 s**), and a data frame on an *established*
+stream, queued behind one blocked peer open, paid the same
+(`DataUnderStallWithOpen` data waits min 190 ms, max **3.205 s**) — while the
+no-open control paid **0 ns**. The cost was therefore not the open alone: one peer
+open arriving during an egress write stalled **all ingress** for the session, and
+on the operator's single long-lived multiplexed session new streams are opened
+constantly.
+
+The fix is `write_answering_opens` in `src/central_io/encoder.rs`: the egress
+writer polls the opener drain while a transport write is in flight. The drain is
+`fair_queue::Receiver::poll_openers`, extracted from `poll_recv_excluding` so
+there is exactly one authority for announcing an open (both the ordinary receive
+path and this one install the opened head through the same
+`WriteDataRx::install_open_head`). The admission order is untouched — the caller
+still waits for the token before it inserts, which is what leaves no entry behind
+on a refusal — and only the *dependence of that wait on the transport* is removed.
+The opener channel registers its waker in the writer task, so an arriving request
+wakes the write's own `select` and the drain runs before the write resumes. On the
+same command after the fix: **0 ns on all four shapes, 90 of 90 stalled rounds
+serviced in flight**.
+
+Tier: **standard** (`#[ignore]`d, asserting). Measured cost on the release gate
+build: **0.11 s** for 30 rounds per shape (three runs, `finished in 0.11s`; 90
+stalls, 133.74 s of simulated session time). `MUX_EGRESS_STALL_ROUNDS` sizes each
+shape. The heartbeat is deliberately set an hour out: the writer re-creates its
+heartbeat sleep on every dispatched frame, so a production cadence puts its own
+sleeps on the paused clock, and the heartbeat and receive-deadline cells belong to
+`spike_survival_soak`.
+
+Vacuity. With the drain removed (`data.poll_openers(cx)` deleted from the
+`answering` branch, occurrences 1 -> 0, mutated line printed, restored with
+`touch` and verified byte-identical to the backup) the arm fails naming the
+observed value: `OpenUnderStall round 0: a peer open was not serviced until the
+190ms transport write had returned - the ingress path is gated by the egress write
+(observed wait 190ms)`. The same build's always-run structural pin,
+`central_io::encoder::tests::an_open_is_answered_while_a_transport_write_is_in_flight`
+(default tier: a writer that parks in `poll_write` until released, then the same
+`for_stream` request), fails under the same mutation on its timeout (`an open was
+not answered while the transport write was in flight`). Both are re-run green
+with the drain restored.
+
+Detection limit, stated rather than implied: the causal chain is the same every
+round; what varies is the scheduler interleaving, so the rounds sample
+interleavings rather than being independent draws of one schedule, and the
+rule-of-three bound at 30 rounds is a formal exclusion of an
+interleaving-dependent per-round defect rate above ~0.1, not a rate estimate.
+
+Coverage cells provided: the ingress/egress coupling at the field's own write
+durations on the deployed interactive shape (a peer open under an in-flight
+write); the amplification to a data frame on an *established* stream queued behind
+a blocked peer open; the isolating control (the same frame with no stream
+introduced); the zero-cost baseline; the paused-clock attribution ledger; and the
+admission order's preservation, which the existing refused-open arms still pin
+(`control::request_path_capacity_tests::an_egress_token_table_full_refuses_the_open_instead_of_waiting`
+asserts no entry is left behind). Cells deliberately **not** covered, with the
+reason for each empty cell: a real transport — the stall is the arm's own `Sleep`
+on an in-memory `duplex`, so the arm establishes *which task must run* for the
+token to be minted and not that a socket write blocks for `D`, and `duplex`'s
+shared per-direction buffer adds a reverse back-pressure a socket pair would not
+(the mux layer's own answer is from the code: the writer awaits only its producer
+channels and the transport, so it never waits on the ingress task's progress); the
+heartbeat and receive deadline (an hour out on purpose — `spike_survival_soak`);
+impairment other than the write stall; and a *queue* of several opens behind one
+write (the arm issues one per round, so it shows the drain's entrance, not its
+throughput).
 
 ### The egress ready mark carries its wake (structural, default tier)
 
@@ -1084,6 +1191,7 @@ session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_eg
 frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering = standard
 frame_dup_partial_soak::a_long_lived_session_survives_duplicated_and_partial_frames = standard
 receive_stall_soak::a_withheld_delivery_costs_the_withhold_and_nothing_else = standard
+egress_write_ingress_coupling::an_ingress_event_does_not_wait_behind_an_egress_transport_write = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -1111,6 +1219,7 @@ frame_dup_partial_soak::the_release_assertion_rejects_a_retained_structure
 receive_stall_soak::a_withheld_delivery_costs_the_withhold_and_nothing_else
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
+egress_write_ingress_coupling::an_ingress_event_does_not_wait_behind_an_egress_transport_write
 ```
 
 ## Perf-tier reach into asserting helpers
@@ -1275,6 +1384,7 @@ growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the
 reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - | the long-lived-session frame-reordering soak sized by MUX_REORDER_ROUNDS with its matched points placed by MUX_REORDER_CHECKPOINT, and MUX_REORDER_FAULT the red-proof selector (no_reorder delivers every frame in sent order, never_release strands a held data frame, no_duplicate never re-delivers one): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame and write the frames queued behind it first and re-deliver one data frame in three a frame later (concurrent echo rounds, a multi-frame bidirectional message, a peer that accepts and stops reading until the read queue's bound is reached, streams dropped mid-transfer, a closed-without-reading burst, a CloseWrite overtaking in-flight data, and a delivery stall at the field's 190 ms/1063 ms/3205 ms magnitudes applied while frames are reordered in flight) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that the mux's own ReorderBuffer held out-of-order frames and dropped after-release ones idempotently, that every reordered burst delivered byte-exact in stream order, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, reorder@metric=frames-buffered-out-of-order+source=mux-internal-ingest-counter, ordering@metric=byte-exact-in-stream-order+impairment=frame-reorder, idempotence@metric=frame-dropped-after-release, liveness@shape=reorder-across-close+metric=CloseWrite-overtake, liveness@shape=reorder-plus-stall+metric=receive-deadline-armed-not-expired, liveness@shape=slow-consumer-x-reorder+metric=read-queue-bound-reached, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-reorder-never-release-and-no-duplicate | MUX_REORDER_CHECKPOINT=200,MUX_REORDER_ROUNDS=841,total=MUX_REORDER_ROUNDS,wall=7.47s,bound=3.6e-3/round
 dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the long-lived-session frame-duplication and partial-delivery soak sized by MUX_DUP_ROUNDS with its matched points placed by MUX_DUP_CHECKPOINT, and MUX_DUP_FAULT the red-proof selector (no_hold removes the reorder hold, no_duplicate removes both duplicate injections, no_split removes the split injection): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame, write the frames queued behind it first and re-deliver a copy of the frame the receiver is still holding, re-deliver frames after release, and write every data frame as two transport segments (one of them withheld across the field's 190 ms/1063 ms/3205 ms spike) (concurrent echo rounds, a multi-frame bidirectional message whose held frame's successor is duplicated while buffered, a peer that accepts and stops reading, a tail frame split across a spike, and a finished stream's data frame re-delivered after its entry retired) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that duplicates were dropped both while buffered and after release and never delivered into the stream, that a frame body really was consumed across more than one segment, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, duplication@metric=frame-dropped-while-buffered+source=mux-internal-ingest-counter, duplication@metric=frame-dropped-after-release, ordering@metric=byte-exact-in-stream-order+impairment=frame-split-and-duplicate, partial-delivery@metric=frame-body-across-multiple-segments+source=reader-body-loop-counter, resurrection@metric=stream-materialised-from-duplicate-after-close+state=refused, liveness@shape=duplication-x-slow-consumer+metric=read-queue-bound-reached, liveness@shape=partial-x-spike+metric=receive-deadline-armed-not-expired, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-hold-no-duplicate-and-no-split | MUX_DUP_CHECKPOINT=50,MUX_DUP_ROUNDS=210,total=MUX_DUP_ROUNDS,wall=5.18s,bound=1.4e-2/round
 receive-stall-soak = MUX_RECEIVE_STALL_ROUNDS,MUX_RECEIVE_STALL_FAULT | - | the paused-clock withheld-delivery soak sized by MUX_RECEIVE_STALL_ROUNDS, with MUX_RECEIVE_STALL_FAULT the red-proof selector (no_withhold makes the transport ignore the arm, arrival_gated releases a held frame only on the same flow's next arrival, short_release releases it after half the interval): four concurrent flows on four long-lived streams over a frame-level withholding transport across four phases (the deployed interactive-lane baseline, a multi-frame message whose withheld frame leaves the reorder buffer holding a gap, the stock wire where the withheld frame heads a byte stream, and a zero-impairment control), asserting on every round that an unobstructed flow is delivered with the paused clock untouched, that the withheld flow's message arrives no earlier than its withhold and no later than it plus one millisecond, that no session tears down, and that the frames the transport withheld equal the count the phase's schedule names | attribution@candidate=receive-path+metric=excess-over-withhold, attribution@candidate=reorder-buffer+impairment=multi-frame-withhold, ordering@metric=per-flow-message-order, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, stall-detection@fault=arrival-gated-release, stall-detection@fault=no-withhold, anti-vacuity@metric=withhold-landed-lower-bound+control=short-release | MUX_RECEIVE_STALL_ROUNDS=200,total=2*MUX_RECEIVE_STALL_ROUNDS+140,wall=0.03s,bound=5.6e-3/round
+egress-ingress-coupling = MUX_EGRESS_STALL_ROUNDS | - | the paused-clock egress-write/ingress-coupling arm sized by MUX_EGRESS_STALL_ROUNDS, with no red-proof selector (its vacuity is a documented source mutation of the drain it guards): the client's transport write half parks in poll_write for the field's 190 ms/1063 ms/3205 ms and stamps that write's simulated begin and end itself, and across four shapes (a steady-state peer-open baseline with no write stalled, the peer open under a stalled write, a data frame on an established stream with no stream introduced as the isolating control, and the same data frame queued behind a peer open that is still blocked) every ingress event must be serviced while the stalled write is still in flight and with the clock still at the write's begin, with the transport having entered exactly the one armed write, the run's elapsed simulated time equal to the stalls the arm itself armed | coupling@metric=ingress-event-serviced-while-egress-write-in-flight+shape=peer-open, amplification@metric=data-frame-behind-blocked-peer-open+shape=established-stream, attribution@control=no-stream-introduced+metric=data-frame-serviced-while-writer-parked, baseline@metric=steady-state-open-cost, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, admission@invariant=token-before-table-insert+state=preserved | MUX_EGRESS_STALL_ROUNDS=30,total=4*MUX_EGRESS_STALL_ROUNDS,wall=0.11s,bound=0.1/round
 ```
 
 ## Opt-in targets outside this manifest
