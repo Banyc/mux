@@ -75,7 +75,20 @@ pub const MAX_SPLICE_STREAMS: usize = 256;
 pub const MAX_ORPHAN_STREAMS: usize = MAX_SPLICE_STREAMS;
 
 /// Time-to-live for orphan entries in the registry.
-pub const ORPHAN_TTL: Duration = Duration::from_millis(1500);
+///
+/// An orphan is a successor generation held until its generation 0 arrives.
+/// That is the same inter-generation boundary a [`SplicedReader`] waits
+/// across in the other direction ([`DEFAULT_SUCCESSOR_DEADLINE`]), so both
+/// ends of the boundary must use the same window: expiring an orphan marks
+/// the logical id broken and refuses its gen-0, so a window shorter than the
+/// reader's own successor deadline declares a gap before the reader on the
+/// far side of it would. It must also outlast the session's own liveness
+/// window — the sliding receive deadline,
+/// `RECEIVE_DEADLINE_INTERVALS * heartbeat_interval` = 20 s at the production
+/// 5 s heartbeat — or a live session would break the chains a delivery spike
+/// delayed; the field's worst measured spike (3205 ms) and worst observed
+/// silence (19.9 s) both sit inside it.
+pub const ORPHAN_TTL: Duration = DEFAULT_SUCCESSOR_DEADLINE;
 
 /// Capacity of the per-logical-stream successor queue feeding a
 /// [`SplicedReader`]. Bounded so a slow reader cannot accumulate
@@ -2548,6 +2561,57 @@ mod tests {
             registry.orphan_count, 0,
             "an orphan outlived its TTL because no further orphan arrived to reap it"
         );
+    }
+
+    /// A successor generation can overtake its generation 0 when the two are
+    /// delivered on different lanes: the successor is written on the newer,
+    /// faster lane while gen-0 waits on the stalled one. The registry holds
+    /// the successor as an orphan until gen-0 arrives, but reaps it on a
+    /// *pure elapsed-time* TTL the instant any other stream's generation is
+    /// dispatched — so a spike that delays gen-0 past the TTL marks the chain
+    /// broken, and the gen-0 is then refused (`BrokenChain`) even though the
+    /// session itself stays alive for the whole spike.
+    ///
+    /// The window must therefore be no shorter than the session's own
+    /// liveness window (the sliding receive deadline,
+    /// `RECEIVE_DEADLINE_INTERVALS * heartbeat_interval` = 20 s at the
+    /// production 5 s heartbeat) or the field's worst measured spike. This
+    /// pins the two spike magnitudes the field records: the 3205 ms maximum
+    /// and the 19.9 s silence observed once.
+    #[tokio::test(start_paused = true)]
+    async fn a_spike_delayed_generation_zero_is_not_declared_a_broken_chain() {
+        for spike in [Duration::from_millis(3_205), Duration::from_millis(19_900)] {
+            let mut registry = SpliceRegistry::new();
+            let (successor, _held) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(7, 1, false), successor).is_ok(),
+                "a successor that overtakes its gen-0 must be held, not refused"
+            );
+
+            // The spike delays gen-0. Another stream's generation is
+            // dispatched inside the window, which is what runs the reap.
+            tokio::time::advance(spike).await;
+            let (other, _other_held) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(8, 0, false), other).is_ok(),
+                "the unrelated gen-0 is an ordinary splice"
+            );
+
+            let (gen0, _gen0_held) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(7, 0, false), gen0).is_ok(),
+                "a {} ms spike delayed a stream's gen-0 behind its successor and the \
+                 chain was declared broken, so the gen-0 was refused even though the \
+                 session's own liveness window had not closed",
+                spike.as_millis()
+            );
+            assert!(
+                registry.streams[&7].pending.contains_key(&1),
+                "the spike-delayed gen-0 was surfaced without adopting its successor \
+                 (after a {} ms spike)",
+                spike.as_millis()
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
