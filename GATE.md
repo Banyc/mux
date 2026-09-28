@@ -1115,8 +1115,9 @@ Cells deliberately **not** covered: the real transport and its impairment
 models (mux is transport-free); frame *reordering* and *duplication* (the
 transport is an in-order duplex here; those are the reorder and dup soaks');
 migration successor generations (the `migration_api`/`migration_wire` layer sits
-above the session these arms drive and its soak would be a separate arm — this
-one names the omission rather than implying coverage); and multi-frame messages
+above the session these arms drive; that cell is held by the migration horizon
+arm below, whose section names it — this arm names the omission rather than
+implying coverage); and multi-frame messages
 (the withhold is at the session's read, not inside a message body).
 
 ### Timer inventory: every deadline in `mux` and what re-arms it
@@ -1251,6 +1252,76 @@ cap was probed down to **4** and was green from **8** up, so the burst parks
 5–7 readers at a time — far under the cap. `SPLICE_CLEANUP_CAPACITY` stays a
 driver-side retention, not a stream death, and heals on the next generation's
 `Closed`.
+
+### Successor generations across the field spike horizon (default tier)
+
+`migration_wire::tests::a_field_horizon_of_spike_delayed_successors_neither_breaks_a_chain_nor_retains_a_generation`
+holds the cell the session-level soaks above explicitly leave empty: **successor
+generations churning across the field's whole spike horizon**, with each churn
+stream's generation 0 delayed behind its successors every round, and the
+registry's structure sets censused at matched points.
+
+Every other migration arm holds a **single** spike: one successor (or one
+stream's successors) delayed by one 3 205 ms or 19.9 s advance, with no churn
+and no census. This arm is the horizon. It drives the real `SpliceRegistry`
+and the real `SplicedReader` on a paused clock that moves simulated time only
+(the driver's contiguous flush is mirrored by the queue feed, exactly as
+`eof_barrier_gen1_blocked_until_gen0_eof` does), so the cost is the work and
+not the horizon:
+
+- **48 rounds**, a checkpoint every 12, so twelve applications of each
+  magnitude and twelve 19.9 s boundary spikes — the same schedule
+  `tests/field_horizon_soak.rs` applies, which the session arm could not reach;
+- **three churn streams per round**, each staging **four successors before its
+  generation 0** (the lane race the orphan store exists for), then a 15 s
+  round-end idle so the horizon ages with no traffic of the arm's own;
+- a **matched-point census** of `orphan_count`, `broken` and the stream table,
+  all asserted equal to the empty floor the run starts from.
+
+Assertions, on **every** round: the staged successors are held (mid-round
+census) and survive the spike; the delayed gen-0 is accepted — `BrokenChain`
+must not fire, the chain is a live session's stream, not a dead one — and it
+adopts every held successor; the whole chain is delivered byte-for-byte in
+generation order; and the registry returns to its floor. At every matched
+point the orphan / broken / stream sets must not have grown. Instrument
+sanity: every round applied a spike, every staged successor was delivered,
+every chain completed, and the 19.9 s boundary spike was reached.
+
+Measured cost on the release gate build: **0.00-0.01 s** wall (load average
+3.7) for a horizon of **~1 012 s simulated** (12 x 24.36 s of spikes + 48 x
+15 s idle). It runs in the default tier, so it is paid on every
+`cargo test -p mux`, which is affordable precisely because the clock is
+simulated. `MUX_MIG_ROUNDS` and `MUX_MIG_CHECKPOINT` size it.
+
+**Vacuity.** Four source mutations redden the arm, each with the observed text:
+
+- `ORPHAN_TTL` 30 s -> 1 500 ms (the historical defect): red at round 2 with
+  *"round 2: a 3.205s spike delayed stream 10007's generation 0 behind 4
+  successor(s) and the chain was declared broken (BrokenChain) even though the
+  session's own liveness window had not closed"* — the same failure the
+  single-spike arm pins, now reached through the horizon;
+- the reap guard `front.deadline <= now` -> `now >= now` (reap always): red at
+  round 0, *"successor 2 of stream 10000 was refused (Err(BrokenChain)) before a
+  spike could fill the allowance"*;
+- `MAX_ORPHANS_PER_STREAM` 256 -> 2: red at round 0, *"successor 3 of stream
+  10000 was refused (Err(TooManyOrphans)) ..."*;
+- the gen-0 adoption that drops the parked readers: red at round 0,
+  *"the delayed gen-0 of stream 10000 did not adopt every successor the spike
+  held"* (`0` against `4`).
+
+**Detection limit, stated rather than implied.** This arm's successors arrive
+**before** gen-0 (the orphan path); it queues at most one generation after
+gen-0 (the FINAL), so it does **not** detect the post-gen-0 pending bound. With
+`entry.pending.len() >= MAX_PENDING_GENERATIONS` removed (`else if false`) the
+arm stays **green** — an observed green, not an assumed one. That bound is
+held by `too_many_pending_generations_rejected` and
+`a_spike_cannot_fill_one_streams_pending_allowance`, which fail on the same
+mutation (*"assertion failed: matches!(result,
+Err(MigrationError::TooManyPendingGenerations))"*). A zero-hit run of 48 rounds
+is one host, one build and seeded replication of one schedule, so it supports
+an order-of-magnitude exclusion, not a rate. The arm also does not exercise
+`migration_api`'s reader-hand-off (`route_opened_reader` / `latest_held_reader`),
+which the `migration_api` unit tests cover.
 
 ### Frame reordering on a long-lived session (standard tier)
 
@@ -1715,6 +1786,7 @@ reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - |
 dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the long-lived-session frame-duplication and partial-delivery soak sized by MUX_DUP_ROUNDS with its matched points placed by MUX_DUP_CHECKPOINT, and MUX_DUP_FAULT the red-proof selector (no_hold removes the reorder hold, no_duplicate removes both duplicate injections, no_split removes the split injection): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame, write the frames queued behind it first and re-deliver a copy of the frame the receiver is still holding, re-deliver frames after release, and write every data frame as two transport segments (one of them withheld across the field's 190 ms/1063 ms/3205 ms spike) (concurrent echo rounds, a multi-frame bidirectional message whose held frame's successor is duplicated while buffered, a peer that accepts and stops reading, a tail frame split across a spike, and a finished stream's data frame re-delivered after its entry retired) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that duplicates were dropped both while buffered and after release and never delivered into the stream, that a frame body really was consumed across more than one segment, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, duplication@metric=frame-dropped-while-buffered+source=mux-internal-ingest-counter, duplication@metric=frame-dropped-after-release, ordering@metric=byte-exact-in-stream-order+impairment=frame-split-and-duplicate, partial-delivery@metric=frame-body-across-multiple-segments+source=reader-body-loop-counter, resurrection@metric=stream-materialised-from-duplicate-after-close+state=refused, liveness@shape=duplication-x-slow-consumer+metric=read-queue-bound-reached, liveness@shape=partial-x-spike+metric=receive-deadline-armed-not-expired, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-hold-no-duplicate-and-no-split | MUX_DUP_CHECKPOINT=50,MUX_DUP_ROUNDS=210,total=MUX_DUP_ROUNDS,wall=5.18s,bound=1.4e-2/round
 receive-stall-soak = MUX_RECEIVE_STALL_ROUNDS,MUX_RECEIVE_STALL_FAULT | - | the paused-clock withheld-delivery soak sized by MUX_RECEIVE_STALL_ROUNDS, with MUX_RECEIVE_STALL_FAULT the red-proof selector (no_withhold makes the transport ignore the arm, arrival_gated releases a held frame only on the same flow's next arrival, short_release releases it after half the interval): four concurrent flows on four long-lived streams over a frame-level withholding transport across four phases (the deployed interactive-lane baseline, a multi-frame message whose withheld frame leaves the reorder buffer holding a gap, the stock wire where the withheld frame heads a byte stream, and a zero-impairment control), asserting on every round that an unobstructed flow is delivered with the paused clock untouched, that the withheld flow's message arrives no earlier than its withhold and no later than it plus one millisecond, that no session tears down, and that the frames the transport withheld equal the count the phase's schedule names | attribution@candidate=receive-path+metric=excess-over-withhold, attribution@candidate=reorder-buffer+impairment=multi-frame-withhold, ordering@metric=per-flow-message-order, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, stall-detection@fault=arrival-gated-release, stall-detection@fault=no-withhold, anti-vacuity@metric=withhold-landed-lower-bound+control=short-release | MUX_RECEIVE_STALL_ROUNDS=200,total=2*MUX_RECEIVE_STALL_ROUNDS+140,wall=0.03s,bound=5.6e-3/round
 egress-ingress-coupling = MUX_EGRESS_STALL_ROUNDS | - | the paused-clock egress-write/ingress-coupling arm sized by MUX_EGRESS_STALL_ROUNDS, with no red-proof selector (its vacuity is a documented source mutation of the drain it guards): the client's transport write half parks in poll_write for the field's 190 ms/1063 ms/3205 ms and stamps that write's simulated begin and end itself, and across four shapes (a steady-state peer-open baseline with no write stalled, the peer open under a stalled write, a data frame on an established stream with no stream introduced as the isolating control, and the same data frame queued behind a peer open that is still blocked) every ingress event must be serviced while the stalled write is still in flight and with the clock still at the write's begin, with the transport having entered exactly the one armed write, the run's elapsed simulated time equal to the stalls the arm itself armed | coupling@metric=ingress-event-serviced-while-egress-write-in-flight+shape=peer-open, amplification@metric=data-frame-behind-blocked-peer-open+shape=established-stream, attribution@control=no-stream-introduced+metric=data-frame-serviced-while-writer-parked, baseline@metric=steady-state-open-cost, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, admission@invariant=token-before-table-insert+state=preserved | MUX_EGRESS_STALL_ROUNDS=30,total=4*MUX_EGRESS_STALL_ROUNDS,wall=0.11s,bound=0.1/round
+migration-horizon-soak = MUX_MIG_ROUNDS,MUX_MIG_CHECKPOINT | - | the migration-registry field spike horizon (a lib unit test, run by plain `cargo test -p mux`) sized by MUX_MIG_ROUNDS with its matched points placed by MUX_MIG_CHECKPOINT: 48 rounds of the field's four spike magnitudes (190 ms / 1063 ms / 3205 ms / 19.9 s), three churn streams per round each staging four successor generations before its generation 0, a 15 s round-end idle, asserting on every round that the held successors survive the spike, that the delayed gen-0 is accepted (BrokenChain never fires) and adopts every successor, that the chain delivers byte-exact in generation order, and that the registry returns to its empty floor, with the orphan / broken / stream sets censused at every matched point | growth@metric=per-stream-structure-live-count+points=matched+spike=deadline-boundary, release@structure=orphan-store+metric=held-generations, release@structure=broken-id-set+metric=retained-ids, ordering@metric=byte-exact-per-stream+shape=spike-delayed-successors, liveness@shape=successor-churn-across-horizon+metric=gen0-accepted-not-brokenchain, staleness@fault=orphan-ttl-1500ms, staleness@fault=reap-guard-always-true, staleness@fault=orphan-cap-2, staleness@fault=handoff-drops-reader | MUX_MIG_ROUNDS=48,MUX_MIG_CHECKPOINT=12,total=3*MUX_MIG_ROUNDS,wall=0.01s,bound=6.3e-2/round
 ```
 
 ## Opt-in targets outside this manifest

@@ -2921,4 +2921,296 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // Field spike horizon: successor generations across repeated spikes
+    // -------------------------------------------------------------------
+
+    /// The field's measured spike magnitudes in schedule order: the deployed
+    /// path's floor, its two measured maxima, and the one observed 19.9 s
+    /// silence. This is the same schedule `tests/field_horizon_soak.rs`
+    /// applies at the session level, so the migration arm reads the horizon
+    /// the session arm could not reach.
+    const FIELD_SPIKE_HORIZON: [Duration; 4] = [
+        Duration::from_millis(190),
+        Duration::from_millis(1_063),
+        Duration::from_millis(3_205),
+        Duration::from_millis(19_900),
+    ];
+
+    /// One generation carrying a single payload byte with its writer already
+    /// closed, so the reader sees the byte and then EOF — the shape the
+    /// splice driver hands the registry as a continuation.
+    async fn closed_generation(payload: u8) -> GenerationReader {
+        let (mut writer, reader) = duplex(64);
+        writer.write_all(&[payload]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        Box::pin(reader)
+    }
+
+    /// The uncovered cell: **successor generations churning across the field's
+    /// whole spike horizon**, with each churn stream's generation 0 delayed
+    /// behind its successors every round, and the registry's structure sets
+    /// censused at matched points.
+    ///
+    /// Every existing migration arm holds a *single* spike: one successor (or
+    /// one stream's successors) delayed by one 3 205 ms or 19.9 s advance.
+    /// None runs the four-magnitude schedule over a horizon, none churns many
+    /// stream ids against it, and none censuses the registry across the
+    /// horizon. That is the cell this arm holds, and it is the interaction the
+    /// historical `ORPHAN_TTL` defect lived in: on any dispatch other than the
+    /// delayed id's own, the registry reaps every orphan whose pure-elapsed-
+    /// time TTL has passed and marks the id broken, so a spike longer than the
+    /// TTL turns a live session's delayed gen-0 into `BrokenChain`.
+    ///
+    /// The arm drives the real [`SpliceRegistry`] and the real
+    /// [`SplicedReader`] (the driver's contiguous flush is mirrored by the
+    /// queue feed below, exactly as `eof_barrier_gen1_blocked_until_gen0_eof`
+    /// does), and asserts on every round: the held successors survive the
+    /// spike, the delayed gen-0 is accepted (`BrokenChain` never fires), the
+    /// whole chain is delivered byte-for-byte in generation order, and the
+    /// registry returns to its empty floor; and at every matched point: the
+    /// orphan / broken / stream sets have not grown from that floor.
+    ///
+    /// Tier: **default** (runs in `cargo test -p mux`); the horizon is a paused
+    /// clock, so it costs the work and not the simulated time. `MUX_MIG_ROUNDS`
+    /// and `MUX_MIG_CHECKPOINT` size it; `MUX_MIG_FAULT` is not used (the
+    /// red-proofs are source mutations, as for the other migration arms).
+    #[tokio::test(start_paused = true)]
+    async fn a_field_horizon_of_spike_delayed_successors_neither_breaks_a_chain_nor_retains_a_generation()
+     {
+        // 48 rounds with a checkpoint every 12: twelve applications of each
+        // magnitude, four of them the 19.9 s boundary the session soak also
+        // reaches twelve times over its own (four-magnitude) schedule.
+        let rounds: u64 = std::env::var("MUX_MIG_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48);
+        let checkpoint_every: u64 = std::env::var("MUX_MIG_CHECKPOINT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12)
+            .max(1);
+        // Successors that overtake one stream's generation 0: the lane race
+        // the orphan store exists for. Four is a small burst that still
+        // exceeds a per-stream allowance probed down to 2, so the capacity
+        // red-proof has teeth.
+        const CHURN_STREAMS: u64 = 3;
+        const SUCCESSORS_PER_STREAM: u32 = 4;
+        // The round-end idle the session soak also takes: three heartbeat
+        // intervals of simulated session time, aging the horizon without
+        // crossing any deadline a held generation sits inside.
+        const IDLE_WINDOW: Duration = Duration::from_secs(15);
+        const READ_BUDGET: Duration = Duration::from_secs(5);
+
+        let mut registry = SpliceRegistry::new();
+        // The floor: an empty registry. Every matched point must return to it.
+        let floor = (
+            registry.orphan_count,
+            registry.broken.len(),
+            registry.streams.len(),
+        );
+        let mut completed = 0u64;
+        let mut staged = 0u64;
+        let mut delivered = 0u64;
+        let mut spikes_applied = 0u64;
+        let mut boundary_spikes = 0u64;
+        let mut checkpoints: Vec<(u64, usize, usize, usize)> = Vec::new();
+
+        for round in 0..rounds {
+            let spike = FIELD_SPIKE_HORIZON[(round as usize) % FIELD_SPIKE_HORIZON.len()];
+            let base = 10_000 + round * CHURN_STREAMS;
+
+            // 1. Successors overtake gen-0: each churn stream's successors are
+            //    dispatched before its generation 0, so they are held as
+            //    orphans. They are staged at one instant (no advance yet), so
+            //    nothing is expired when the spike lands.
+            for index in 0..CHURN_STREAMS {
+                let id = base + index;
+                for generation in 1..=SUCCESSORS_PER_STREAM {
+                    let result = registry.dispatch(
+                        hdr(id, generation, false),
+                        closed_generation(generation as u8).await,
+                    );
+                    assert!(
+                        result.is_ok(),
+                        "round {round}: successor {generation} of stream {id} was refused ({result:?}) before a spike could fill the allowance"
+                    );
+                    staged += 1;
+                }
+            }
+
+            // Mid-round census: the successors are held, not dropped, and no
+            // id has been declared broken. A green run cannot be one in which
+            // the spike held nothing.
+            assert_eq!(
+                registry.orphans.len(),
+                CHURN_STREAMS as usize,
+                "round {round}: {} stream(s) hold orphans, not the {CHURN_STREAMS} staged",
+                registry.orphans.len()
+            );
+            assert_eq!(
+                registry.orphan_count,
+                (CHURN_STREAMS * SUCCESSORS_PER_STREAM as u64) as usize,
+                "round {round}: {} orphan(s) held, not the {} staged",
+                registry.orphan_count,
+                CHURN_STREAMS * SUCCESSORS_PER_STREAM as u64
+            );
+            assert!(
+                registry.broken.is_empty(),
+                "round {round}: staging successors already marked a stream broken"
+            );
+            assert!(
+                registry.streams.is_empty(),
+                "round {round}: a stream table entry exists before any gen-0 arrived"
+            );
+
+            // 2. The spike is pure elapsed time with the successors parked
+            //    behind a gen-0 that has not arrived. Expiry alone reaps
+            //    nothing; only a dispatch runs the reap.
+            tokio::time::advance(spike).await;
+            spikes_applied += 1;
+            if spike == FIELD_SPIKE_HORIZON[FIELD_SPIKE_HORIZON.len() - 1] {
+                boundary_spikes += 1;
+            }
+            assert_eq!(
+                registry.orphan_count,
+                (CHURN_STREAMS * SUCCESSORS_PER_STREAM as u64) as usize,
+                "round {round}: the {spike:?} advance alone discarded a held generation"
+            );
+
+            // 3. Each delayed gen-0 arrives. The spike must not have reaped
+            //    its successors and marked the id broken: a chain is a live
+            //    session's stream, not a dead one.
+            for index in 0..CHURN_STREAMS {
+                let id = base + index;
+                let (mut gen0_writer, gen0_reader) = duplex(64);
+                gen0_writer.write_all(&[0]).await.unwrap();
+                let spliced = registry
+                    .dispatch(hdr(id, 0, false), Box::pin(gen0_reader))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "round {round}: a {spike:?} spike delayed stream {id}'s generation 0 
+                             behind {SUCCESSORS_PER_STREAM} successor(s) and the chain was declared 
+                             broken ({e:?}) even though the session's own liveness window had not closed"
+                        )
+                    });
+                let mut spliced = spliced.expect("a non-final gen-0 produces a spliced reader");
+                assert_eq!(
+                    registry.streams[&id].pending.len(),
+                    SUCCESSORS_PER_STREAM as usize,
+                    "round {round}: the delayed gen-0 of stream {id} did not adopt every successor the spike held"
+                );
+
+                // Mirror the splice driver's contiguous flush: adopt the held
+                // successors into the reader's queue in generation order, then
+                // close the chain with a FINAL.
+                let (queue_tx, queue_rx) = tokio::sync::mpsc::channel(SPLICE_QUEUE_CAPACITY);
+                spliced = spliced.with_queue(queue_rx, DEFAULT_SUCCESSOR_DEADLINE);
+                let (final_writer, final_reader) = duplex(1);
+                drop(final_writer);
+                registry
+                    .dispatch(
+                        hdr(id, SUCCESSORS_PER_STREAM + 1, true),
+                        Box::pin(final_reader),
+                    )
+                    .expect("a FINAL behind the successors must be held");
+                while let Some((_generation, is_final, reader)) = registry.pop_pending(id) {
+                    queue_tx.send((is_final, reader)).await.unwrap();
+                }
+                drop(queue_tx);
+                drop(gen0_writer);
+
+                let mut got = Vec::new();
+                tokio::time::timeout(READ_BUDGET, spliced.read_to_end(&mut got))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "round {round}: stream {id} stranded on a generation the {spike:?} spike withheld"
+                        )
+                    })
+                    .unwrap_or_else(|e| panic!("round {round}: stream {id} read failed: {e}"));
+                let expected: Vec<u8> = (0..=SUCCESSORS_PER_STREAM).map(|g| g as u8).collect();
+                assert_eq!(
+                    got, expected,
+                    "round {round}: the spike-delayed chain for stream {id} did not deliver its generations in order"
+                );
+                delivered += SUCCESSORS_PER_STREAM as u64;
+                // The driver retires an entry when the FINAL is flushed.
+                registry.remove_stream(id);
+                completed += 1;
+            }
+
+            // 4. Round-end census: every generation adopted and retired, and
+            //    no id left broken by a spike the session survived.
+            assert_eq!(
+                registry.orphan_count, 0,
+                "round {round}: an orphan outlived its own gen-0"
+            );
+            assert!(
+                registry.orphans.is_empty(),
+                "round {round}: an orphan stream entry survived its round"
+            );
+            assert!(
+                registry.broken.is_empty(),
+                "round {round}: a {spike:?} spike marked a stream broken while the session was alive"
+            );
+            assert!(
+                registry.streams.is_empty(),
+                "round {round}: a stream table entry survived its round"
+            );
+
+            // 5. Age the horizon with no traffic of the arm's own.
+            tokio::time::sleep(IDLE_WINDOW).await;
+
+            if (round + 1) % checkpoint_every == 0 {
+                let now = (
+                    registry.orphan_count,
+                    registry.broken.len(),
+                    registry.streams.len(),
+                );
+                assert_eq!(
+                    now,
+                    floor,
+                    "matched point at round {} grew past the floor: orphan_count/broken/streams {now:?} against {floor:?}",
+                    round + 1
+                );
+                checkpoints.push((round + 1, now.0, now.1, now.2));
+            }
+        }
+
+        // Instrument sanity: a run that staged nothing, applied no boundary
+        // spike, or completed nothing would pass the censuses vacuously.
+        assert_eq!(
+            spikes_applied, rounds,
+            "only {spikes_applied} of {rounds} rounds applied a spike"
+        );
+        assert!(
+            boundary_spikes > 0,
+            "the 19.9 s boundary spike was never applied; the cell this arm exists for was not reached"
+        );
+        assert_eq!(
+            staged,
+            rounds * CHURN_STREAMS * SUCCESSORS_PER_STREAM as u64,
+            "only {staged} successor(s) were staged over {rounds} rounds"
+        );
+        assert_eq!(
+            delivered, staged,
+            "{delivered} of {staged} staged successors were delivered"
+        );
+        assert_eq!(
+            completed,
+            rounds * CHURN_STREAMS,
+            "only {completed} chain(s) completed over {rounds} rounds"
+        );
+        assert!(
+            checkpoints.len() >= 2,
+            "a trend needs at least two matched points"
+        );
+        assert_eq!(registry.orphan_count, 0);
+        assert!(registry.orphans.is_empty());
+        assert!(registry.broken.is_empty());
+        assert!(registry.streams.is_empty());
+    }
 }
