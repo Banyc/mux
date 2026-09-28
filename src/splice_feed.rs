@@ -321,6 +321,73 @@ mod tests {
         driver.abort_all();
     }
 
+    /// A gen-0 whose logical id was claimed *before* its continuation was
+    /// handed over can never be evicted by the unclaimed cap. Both production
+    /// callers use that order — `await_gene` then `send_continuation`
+    /// (`migration_api.rs:755,759` and `:1170,1178`) — while
+    /// `add_accepter` (`:1080`) forwards a peer header with no claim at all.
+    ///
+    /// A reader is parked only when no registration for its id has been
+    /// processed, and a produced gen-0 always has its registration already in
+    /// the register queue, so every parked reader is paired with a pending
+    /// registration. With the queue bounded at `SPLICE_REGISTER_CAPACITY` = 64
+    /// entries, eviction at `MAX_UNCLAIMED_GEN0` = 64 would need the 64 parked
+    /// readers' registrations *and* the incoming gen-0's own — 65 pending
+    /// registrations in a 64-slot queue. It cannot happen; only a gen-0 with
+    /// no registration at all (a peer pinning readers) can fill the queue.
+    ///
+    /// Four times the cap is offered here, so the register channel is genuinely
+    /// back-pressured and the burst cannot be dismissed as too shallow to
+    /// matter. A run that evicted a parked reader leaves its registrant
+    /// waiting forever, because the later register finds no `ready` entry and
+    /// parks in `waiters`.
+    #[tokio::test]
+    async fn a_burst_of_registered_gen0s_never_reaches_the_unclaimed_cap() {
+        let (handle, mut driver) = spawn_splice_router();
+        // Four times the cap, so the register channel (capacity 64) is
+        // genuinely back-pressured and the burst cannot be waved away as too
+        // shallow to matter.
+        let count = 4 * MAX_UNCLAIMED_GEN0;
+        let mut receivers = Vec::new();
+        for logical_id in 0..(count as u64) {
+            // Production order: the id is claimed before its continuation is
+            // handed over, never the reverse.
+            let rx = handle
+                .await_gene(logical_id)
+                .await
+                .expect("splice feed alive");
+            let (theirs, _ours) = tokio::io::duplex(64);
+            handle
+                .send_continuation(
+                    ResumeHeader {
+                        logical_id,
+                        generation: 0,
+                        is_final: false,
+                        is_response: false,
+                    },
+                    Box::pin(theirs) as GenerationReader,
+                )
+                .await
+                .expect("splice feed alive");
+            receivers.push((logical_id, rx));
+        }
+        for (logical_id, rx) in receivers {
+            let reader = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "registered gen-0 {logical_id} was never delivered to its \
+                         registrant, so a reader whose claim preceded it was evicted"
+                    )
+                });
+            assert!(
+                reader.is_ok(),
+                "registered gen-0 {logical_id} was dropped before its registrant got it"
+            );
+        }
+        driver.abort_all();
+    }
+
     /// The supervisor waits for BOTH the matcher and the driver: a driver
     /// error must still be reported as `DriverFailed` even when the matcher
     /// finished first. Stopping on the first child (`||`) would abort the

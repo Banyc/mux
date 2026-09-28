@@ -771,7 +771,7 @@ heartbeat, a stream error) can reach the full condition.
 | `migration_api::MAX_CONCURRENT_PEEKS` = 256 | `src/migration_api.rs:561`, gate at `:1047` | stops accepting new streams (`select!` guard) while peeks are outstanding; nothing blocks on it | yes — a resume-header peek | **no test of the cap itself**; the gate is in `ResponseRouter::add_accepter`'s accept loop, whose behaviour is "stop pulling" and so cannot wait |
 | `MAX_PENDING_GENERATIONS`, `MAX_ORPHANS_PER_STREAM`, `MAX_SPLICE_STREAMS`, `MAX_ORPHAN_STREAMS` = 256 | `src/migration_wire.rs:56,63,68,75` | typed errors (`TooManyPendingGenerations`, `TooManyOrphans`, `TooManySpliceStreams`); the id is remembered broken so a gen-0 that arrives late is refused rather than stranded | healing path, not the steady-state request path | `migration_wire` bound tests |
 | `SPLICE_QUEUE_CAPACITY` 256 / `SPLICE_CLEANUP_CAPACITY` 64 | `src/migration_wire.rs:83,86` | `try_send` full → reinsert and park on a notify; cleanup full → the drop notification is best-effort (`let _ =`) | healing path | `migration_wire` splice tests |
-| `MAX_UNCLAIMED_GEN0` = 64 | `src/splice_feed.rs:82` | evicts the oldest unclaimed reader | healing path | `splice_feed::tests::the_ready_queue_evicts_at_exactly_the_cap` |
+| `MAX_UNCLAIMED_GEN0` = 64 | `src/splice_feed.rs:82` | evicts the oldest reader with no pending claim (only a gen-0 dispatched without `await_gene` can fill it) | healing path | `splice_feed::tests::the_ready_queue_evicts_at_exactly_the_cap` (the eviction), `splice_feed::tests::a_burst_of_registered_gen0s_never_reaches_the_unclaimed_cap` (a registered burst never reaches it) |
 | `SPLICE_CONT_CAPACITY` 1 024 / `SPLICE_GEN0_CAPACITY` 64 / `SPLICE_REGISTER_CAPACITY` 64 | `src/splice_feed.rs:83-85` | blocks a send; drained by the router's own driver/matcher tasks | healing path | `splice_feed` router tests |
 | `traffic_class::HISTORY_MAX` 16 / `DEMOTE_STREAK` 4 | `src/traffic_class.rs:33-35` | fixed-size observation windows, evict oldest | yes — every dispatch | `central_io::scheduler` latency-class tests |
 | `padding::MAX_PAD` 1 500 / `encoder::REASSEMBLY_MAX_BODY` | `src/padding.rs:12`, `src/central_io/encoder.rs:22` | bounds a frame's padding/body; no full condition | yes — every frame | `wire_contract`, `padding` unit tests |
@@ -1060,7 +1060,7 @@ is what bounds how many generations one stream can produce in a window.
 | `MAX_SPLICE_STREAMS` = 256 | `migration_wire.rs:68` | count, **live splice streams** | `TooManySpliceStreams`; the gen-0 is refused and no reader is produced — the stream never opens | needs 256 concurrent migrating streams; a spike does not create them | **load bound, kept.** An entry persists for the stream's life, so occupancy is concurrent live streams, not elapsed time |
 | `SPLICE_QUEUE_CAPACITY` = 256 | `migration_wire.rs:96` | count, per stream | `try_send` full → reinsert + `blocked_by_capacity`, re-flushed on the reader's drain (`:922-934`, `:1096`) | n/a | **no — a delay, not a loss.** The refused generation stays in the registry and is re-flushed when the reader makes room; pinned by `a_final_deferred_by_a_full_queue_is_redelivered_when_the_reader_drains` |
 | `SPLICE_CLEANUP_CAPACITY` = 64 | `migration_wire.rs:99` | count | cleanup notification is best-effort (`let _ = try_send`, `:645`); a lost one leaves driver-side state until the next flush/removal | n/a | **not a stream death**; a driver-side retention under a >64 burst of reader drops, self-healed by the next flush's `Closed` |
-| `MAX_UNCLAIMED_GEN0` = 64 | `splice_feed.rs:82` | count, **burst queue** | evicts the oldest unclaimed gen-0 reader (`splice_feed.rs:180`) — a **loss** | a post-spike burst can park more than 64 while the accepter registers | **burst/load bound, kept, exposure recorded.** Reached when the matcher outpaces the accepters, which a normal open burst can do with no spike; it bounds an otherwise unbounded set of unclaimed readers |
+| `MAX_UNCLAIMED_GEN0` = 64 | `splice_feed.rs:82` | count, **unregistered-continuation queue** | evicts the oldest reader that has no claim on it (`splice_feed.rs:180`) — a deliberate drop of an unclaimed reader, not a stream death | a registered gen-0 cannot fill it: a parked reader always has its registration still in the register queue, and that queue holds 64, so eviction at 64 needs 65 pending registrations in 64 slots. A registered burst of **4× the cap (256)** is green 100/100 at the real cap (the same burst reddened only once the cap was probed down to **4**, i.e. it parks 5–7 at a time) | **peer/footprint bound, defended.** It is reached only by a gen-0 continuation dispatched with **no** `await_gene` — the peer-pinning vector `add_accepter` (`migration_api.rs:1080`) forwards — not by slowness and not by registered load. Every field path (`peek_and_dispatch` `:755,759`, `inject_response_gene` `:1170,1178`) claims first. Pinned by `splice_feed::tests::a_burst_of_registered_gen0s_never_reaches_the_unclaimed_cap` |
 
 **The one bound that cannot tell load from slowness is
 `MAX_ORPHAN_STREAMS`**, and it is kept for two reasons measured here rather
@@ -1080,6 +1080,33 @@ above the 256 per-stream allowance"*, and at the pre-fix 1 500 ms the
 spike-shaped arm fails at successor 11 with *"the spike's successor 11 was
 refused (Err(BrokenChain)) …"*. A later raise of the TTL is caught here rather
 than in the field.
+
+**`MAX_UNCLAIMED_GEN0` is not a spike exposure either.** A reader parks in the
+matcher's `ready` queue only when a gen-0 arrives before any registration for
+its id has been processed, and every field path enqueues the registration
+first (`await_gene` at `migration_api.rs:755`/`:1170` precedes
+`send_continuation` at `:759`/`:1178`). A parked reader therefore always has
+its registration still sitting in the register queue, which holds
+`SPLICE_REGISTER_CAPACITY` = 64 entries; eviction at 64 would need the 64
+parked readers' registrations plus the incoming gen-0's own — 65 pending
+registrations in a 64-slot queue. A 3 205 ms spike cannot change that: it
+delays the arrival of the gen-0 header, but once the accepter holds the header
+it enqueues the registration and the continuation back to back, so the
+unclaimed window is a handful of matcher iterations and does not grow with RTT.
+The cap is a **footprint guard for a peer that pins readers**: only
+`add_accepter` (`:1080`) hands the driver a gen-0 without a claim, and a
+conforming peer's response chain starts at generation 1
+(`GenerationChain::new_response`, `migration_wire.rs:273`), so a well-behaved
+peer never produces the input. `a_burst_of_registered_gen0s_never_reaches_the_unclaimed_cap`
+drives 256 registered gen-0s (4× the cap) through the production order and
+requires every one to reach its registrant; it is green at the cap (100/100
+runs) and was shown red by replacing the eviction guard with `if true`
+(*"registered gen-0 128 was never delivered to its registrant, so a reader
+whose claim preceded it was evicted"*). The same 256-burst reddened when the
+cap was probed down to **4** and was green from **8** up, so the burst parks
+5–7 readers at a time — far under the cap. `SPLICE_CLEANUP_CAPACITY` stays a
+driver-side retention, not a stream death, and heals on the next generation's
+`Closed`.
 
 ### Frame reordering on a long-lived session (standard tier)
 
