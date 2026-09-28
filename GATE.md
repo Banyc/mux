@@ -1032,11 +1032,54 @@ that magnitude as a pass (`spike_survival_soak`), no longer silence has been
 observed, and raising `RECEIVE_DEADLINE_INTERVALS` is a death-detection trade
 that needs a measurement this revision does not have. The birth and lane-hello
 deadlines (4 s) clear the field's measured maxima by 795 ms but not the 19.9 s
-one-off; both values are owned by `rtp_mux`. The orphan **capacity** bounds
-(`MAX_ORPHAN_STREAMS`/`MAX_ORPHANS_PER_STREAM`, `migration_wire.rs:63,75`) can
-refuse a generation under a spike that produces more than 256 orphan streams
-and mark the id broken the same way; they are a sizing bound rather than a
-deadline and are unchanged here.
+one-off; both values are owned by `rtp_mux`. The orphan **capacity** bounds are
+resolved below: the per-stream ones are refuted by the migration cadence and
+the global one is a load bound that a spike stretches but does not fill.
+
+### The migration/orphan capacity bounds: kind, margin, and whether slowness reaches them
+
+The timer inventory above closed with the orphan **capacity** bounds as an open
+question. The question that decides whether each is a defect is the one the
+`ORPHAN_TTL` fix turned on: does *slowness* reach it, or only *load*? A spike
+creates no work; it delays work that already existed. A bound whose occupancy
+is a function of work (streams opened, generations produced) is a load bound
+and defensible; one whose occupancy grows with **retention time** is reachable
+by a spike at a load that is safe without it — and for a bound whose refusal
+marks the id broken, that is the same stream-death the TTL was.
+
+One row per bound, from the code, with its kind and its refusal's effect on the
+stream. `margin` is against the field's worst measured spike (3 205 ms) at the
+sender's migration cadence (`traffic_class::MIGRATION_COOLDOWN`, 150 ms), which
+is what bounds how many generations one stream can produce in a window.
+
+| bound | file:line | kind | when full: what happens to the stream | margin vs 3 205 ms | slowness-reachable? |
+| --- | --- | --- | --- | --- | --- |
+| `MAX_ORPHANS_PER_STREAM` = 256 | `migration_wire.rs:63` | count, **per stream** | `insert_orphan` calls `remember_broken` (`:492`) then `TooManyOrphans`; the driver retires the stream (`:1018-1035`), so a later gen-0 is refused `BrokenChain` — the stream dies while the session lives | needs 256 successors in the window; a 3 205 ms spike makes **≤22**, and the full 30 s TTL window only **200** | **no — refuted by the cadence.** The cooldown (`traffic_class.rs:34`) spaces one stream's migrations ≥150 ms apart, so `ORPHAN_TTL / MIGRATION_COOLDOWN` = 200 < 256: a pure delay cannot fill it. Pinned by `a_spike_cannot_fill_one_streams_orphan_allowance`. `force_migrate` (tests only) and `rebind` (`migration_api.rs:345`; `rtp_mux` re-pairs lanes) bypass the cooldown — a caller-driven load, not a spike |
+| `MAX_ORPHAN_STREAMS` = 256 | `migration_wire.rs:75` | count, **distinct ids** | same as above: `remember_broken` + `TooManyOrphans`; the refused id's gen-0 → `BrokenChain` | needs 256 distinct streams with an un-delivered gen-0; a spike adds no stream, but stretches each one's life from ~1 RTT to the spike | **load bound, kept.** Its occupancy is `open-rate × retention`: a spike lowers the reaching rate (`256/3.205 s` = **80 streams/s** against `256/0.19 s` = **1 347/s** at the field's 190 ms floor), but it is already reachable by concurrent opens under load alone, and removing it uncaps the orphan store. Refuted for a *pure* spike by `a_spike_does_not_add_an_orphan_stream` |
+| `MAX_PENDING_GENERATIONS` = 256 | `migration_wire.rs:56` | count, **per stream** | `TooManyPendingGenerations`; the driver retires the stream (same arm), gen-0 answered `None` | same cadence bound: ≤22 at 3 205 ms, ≤200 per TTL window | **no — same refutation.** A delay drains the reader's queue, and the generations queue behind the delayed one, but the cadence caps the queue below the allowance. Pinned by `a_spike_cannot_fill_one_streams_pending_allowance` |
+| `MAX_SPLICE_STREAMS` = 256 | `migration_wire.rs:68` | count, **live splice streams** | `TooManySpliceStreams`; the gen-0 is refused and no reader is produced — the stream never opens | needs 256 concurrent migrating streams; a spike does not create them | **load bound, kept.** An entry persists for the stream's life, so occupancy is concurrent live streams, not elapsed time |
+| `SPLICE_QUEUE_CAPACITY` = 256 | `migration_wire.rs:96` | count, per stream | `try_send` full → reinsert + `blocked_by_capacity`, re-flushed on the reader's drain (`:922-934`, `:1096`) | n/a | **no — a delay, not a loss.** The refused generation stays in the registry and is re-flushed when the reader makes room; pinned by `a_final_deferred_by_a_full_queue_is_redelivered_when_the_reader_drains` |
+| `SPLICE_CLEANUP_CAPACITY` = 64 | `migration_wire.rs:99` | count | cleanup notification is best-effort (`let _ = try_send`, `:645`); a lost one leaves driver-side state until the next flush/removal | n/a | **not a stream death**; a driver-side retention under a >64 burst of reader drops, self-healed by the next flush's `Closed` |
+| `MAX_UNCLAIMED_GEN0` = 64 | `splice_feed.rs:82` | count, **burst queue** | evicts the oldest unclaimed gen-0 reader (`splice_feed.rs:180`) — a **loss** | a post-spike burst can park more than 64 while the accepter registers | **burst/load bound, kept, exposure recorded.** Reached when the matcher outpaces the accepters, which a normal open burst can do with no spike; it bounds an otherwise unbounded set of unclaimed readers |
+
+**The one bound that cannot tell load from slowness is
+`MAX_ORPHAN_STREAMS`**, and it is kept for two reasons measured here rather
+than assumed: its occupancy is *concurrent new streams* (a load) — a 3 205 ms
+spike adds none, so it is already reachable without a spike at a higher open
+rate — and the state it bounds is a live substream reader, so removing or
+raising it trades a bounded footprint for an unbounded one. The per-stream
+bounds (`MAX_ORPHANS_PER_STREAM`, `MAX_PENDING_GENERATIONS`) are the ones the
+predecessor's note flagged, and the cadence refutes them. **What the previous
+fix changed is the margin, not the verdict:** moving `ORPHAN_TTL` from 1.5 s to
+30 s raised the per-stream window's ceiling from 10 to 200 — still under 256,
+but 56 generations from it. The arithmetic guards in the two
+`a_spike_cannot_fill_…` arms fail the moment
+`ORPHAN_TTL / MIGRATION_COOLDOWN` reaches the allowance: at `ORPHAN_TTL` = 39 s
+the guard reports *"ORPHAN_TTL (39s) spans 260 migration slots of 150ms, at or
+above the 256 per-stream allowance"*, and at the pre-fix 1 500 ms the
+spike-shaped arm fails at successor 11 with *"the spike's successor 11 was
+refused (Err(BrokenChain)) …"*. A later raise of the TTL is caught here rather
+than in the field.
 
 ### Frame reordering on a long-lived session (standard tier)
 

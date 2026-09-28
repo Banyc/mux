@@ -2614,6 +2614,156 @@ mod tests {
         }
     }
 
+    /// The *per-stream* orphan allowance cannot be filled by a spike. A
+    /// successor generation is produced by a lane migration, and the sender's
+    /// migration cooldown (`traffic_class::MIGRATION_COOLDOWN`, 150 ms) spaces
+    /// two migrations of one stream at least that far apart, so a stream can
+    /// produce at most `ORPHAN_TTL / MIGRATION_COOLDOWN` successors inside the
+    /// whole orphan-retention window. At the field's worst spike (3 205 ms)
+    /// that is 22; across the full 30 s window it is 200 — strictly below the
+    /// 256 allowance. This is the refutation of "the orphan *capacity* bound
+    /// costs a stream under a spike": the count a pure delay can retain is
+    /// bounded by the cooldown, not by the delay.
+    ///
+    /// Two properties are pinned, with distinct teeth. The arithmetic guard
+    /// fails if `ORPHAN_TTL` is ever raised (or the cooldown shortened) far
+    /// enough that one stream's whole window can fill the allowance — the
+    /// coupling the previous fix introduced by moving the TTL to 30 s. The
+    /// spike-shaped arm fails if the TTL is short enough that a spike reaps a
+    /// held successor and marks the id broken before gen-0 arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_spike_cannot_fill_one_streams_orphan_allowance() {
+        let cooldown = crate::traffic_class::MIGRATION_COOLDOWN;
+        let slots_in_a_window = ORPHAN_TTL.as_nanos() / cooldown.as_nanos();
+        assert!(
+            slots_in_a_window < MAX_ORPHANS_PER_STREAM as u128,
+            "ORPHAN_TTL ({ORPHAN_TTL:?}) spans {slots_in_a_window} migration slots of \
+             {cooldown:?}, at or above the {MAX_ORPHANS_PER_STREAM} per-stream allowance: \
+             the retention window alone now fills one stream's allowance, so a spike that \
+             lasts the window marks the id broken"
+        );
+
+        const SPIKE: Duration = Duration::from_millis(3_205);
+        let mut registry = SpliceRegistry::new();
+        let mut elapsed = Duration::ZERO;
+        let mut generation = 1u32;
+        let mut held = 0usize;
+        while elapsed <= SPIKE {
+            let (c, _s) = duplex(1);
+            let result = registry.dispatch(hdr(7, generation, false), c);
+            assert!(
+                result.is_ok(),
+                "the spike's successor {generation} was refused ({result:?}) before a \
+                 spike could fill the allowance"
+            );
+            held += 1;
+            generation += 1;
+            tokio::time::advance(cooldown).await;
+            elapsed += cooldown;
+        }
+        let (gen0, _held) = duplex(1);
+        let gen0_result = registry.dispatch(hdr(7, 0, false), gen0);
+        assert!(
+            gen0_result.is_ok(),
+            "a {} ms spike delayed gen-0 behind {held} successors and the chain was \
+             declared broken ({gen0_result:?}), so the gen-0 was refused while the \
+             session was alive",
+            SPIKE.as_millis()
+        );
+        assert!(
+            !registry.broken.contains_key(&7),
+            "a spike inside the retention window marked the stream broken"
+        );
+        assert_eq!(
+            registry.streams[&7].pending.len(),
+            held,
+            "the spike-delayed gen-0 did not adopt every successor the spike held"
+        );
+    }
+
+    /// The *post-gen-0* pending allowance (`MAX_PENDING_GENERATIONS`) has the
+    /// same shape and the same refutation as the orphan allowance: a spike
+    /// that delays one generation lets the generations the peer produces
+    /// behind it queue in `entry.pending`, but the cooldown caps how many the
+    /// peer can produce inside the retention window, and that is strictly
+    /// below the allowance. The arithmetic guard carries the teeth; the
+    /// spike-shaped arm shows the held count stays under the allowance and
+    /// would fail against an allowance smaller than a spike's own generation
+    /// count.
+    #[tokio::test(start_paused = true)]
+    async fn a_spike_cannot_fill_one_streams_pending_allowance() {
+        let cooldown = crate::traffic_class::MIGRATION_COOLDOWN;
+        let slots_in_a_window = ORPHAN_TTL.as_nanos() / cooldown.as_nanos();
+        assert!(
+            slots_in_a_window < MAX_PENDING_GENERATIONS as u128,
+            "ORPHAN_TTL ({ORPHAN_TTL:?}) spans {slots_in_a_window} migration slots of \
+             {cooldown:?}, at or above the {MAX_PENDING_GENERATIONS} per-stream pending \
+             allowance: one stream's retention window alone now fills the allowance"
+        );
+
+        const SPIKE: Duration = Duration::from_millis(3_205);
+        let mut registry = SpliceRegistry::new();
+        // gen-0 opens the stream; gen-1 is the generation the spike delays, so
+        // everything the peer writes behind it queues in `entry.pending`.
+        let (gen0, _g0) = duplex(1);
+        registry.dispatch(hdr(9, 0, false), gen0).unwrap();
+        let mut elapsed = Duration::ZERO;
+        let mut generation = 2u32;
+        while elapsed <= SPIKE {
+            let (c, _s) = duplex(1);
+            assert!(
+                registry.dispatch(hdr(9, generation, false), c).is_ok(),
+                "successor {generation} queued behind the spike's gap was refused"
+            );
+            generation += 1;
+            tokio::time::advance(cooldown).await;
+            elapsed += cooldown;
+        }
+        // The delayed gen-1 arrives; the held generations are still there.
+        let (gap, _gap_held) = duplex(1);
+        assert!(registry.dispatch(hdr(9, 1, false), gap).is_ok());
+        assert_eq!(
+            registry.streams[&9].pending.len(),
+            (generation - 1) as usize,
+            "the spike-delayed generation did not stay queued with the ones behind it"
+        );
+        assert!(
+            registry.streams[&9].pending.len() < MAX_PENDING_GENERATIONS,
+            "a 3205 ms spike queued {}, at or above the {MAX_PENDING_GENERATIONS} allowance",
+            registry.streams[&9].pending.len()
+        );
+    }
+
+    /// The *global* orphan-stream allowance (`MAX_ORPHAN_STREAMS`) is a count of
+    /// concurrent streams whose gen-0 has not arrived, not a deadline:
+    /// advancing the clock by a spike adds no stream. A spike lengthens how
+    /// long each retained stream stays, so the opening rate that reaches the
+    /// allowance falls (`rate * retention`), but the bound is a load bound and
+    /// is already reachable under load alone. This pins the refutation — with
+    /// no new stream, a spike moves the clock and not the set — and, like the
+    /// per-stream arms, goes red if the retention window is ever shortened
+    /// enough that a spike reaps the retained set.
+    #[tokio::test(start_paused = true)]
+    async fn a_spike_does_not_add_an_orphan_stream() {
+        let mut registry = SpliceRegistry::new();
+        for i in 0..MAX_ORPHAN_STREAMS as u64 {
+            let (c, _s) = duplex(1);
+            registry.dispatch(hdr(100 + i, 1, false), c).unwrap();
+        }
+        assert_eq!(registry.orphans.len(), MAX_ORPHAN_STREAMS);
+        tokio::time::advance(Duration::from_millis(3_205)).await;
+        // A dispatch runs the reap. Inside the 30 s TTL nothing expires, and
+        // elapsed time adds no stream: the set is unmoved by the spike.
+        let (c, _s) = duplex(1);
+        registry.dispatch(hdr(999, 0, false), c).unwrap().unwrap();
+        assert_eq!(
+            registry.orphans.len(),
+            MAX_ORPHAN_STREAMS,
+            "elapsed time added or removed an orphan stream, so the global bound is a \
+             deadline rather than a concurrent-stream count"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_expired_orphan_is_still_adopted_by_its_own_gen0() {
         let mut registry = SpliceRegistry::new();
