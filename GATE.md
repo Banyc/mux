@@ -975,6 +975,150 @@ to the harness scenarios in `rtp_mux/GATE.md`), and the birth window
 (`first_receive_deadline`), whose production value and red-proof arm live in
 `rtp_mux`.
 
+### Combined-horizon field soak (standard tier)
+
+`tests/field_horizon_soak.rs` is a labelled **composite**: the field's whole
+session shape with no dimension held out, so it can reach a defect that lives
+in the *interaction* of dimensions no one-dimension arm holds.
+
+What each neighbouring arm holds, and therefore what this one adds:
+
+| arm | spike magnitudes | churn | live traffic across the stall | census |
+| --- | --- | --- | --- | --- |
+| `spike_survival_soak` | all four (incl. 19.9 s) | one stream per round, opened *after* release | heartbeats only | none |
+| `session_growth_soak` | 1063 ms only | heavy | no (dedicated spike round, probe after release) | yes |
+| `frame_reorder_soak` | 190 / 1063 / 3205 ms | heavy | yes | yes |
+| `frame_dup_partial_soak` | 190 / 1063 / 3205 ms | heavy | yes | yes |
+| `interactive_liveness_soak` | none | heavy | n/a | no |
+| **this arm** | **all four, incl. 19.9 s** | **heavy** | **persistent operator lane, request staged before and consumed after** | **yes** |
+
+The unheld cell is the last row's: **a per-stream census across the 19.9 s
+boundary spike, taken with live interactive traffic and short-lived churn in
+flight across it.** `frame_reorder_soak`'s module doc records why it stops at
+3205 ms — the two sessions' sliding windows are armed at different instants and
+the ledger publishes only the most recent arm, so a 19.9 s advance is ambiguous
+between the silence the phase applied and the silence plus the arm skew. This
+arm removes the ambiguity rather than inheriting it: on the paused clock a full
+operator round trip is performed at the top of every round, which re-arms
+**both** sessions' windows at the same simulated instant, and the round then
+asserts the margin it is about to cross is the full `RECEIVE_DEADLINE` before
+advancing. A round whose margin is short fails naming the ledger instead of
+asserting on a session the detector had already ended. (Measured: without that
+synchronisation the 19.9 s spike tore the client down at round 3 with
+`receive deadline - session timed out` while the last-armed window still had
+100 ms left — the exact skew, reproduced.)
+
+`a_field_shaped_horizon_does_not_grow_a_session_or_lose_a_wake` runs 48 rounds
+of a fixed eight-round shape schedule (concurrent echo rounds, a 32 KiB bulk
+transfer, a peer that accepts and stops reading against a bounded read queue,
+streams dropped mid-transfer with no final offset, a closed-without-reading
+burst with alternating close order) against the field's four-magnitude spike
+schedule, with one **persistent** operator stream — opened once, echoed by a
+server task, never closed mid-horizon — carrying a request staged *before*
+each stall and its reply consumed *after* release. The churn streams are opened
+on the live path and their writes staged *while the stall is set*, so the spike
+lands on traffic in both directions.
+
+The census is taken at four matched points (after 24, 48, 72 and 96 completed
+churn streams) and compared against a **measured floor** — the census sampled
+with only the operator lane open — rather than against zero. The floor is
+non-zero and that is asserted, so this is not "everything is zero" wearing a
+different name: the operator lane's own `stream_table`, `reassembly_buffers`,
+`open_read_sinks` and egress token entries are the expected constant, and every
+churn stream the horizon opened must return the census to exactly it. Each
+point asserts `closed_but_retained == 0`, `reassembly_pending_frames/bytes == 0`,
+`stream_table_len`/`reassembly_buffers`/`open_read_sinks`/`token_queues`/
+`token_streams`/`token_deficits` equal to the floor, `cached_heads` not above
+it, and the retired-id window inside `RETIRED_FINISHED_PEER_STREAM_WINDOW`; the
+points are then compared pairwise so a structure non-zero at two points with a
+larger value later fails even if no field-specific assertion names it.
+
+Per round it also asserts: the spike really was applied (no byte delivered
+while stalled; at least one read held by the gate) and, for the long stalls, no
+heartbeat was consumed during it; the operator reply and every churn stream
+completed byte-exact against an independently re-derived pattern; no
+receive-deadline window expired; and the session never tore down.
+
+Tier: **standard** (`#[ignore]`d, asserting). `MUX_FIELD_ROUNDS` sizes the
+horizon, `MUX_FIELD_CHECKPOINT` places its matched points (48 and 12 by
+default, i.e. four points), and `MUX_FIELD_FAULT=no_stall` disables the gate's
+hold so the "the spike was applied" checks must fail. Measured cost: **0.96 s
+and 4.76 s / 4.75 s** for the default 48 rounds on three runs at load averages
+24-28 (the spread is the host, not the arm: the same build measured 0.96 s in a
+quiet window and 4.76 s under load 27.8); 1 233 s of simulated session time,
+96 churn streams completed, 48 spikes applied, 12 of them the 19.9 s boundary
+magnitude, 306 heartbeats sent and received, 673 receive-deadline sleeps armed,
+0 expiries. Detection limit: the per-point assertion is exact against a
+measured floor, so a single retained churn structure at any of the four points
+fails the run; the pairwise comparison adds the non-zero-at-both-points case.
+Cycles are seeded replications of one fixed schedule, not independent draws, so
+a zero-hit run of 48 rounds excludes a per-round defect rate above ~6.3e-2 at
+95 % (rule of three, 3/48) on one host and one build — an order-of-magnitude
+exclusion, not a rate. The arm is **not** a detector for the delete-a-wake
+class, measured rather than assumed: see the fourth probe below, green at
+62.5× the default volume. That cell stays with the unit suite and
+`interactive_liveness_soak`.
+
+Vacuity. Each probe below printed the mutated line and a token-occurrence
+count between the edit and the verdict, and every mutated file was restored
+with `touch` and checked byte-identical (`shasum -a 256`) afterwards.
+
+Three injections, of different kinds, each reddening the arm and naming the
+observed value:
+
+1. **A retention that never releases** — `MuxControl::retire_if_closed`'s
+   predicate forced false (`src/control.rs:586`, the one occurrence), which is
+   the frame-reassembly retention defect reintroduced. The first matched point
+   fails: `first: client retains 12 stream-table entr(ies) that is_closed
+   already reports finished — no later transition can release them, so the table
+   only fills (stream_table=15 reassembly_buffers=15
+   reassembly_pending(frames=0 bytes=0) open_read_sinks=3 closed_but_retained=12
+   retired_window=0)`.
+2. **A stalled spike not recovered** — `MUX_FIELD_FAULT=no_stall`: the gate's
+   hold is removed, so round 0 fails `the 190ms spike delivered 9504 byte(s)
+   while stalled, so the spike was not applied and this round proves nothing`.
+3. **A byte lost on the wire** — the staged churn write made one byte short
+   (`payload[..payload.len() - 1]`): round 0 fails `the echo churn stream did
+   not recover after the 190ms spike: echo payload mismatch: 4095 of 4096
+   bytes`, which is the byte-conservation and ordering assertion doing its job.
+
+A fourth kind — **a lost wakeup** — has three recorded implementations, all of
+which leave this arm green, and that is a stated detection limit rather than a
+hole:
+
+* `self.waker.wake()` deleted from the egress ready set
+  (`fair_queue::ReadyCounts::add`, `src/fair_queue.rs:551`): green at the
+  default 48 rounds, at 400 (8.3×) and at 3 000 (62.5×). The crate's own
+  default-tier unit test is the detector — with the line deleted,
+  `fair_queue::tests::a_ready_mark_wakes_a_parked_consumer_whose_channel_waker_is_gone`
+  fails naming the reading (`left: 0 right: 1`, `a ready mark published while
+  the consumer was parked did not wake it`). The interleaving that wake guards
+  is rare; the crate's own `interactive_liveness_soak` needs
+  `MUX_SOAK_CYCLES=20000 MUX_SOAK_SEED=2` to reach it. This arm does not hold
+  that cell, and does not claim to.
+* `self.notify.notify_one()` deleted from `StreamCloseState::record`
+  (`src/stream/mod.rs:67`): green. The close receiver re-drains on every poll of
+  its `select!`, so the lost permit heals on the next branch wakeup.
+* the fixture's own `StallSwitch::release` wake deleted: green, because a gated
+  read is resumed by the underlying duplex's persistent waker when the peer's
+  next frame lands, so the gate's wake is not load-bearing in this fixture.
+
+Coverage cells provided: per-stream structure release and non-growth over a
+long horizon **at the deadline-boundary spike magnitude** with concurrent
+interactive traffic and churn in flight (`stream_table`, reorder buffers and
+their pending maps, open read sinks, egress token tables), all against a
+measured persistent-lane floor; a persistent operator lane surviving every
+spike and completing its reply byte-exact across each; the receive-deadline
+window synchronised and asserted full before every advance; zero expiries and
+zero teardowns across the horizon; and per-round spike-applied non-vacuity.
+Cells deliberately **not** covered: the real transport and its impairment
+models (mux is transport-free); frame *reordering* and *duplication* (the
+transport is an in-order duplex here; those are the reorder and dup soaks');
+migration successor generations (the `migration_api`/`migration_wire` layer sits
+above the session these arms drive and its soak would be a separate arm — this
+one names the omission rather than implying coverage); and multi-frame messages
+(the withhold is at the session's read, not inside a message body).
+
 ### Timer inventory: every deadline in `mux` and what re-arms it
 
 Taken from the code (`rg -n 'Duration::from|Instant::now|deadline|timeout|interval' src/`,
@@ -1357,6 +1501,7 @@ interactive_liveness_families::concurrent_sessions_family = standard
 interactive_liveness_families::control_race_family = standard
 interactive_liveness_families::reassembly_gap_family = standard
 spike_survival_soak::a_live_session_survives_the_fields_spike_schedule = standard
+field_horizon_soak::a_field_shaped_horizon_does_not_grow_a_session_or_lose_a_wake = standard
 session_growth_soak::a_long_lived_session_releases_every_per_stream_structure = standard
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap = standard
 frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering = standard
@@ -1375,6 +1520,7 @@ interactive_liveness_families::concurrent_sessions_family
 interactive_liveness_families::control_race_family
 interactive_liveness_families::reassembly_gap_family
 spike_survival_soak::a_live_session_survives_the_fields_spike_schedule
+field_horizon_soak::a_field_shaped_horizon_does_not_grow_a_session_or_lose_a_wake
 session_growth_soak::a_long_lived_session_releases_every_per_stream_structure
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap
 session_growth_soak::the_growth_assertion_rejects_a_grown_census
@@ -1412,7 +1558,8 @@ so the same green arm judges a few hundred cycles or a few hundred thousand.
 A default-tier lib-target component soak in `src` scales its round count the
 same way. All of it is declared in the `gate-env-tier` block below, and every
 row of it is scriptless (`-`), because no script of this crate sets any of the
-names.
+names. The combined-horizon soak's `MUX_FIELD_*` names are the newest member of
+that set.
 
 ### The schedule families: `MUX_FAMILY_*`
 
@@ -1546,12 +1693,24 @@ rule of three at 64 rounds (3/64), stated per round rather than per stream
 because the 48 streams inside a round share one scheduler instance and one host
 and are not independent draws.
 
+The combined-horizon row's load is the measured default shape:
+`MUX_FIELD_ROUNDS=48` and `MUX_FIELD_CHECKPOINT=12` (four matched points), i.e.
+48 round executions in **0.96 s / 4.76 s / 4.75 s** on three runs (load averages
+24-28; the arm's wall clock tracks the host, not the horizon, because the
+horizon is simulated), reporting 1 233 s of simulated session time, 96 churn
+streams completed, 48 spikes applied (12 of them the 19.9 s boundary
+magnitude), 306 heartbeats sent and received, 673 receive-deadline sleeps
+armed and 0 expiries. The round is the trial unit, so `bound=6.3e-2/round` is
+the rule of three at 48 rounds (3/48); the four matched points are positions
+within one schedule, not independent draws.
+
 ```gate-env-tier
 liveness-schedule-families = MUX_FAMILY_CYCLES,MUX_FAMILY_SEED,MUX_FAMILY_STRAND | - | the per-family liveness of the interactive path under the four schedules the soak holds fixed: quiet message-boundary publishes, three concurrent sessions with one idle, control-frame races against in-flight data, and frame-reassembly under out-of-order delivery, each asserting per-stream payload integrity, per-job completion and a 2 s per-cycle bound, with MUX_FAMILY_STRAND=n the red-proof hold that must fail the reassembly family | liveness@shape=quiet-boundary+metric=per-job-completion, liveness@shape=multi-session-idle+metric=per-job-completion, liveness@shape=control-race+metric=per-job-completion, liveness@shape=reassembly-reorder+metric=per-job-completion, payload-integrity@shape=control-race-and-reassembly+order=per-stream, liveness-rate@metric=rule-of-three+unit=cycle, stall-detection@fault=strand-never-release | MUX_FAMILY_CYCLES=400,total=4*MUX_FAMILY_CYCLES,wall=2.33s,bound=7.5e-3/cycle
 interactive-path-soak = MUX_SOAK_CYCLES,MUX_SOAK_SEED,MUX_SOAK_REPLAY_TO,MUX_SOAK_REPEAT | - | the sustained interactive-path liveness soak sized by MUX_SOAK_CYCLES and volume-seeded by MUX_SOAK_SEED, with MUX_SOAK_REPLAY_TO and MUX_SOAK_REPEAT selecting one cycle index and re-running it with the RNG restored for reproduction: many streams per cycle, interactive request/response interleaved with bulk transfers, writers parked on the fair-queue reserve path, a reader or writer dropped mid-flight and Fin racing pending data, asserting staged-equals-received byte conservation, per-job completion and the 2 s per-cycle bound | liveness@shape=interactive-bulk-concurrency+metric=per-job-completion, byte-conservation@shape=soak+metric=staged-vs-received, liveness-rate@metric=rule-of-three+unit=cycle, reproduction@mode=single-cycle-replay+determinism=rng-restored, stall-localisation@shape=replayed-cycle+probe=in-flight-jobs | MUX_SOAK_CYCLES=1500,total=MUX_SOAK_CYCLES,wall=4.04s,bound=2.0e-3/cycle
 egress-component-soak = MUX_EGRESS_SOAK_ROUNDS | - | the egress fair-queue/scheduler component soak in the lib target, sized by MUX_EGRESS_SOAK_ROUNDS: each round opens 48 concurrent streams that stage four 8 KiB chunks on the production reserve path and close while one consumer drains, asserting byte conservation, a Fin for every stream's close and a bounded round | liveness@shape=egress-reserve-drain+metric=per-stream-fin, byte-conservation@shape=egress-soak+metric=staged-vs-dispatched, liveness-rate@metric=rule-of-three+unit=round | MUX_EGRESS_SOAK_ROUNDS=64,total=48*MUX_EGRESS_SOAK_ROUNDS,wall=0.14s,bound=4.7e-2/round
 spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-session spike soak sized by MUX_SPIKE_ROUNDS, with MUX_SPIKE_FAULT=no_stall the red-proof mode that disables the gate's hold: one session held open across a fixed schedule of delivery stalls (190 ms / 1063 ms / 3205 ms / 19.9 s) with the receive-deadline ledger asserted, so a spike costs time and the session survives, and the default-tier detector arm proves the deadline still fires past its window | liveness@shape=long-lived-session+metric=per-job-completion, timer-ledger@metric=receive-deadline+state=armed-not-expired, stall-detection@fault=no-stall-gate, stall-detection@control=deadline-crossed-tears-down | MUX_SPIKE_ROUNDS=120,total=MUX_SPIKE_ROUNDS,wall=1.20s,bound=2.5e-2/cycle
 growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the long-lived-session churn/retention soak sized by MUX_GROWTH_ROUNDS with its matched points placed by MUX_GROWTH_CHECKPOINT, and MUX_GROWTH_FAULT the red-proof selector (leak_stream leaks a peer half per round, no_stall disables the stall phase's hold): a frame_reassembly-on session driven through a fixed eight-round phase schedule (concurrent echo, a peer that stops reading, streams dropped mid-transfer with the client's halves closed first, a closed-without-reading burst with alternating close order, and a 1063 ms delivery stall) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow and that the egress token table drains; the second arm opens one more concurrent stream than the former egress token-table cap and asserts every open completes and every token is reaped | growth@metric=per-stream-structure-live-count+points=matched, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=churn+metric=per-round-recovery-probe, liveness@shape=slow-consumer+metric=recovery, liveness@shape=dropped-mid-transfer+metric=recovery, liveness@shape=closed-without-reading+metric=recovery, liveness@shape=stall+metric=recovery, admission@metric=concurrent-streams-vs-egress-token-cap, staleness@fault=leak-stream-and-no-stall | MUX_GROWTH_CHECKPOINT=200,MUX_GROWTH_ROUNDS=667,total=MUX_GROWTH_ROUNDS,wall=3.39s,bound=4.5e-3/round
+combined-horizon-soak = MUX_FIELD_ROUNDS,MUX_FIELD_CHECKPOINT,MUX_FIELD_FAULT | - | the combined-horizon field soak sized by MUX_FIELD_ROUNDS with its four matched points placed by MUX_FIELD_CHECKPOINT, and MUX_FIELD_FAULT the red-proof selector (no_stall disables the gate's hold): one session driven through the field's whole session shape at once — the full four-magnitude spike schedule including the 19.9 s boundary silence, sustained short-lived-stream churn whose writes are staged while the stall is set, and a persistent operator request/response lane staged before every stall and consumed after release — asserting at each matched point that every per-stream structure returns to the measured operator-lane floor and never grows, that every churn stream is byte-conserving and released, that the receive-deadline window was synchronised full before every advance and never expired, and that the session never tore down | growth@metric=per-stream-structure-live-count+points=matched+spike=deadline-boundary, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=spike-x-churn-x-interactive+metric=receive-deadline-armed-not-expired, liveness@shape=persistent-operator-lane-across-stall+metric=reply-completion, ordering@metric=byte-exact-per-stream+shape=churn, timer-ledger@metric=window-synchronised-before-advance+state=full-window, staleness@fault=no-stall, admission@metric=insert-retire-parity | MUX_FIELD_ROUNDS=48,MUX_FIELD_CHECKPOINT=12,total=MUX_FIELD_ROUNDS,wall=4.8s,bound=6.3e-2/round
 reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - | the long-lived-session frame-reordering soak sized by MUX_REORDER_ROUNDS with its matched points placed by MUX_REORDER_CHECKPOINT, and MUX_REORDER_FAULT the red-proof selector (no_reorder delivers every frame in sent order, never_release strands a held data frame, no_duplicate never re-delivers one): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame and write the frames queued behind it first and re-deliver one data frame in three a frame later (concurrent echo rounds, a multi-frame bidirectional message, a peer that accepts and stops reading until the read queue's bound is reached, streams dropped mid-transfer, a closed-without-reading burst, a CloseWrite overtaking in-flight data, and a delivery stall at the field's 190 ms/1063 ms/3205 ms magnitudes applied while frames are reordered in flight) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that the mux's own ReorderBuffer held out-of-order frames and dropped after-release ones idempotently, that every reordered burst delivered byte-exact in stream order, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, reorder@metric=frames-buffered-out-of-order+source=mux-internal-ingest-counter, ordering@metric=byte-exact-in-stream-order+impairment=frame-reorder, idempotence@metric=frame-dropped-after-release, liveness@shape=reorder-across-close+metric=CloseWrite-overtake, liveness@shape=reorder-plus-stall+metric=receive-deadline-armed-not-expired, liveness@shape=slow-consumer-x-reorder+metric=read-queue-bound-reached, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-reorder-never-release-and-no-duplicate | MUX_REORDER_CHECKPOINT=200,MUX_REORDER_ROUNDS=841,total=MUX_REORDER_ROUNDS,wall=7.47s,bound=3.6e-3/round
 dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the long-lived-session frame-duplication and partial-delivery soak sized by MUX_DUP_ROUNDS with its matched points placed by MUX_DUP_CHECKPOINT, and MUX_DUP_FAULT the red-proof selector (no_hold removes the reorder hold, no_duplicate removes both duplicate injections, no_split removes the split injection): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame, write the frames queued behind it first and re-deliver a copy of the frame the receiver is still holding, re-deliver frames after release, and write every data frame as two transport segments (one of them withheld across the field's 190 ms/1063 ms/3205 ms spike) (concurrent echo rounds, a multi-frame bidirectional message whose held frame's successor is duplicated while buffered, a peer that accepts and stops reading, a tail frame split across a spike, and a finished stream's data frame re-delivered after its entry retired) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that duplicates were dropped both while buffered and after release and never delivered into the stream, that a frame body really was consumed across more than one segment, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, duplication@metric=frame-dropped-while-buffered+source=mux-internal-ingest-counter, duplication@metric=frame-dropped-after-release, ordering@metric=byte-exact-in-stream-order+impairment=frame-split-and-duplicate, partial-delivery@metric=frame-body-across-multiple-segments+source=reader-body-loop-counter, resurrection@metric=stream-materialised-from-duplicate-after-close+state=refused, liveness@shape=duplication-x-slow-consumer+metric=read-queue-bound-reached, liveness@shape=partial-x-spike+metric=receive-deadline-armed-not-expired, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-hold-no-duplicate-and-no-split | MUX_DUP_CHECKPOINT=50,MUX_DUP_ROUNDS=210,total=MUX_DUP_ROUNDS,wall=5.18s,bound=1.4e-2/round
 receive-stall-soak = MUX_RECEIVE_STALL_ROUNDS,MUX_RECEIVE_STALL_FAULT | - | the paused-clock withheld-delivery soak sized by MUX_RECEIVE_STALL_ROUNDS, with MUX_RECEIVE_STALL_FAULT the red-proof selector (no_withhold makes the transport ignore the arm, arrival_gated releases a held frame only on the same flow's next arrival, short_release releases it after half the interval): four concurrent flows on four long-lived streams over a frame-level withholding transport across four phases (the deployed interactive-lane baseline, a multi-frame message whose withheld frame leaves the reorder buffer holding a gap, the stock wire where the withheld frame heads a byte stream, and a zero-impairment control), asserting on every round that an unobstructed flow is delivered with the paused clock untouched, that the withheld flow's message arrives no earlier than its withhold and no later than it plus one millisecond, that no session tears down, and that the frames the transport withheld equal the count the phase's schedule names | attribution@candidate=receive-path+metric=excess-over-withhold, attribution@candidate=reorder-buffer+impairment=multi-frame-withhold, ordering@metric=per-flow-message-order, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, stall-detection@fault=arrival-gated-release, stall-detection@fault=no-withhold, anti-vacuity@metric=withhold-landed-lower-bound+control=short-release | MUX_RECEIVE_STALL_ROUNDS=200,total=2*MUX_RECEIVE_STALL_ROUNDS+140,wall=0.03s,bound=5.6e-3/round
