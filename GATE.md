@@ -332,6 +332,129 @@ covered by the default-tier lib test
 `control::reassembly_tests::out_of_order_frame_delivery_reaches_the_reader_in_sent_order`,
 which injects the out-of-order arrival directly.
 
+### A withheld delivery costs the withhold, and nothing else (standard tier)
+
+The four-flow hostile tail leaves behind, once its start-up transient is gone, a
+per-flow stall of tens of milliseconds that no send-side change moves. The
+question this arm answers is whether the **mux receive path amplifies a
+withheld delivery at all**: `tests/receive_stall_soak.rs`.
+
+The instrument is a paused-clock soak, so nothing but the arm's own `advance`
+moves simulated time and a withheld delivery is measured exactly rather than
+as a percentile. A frame-level transport shim withholds one frame for
+`D in {30, 50, 100} ms` (with `D = 0` control rounds) and the arm asserts, on
+**every** round:
+
+- the flows whose frame was not withheld reach their readers with the clock
+  **untouched** (`Instant::now()` equality) — the cross-flow independence the
+  reorder buffer provides;
+- the withheld flow's message arrives *on its release*: at least `D` — the
+  anti-vacuity check that the withhold landed on the armed flow, without which
+  the upper bound proves nothing — and at most `D + 1 ms`;
+- per-flow message order and flow identity by content, so a reorder or a
+  cross-flow mix-up is a failure rather than a latency reading;
+- no session teardown, and the frames the transport actually withheld equal
+  the count the phase's schedule names, so a green run cannot be one in which
+  the impairment never happened;
+- at the end, the clock moved **exactly** as far as the arm advanced it
+  (`simulated_window == advanced_by_the_soak_itself`), so a heartbeat or an
+  auto-advanced sleep firing outside the arm's control fails the run instead
+  of silently qualifying the zero reading.
+
+Four phases, each varying one dimension from the `SmallWithhold` baseline (the
+deployed interactive-lane shape: `frame_reassembly` on, four concurrent
+long-lived streams, small messages, withhold rotated over the flows):
+`MultiFrameWithhold` varies the **message shape** (200 KiB, many frames, so the
+withheld frame leaves the `ReorderBuffer` holding a tail across a real gap),
+`StockWireWithhold` varies the **wire mode** (`frame_reassembly` off, where the
+withheld frame heads a byte stream so every later frame queues behind it — the
+*transport's* head-of-line cost, which that phase asserts as a per-flow bound
+and not as cross-flow freedom), and `ZeroCostControl` varies the
+**impairment** (no withhold at all).
+
+Measured on this revision (load average 9-25): **540 rounds, 255 withheld
+frames, 2 160 messages, 0 ns of receive-path excess over the withhold** in
+every phase, with `simulated_window=15.3s` and
+`advanced_by_the_soak_itself=15.3s` asserted equal. Cost: **0.03 s** in the
+`standard` tier (`--ignored --test-threads=1`, target wall-clock `finished in
+0.03s`).
+
+Tier: **standard** (`#[ignore]`d, asserting). `MUX_RECEIVE_STALL_ROUNDS` sizes
+the `SmallWithhold`/`ZeroCostControl` phases (default 200);
+`MUX_RECEIVE_STALL_FAULT` selects the red-proof modes, and each of the arm's
+three checks has one as its oracle:
+
+- `no_withhold` — the transport ignores the arm, so the disturbance-fired
+  count is the only assertion that can speak, and it fails with
+  `SmallWithhold: the transport withheld 0 frames, not the 150 this phase's
+  schedule names - the impairment did not reach the structure under test`.
+- `arrival_gated` — the transport releases a held frame only when the **same
+  flow's next** frame arrives (a stop-and-wait transport), which installs the
+  exact arrival-dependence shape this arm hunts. The per-round progress
+  assertion fails with `only 3 of 4 expected messages arrived after 20000
+  scheduler yields with the clock untouched (arrived from flows [0, 2, 3])`.
+  The green run is therefore a positive statement that the receive path has no
+  arrival-dependent wakeup on this shape, not an untested assumption — and it
+  is the scheduler's wakeup path, the one the timer audit records as
+  unexamined, that it covers.
+- `short_release` — the withheld frame is released after `D/2`; the
+  anti-vacuity lower bound fails with `the message on the armed flow 1 took
+  15ms, less than the 30ms its frame was withheld - the withhold did not land
+  on this flow, so this round's upper bound is vacuous`.
+
+The candidates this arm excludes, each with the number that excludes it: the
+fair queue's scheduling and deficit accounting and the central-io scheduler's
+cached-head loop (all four phases deliver every message, so the scheduler
+never strands a ready head); the per-stream read queue's soft and hard limits
+(no round is refused and no session dies, and `StockWireWithhold` reaches the
+same reading with the queue deeper); the `CloseRead`/`ForceCloseWrite` path
+(never taken — a teardown would fail the alive check); the
+reassembly/`ReorderBuffer` wait (the multi-frame phase's 30 gaps cost 0 ns
+over the withhold); and the receive path's only timers — the 10 ms
+`STREAM_READ_DRAIN_GRACE`, which is a *refusal* that tears the stream down
+rather than a delay, and the 20 s receive deadline, measured
+armed-not-expired by `spike_survival_soak`.
+
+**One coupling this arm does not reach, named rather than left silent.** The
+arm withholds a *delivery*, which its shim does without ever blocking an egress
+*write*. A frame that introduces a peer stream does wait on the egress side:
+`handle_central_read` (`src/control.rs:131`, its `accept_peer_stream` call at
+`:173`) → `accept_peer_stream` (`:218`) → `open_stream` (`:256`) →
+`MuxControl::open` (`:623`) → `WriteDataTxFactory::for_stream`
+(`src/central_io/scheduler.rs:419`) → `QueueRegistrar::open`
+(`src/fair_queue.rs:79`), and the token acquisition inside `open` is awaited at
+`src/control.rs:653`. That response is produced only when the central-io writer
+task polls the egress receiver, so while that writer is inside a transport
+write the ingress path does not advance, and a new peer stream's frames queue
+behind it for the duration of one egress write. That is bounded by a transport
+write and affects stream *opening*, not steady-state per-message delivery, so
+it is not the residual this arm measures — but it is the one mux-owned coupling
+that can turn a transport stall into ingress delay, and it is recorded here as
+a **hypothesis with its call chain**, not as a measured defect, because this
+arm's shim never blocks a write. The fence is deliberate: `MuxControl::open`
+acquires the egress token *before* inserting the table entry so a full token
+table cannot consume an admission slot, so decoupling the two trades that
+invariant — a fix belongs with the invariant, not around it.
+
+Coverage cells provided: withheld-delivery amplification on the receive path
+over an impairing frame transport, in both wire modes; the reorder-buffer gap
+across a withheld multi-frame message; cross-flow independence for an
+unobstructed flow while another flow's frame is withheld; a zero-impairment
+baseline measuring the mux's own receive-path cost; and the
+arrival-dependence of a delivery as a red-proof oracle. Cells deliberately
+**not** covered, with the reason for each empty cell: a real transport and a
+real link's loss and jitter (mux is transport-free here — that cell is
+`rtp_mux`'s, and this arm cannot see a repair-ladder stall at all, which is
+why its zero reading is *not* a claim that the field's 30-100 ms does not
+exist, only that the mux receive path does not add to it); a withheld
+*control* frame (`Open`/`CloseWrite` lifecycle impairment is the reorder and
+duplication soaks' cell); a deep per-stream read queue (the soft limit needs
+more than 1 023 queued messages on one flow and its outcome is a refusal, which
+`request_path_capacity::arm_reader_stops_draining` asserts in both wire modes);
+an egress *write* blocked mid-frame (the coupling named above); and wall-clock
+cost (a paused clock measures task-scheduling cost, which is exactly zero, and
+says nothing about a loaded host).
+
 ### The egress ready mark carries its wake (structural, default tier)
 
 A bounded channel's receiver waker is consumed by each delivery, so a
@@ -960,6 +1083,7 @@ session_growth_soak::a_long_lived_session_releases_every_per_stream_structure = 
 session_growth_soak::a_session_admits_more_concurrent_streams_than_the_former_egress_cap = standard
 frame_reorder_soak::a_long_lived_session_survives_sustained_frame_reordering = standard
 frame_dup_partial_soak::a_long_lived_session_survives_duplicated_and_partial_frames = standard
+receive_stall_soak::a_withheld_delivery_costs_the_withhold_and_nothing_else = standard
 ```
 
 The `gate-asserting` block records the report-only/asserting split: every
@@ -984,6 +1108,7 @@ frame_dup_partial_soak::a_long_lived_session_survives_duplicated_and_partial_fra
 frame_dup_partial_soak::the_default_schedule_is_the_declared_one
 frame_dup_partial_soak::the_growth_assertion_rejects_a_grown_census
 frame_dup_partial_soak::the_release_assertion_rejects_a_retained_structure
+receive_stall_soak::a_withheld_delivery_costs_the_withhold_and_nothing_else
 reassembly_stream_release::finished_streams_leave_the_peer_table_in_both_wire_modes
 request_path_capacity::bounded_request_path_capacities_answer_instead_of_waiting
 ```
@@ -1005,8 +1130,8 @@ shape is not fixed by the ignore set: `tests/interactive_liveness_families.rs`
 and `tests/interactive_liveness_soak.rs` read it from the process environment,
 so the same green arm judges a few hundred cycles or a few hundred thousand.
 A default-tier lib-target component soak in `src` scales its round count the
-same way. All of it is declared in the `gate-env-tier` block below; all three
-rows are scriptless (`-`), because no script of this crate sets any of the
+same way. All of it is declared in the `gate-env-tier` block below, and every
+row of it is scriptless (`-`), because no script of this crate sets any of the
 names.
 
 ### The schedule families: `MUX_FAMILY_*`
@@ -1095,6 +1220,17 @@ assertions must fail, and `no_stall` disables the stall phase's hold, so the sta
 fail. Both are detectors, never part of a green run; a run with a fault set fails its own last assertion
 even if no property check happened to catch it, so it cannot be read as a pass.
 
+### The receive-stall attribution soak: `MUX_RECEIVE_STALL_*`
+
+`tests/receive_stall_soak.rs` is the receive-path attribution arm: four
+concurrent flows on four long-lived streams over a frame-level withholding
+transport, on a paused clock, across four phases. `MUX_RECEIVE_STALL_ROUNDS`
+(`:185`, default `DEFAULT_ROUNDS = 200`, `:110`) sizes the baseline and control
+phases — the round is the trial unit — and `MUX_RECEIVE_STALL_FAULT` (`:156`,
+default unset, off) selects the red-proof detectors described in the section
+above. Its own section records the measured shape, the three oracles and the
+cells it does not cover.
+
 ### Cost
 
 The families row's load is the measured default shape, not a derived one: all
@@ -1138,6 +1274,7 @@ spike-survival-soak = MUX_SPIKE_ROUNDS,MUX_SPIKE_FAULT | - | the long-lived-sess
 growth-soak = MUX_GROWTH_ROUNDS,MUX_GROWTH_CHECKPOINT,MUX_GROWTH_FAULT | - | the long-lived-session churn/retention soak sized by MUX_GROWTH_ROUNDS with its matched points placed by MUX_GROWTH_CHECKPOINT, and MUX_GROWTH_FAULT the red-proof selector (leak_stream leaks a peer half per round, no_stall disables the stall phase's hold): a frame_reassembly-on session driven through a fixed eight-round phase schedule (concurrent echo, a peer that stops reading, streams dropped mid-transfer with the client's halves closed first, a closed-without-reading burst with alternating close order, and a 1063 ms delivery stall) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow and that the egress token table drains; the second arm opens one more concurrent stream than the former egress token-table cap and asserts every open completes and every token is reaped | growth@metric=per-stream-structure-live-count+points=matched, release@structure=stream-table+state=closed-but-retained, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=egress-token-table+metric=token-queues, liveness@shape=churn+metric=per-round-recovery-probe, liveness@shape=slow-consumer+metric=recovery, liveness@shape=dropped-mid-transfer+metric=recovery, liveness@shape=closed-without-reading+metric=recovery, liveness@shape=stall+metric=recovery, admission@metric=concurrent-streams-vs-egress-token-cap, staleness@fault=leak-stream-and-no-stall | MUX_GROWTH_CHECKPOINT=200,MUX_GROWTH_ROUNDS=667,total=MUX_GROWTH_ROUNDS,wall=3.39s,bound=4.5e-3/round
 reorder-soak = MUX_REORDER_ROUNDS,MUX_REORDER_CHECKPOINT,MUX_REORDER_FAULT | - | the long-lived-session frame-reordering soak sized by MUX_REORDER_ROUNDS with its matched points placed by MUX_REORDER_CHECKPOINT, and MUX_REORDER_FAULT the red-proof selector (no_reorder delivers every frame in sent order, never_release strands a held data frame, no_duplicate never re-delivers one): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame and write the frames queued behind it first and re-deliver one data frame in three a frame later (concurrent echo rounds, a multi-frame bidirectional message, a peer that accepts and stops reading until the read queue's bound is reached, streams dropped mid-transfer, a closed-without-reading burst, a CloseWrite overtaking in-flight data, and a delivery stall at the field's 190 ms/1063 ms/3205 ms magnitudes applied while frames are reordered in flight) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that the mux's own ReorderBuffer held out-of-order frames and dropped after-release ones idempotently, that every reordered burst delivered byte-exact in stream order, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, reorder@metric=frames-buffered-out-of-order+source=mux-internal-ingest-counter, ordering@metric=byte-exact-in-stream-order+impairment=frame-reorder, idempotence@metric=frame-dropped-after-release, liveness@shape=reorder-across-close+metric=CloseWrite-overtake, liveness@shape=reorder-plus-stall+metric=receive-deadline-armed-not-expired, liveness@shape=slow-consumer-x-reorder+metric=read-queue-bound-reached, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-reorder-never-release-and-no-duplicate | MUX_REORDER_CHECKPOINT=200,MUX_REORDER_ROUNDS=841,total=MUX_REORDER_ROUNDS,wall=7.47s,bound=3.6e-3/round
 dup-partial-soak = MUX_DUP_ROUNDS,MUX_DUP_CHECKPOINT,MUX_DUP_FAULT | - | the long-lived-session frame-duplication and partial-delivery soak sized by MUX_DUP_ROUNDS with its matched points placed by MUX_DUP_CHECKPOINT, and MUX_DUP_FAULT the red-proof selector (no_hold removes the reorder hold, no_duplicate removes both duplicate injections, no_split removes the split injection): one session driven through a fixed eight-round phase schedule over a transport whose two egress directions hold a data frame, write the frames queued behind it first and re-deliver a copy of the frame the receiver is still holding, re-deliver frames after release, and write every data frame as two transport segments (one of them withheld across the field's 190 ms/1063 ms/3205 ms spike) (concurrent echo rounds, a multi-frame bidirectional message whose held frame's successor is duplicated while buffered, a peer that accepts and stops reading, a tail frame split across a spike, and a finished stream's data frame re-delivered after its entry retired) with a full recovery probe every round, asserting at two matched points that every per-stream structure reads zero and did not grow, that duplicates were dropped both while buffered and after release and never delivered into the stream, that a frame body really was consumed across more than one segment, and that no receive-deadline window expired | growth@metric=per-stream-structure-live-count+points=matched, release@structure=reorder-buffer+metric=pending-frames-and-bytes, release@structure=stream-table+state=closed-but-retained, duplication@metric=frame-dropped-while-buffered+source=mux-internal-ingest-counter, duplication@metric=frame-dropped-after-release, ordering@metric=byte-exact-in-stream-order+impairment=frame-split-and-duplicate, partial-delivery@metric=frame-body-across-multiple-segments+source=reader-body-loop-counter, resurrection@metric=stream-materialised-from-duplicate-after-close+state=refused, liveness@shape=duplication-x-slow-consumer+metric=read-queue-bound-reached, liveness@shape=partial-x-spike+metric=receive-deadline-armed-not-expired, liveness@shape=churn+metric=per-round-recovery-probe, staleness@fault=no-hold-no-duplicate-and-no-split | MUX_DUP_CHECKPOINT=50,MUX_DUP_ROUNDS=210,total=MUX_DUP_ROUNDS,wall=5.18s,bound=1.4e-2/round
+receive-stall-soak = MUX_RECEIVE_STALL_ROUNDS,MUX_RECEIVE_STALL_FAULT | - | the paused-clock withheld-delivery soak sized by MUX_RECEIVE_STALL_ROUNDS, with MUX_RECEIVE_STALL_FAULT the red-proof selector (no_withhold makes the transport ignore the arm, arrival_gated releases a held frame only on the same flow's next arrival, short_release releases it after half the interval): four concurrent flows on four long-lived streams over a frame-level withholding transport across four phases (the deployed interactive-lane baseline, a multi-frame message whose withheld frame leaves the reorder buffer holding a gap, the stock wire where the withheld frame heads a byte stream, and a zero-impairment control), asserting on every round that an unobstructed flow is delivered with the paused clock untouched, that the withheld flow's message arrives no earlier than its withhold and no later than it plus one millisecond, that no session tears down, and that the frames the transport withheld equal the count the phase's schedule names | attribution@candidate=receive-path+metric=excess-over-withhold, attribution@candidate=reorder-buffer+impairment=multi-frame-withhold, ordering@metric=per-flow-message-order, timer-ledger@metric=paused-clock-fully-attributable+state=advanced-equals-elapsed, stall-detection@fault=arrival-gated-release, stall-detection@fault=no-withhold, anti-vacuity@metric=withhold-landed-lower-bound+control=short-release | MUX_RECEIVE_STALL_ROUNDS=200,total=2*MUX_RECEIVE_STALL_ROUNDS+140,wall=0.03s,bound=5.6e-3/round
 ```
 
 ## Opt-in targets outside this manifest
