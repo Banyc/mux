@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.61" }
 futures-util = "0.3"
 getrandom = "0.4"
 tokio = { version = "1", features = ["full"] }
